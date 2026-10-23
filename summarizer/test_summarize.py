@@ -950,6 +950,16 @@ class ReasoningEffortConfigTest(unittest.TestCase):
         self.assertEqual(self.parse("high"), "high")
 
 
+class MaxCharsConfigTest(unittest.TestCase):
+    def test_non_positive_limit_is_rejected(self):
+        for value in ("0", "-5"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                summarize.parse_args(["--max-chars", value])
+
+    def test_positive_limit(self):
+        self.assertEqual(summarize.parse_args(["--max-chars", "500"]).max_chars, 500)
+
+
 class GroupsFromEnvTest(unittest.TestCase):
     def parse(self, env, argv=()):
         import os

@@ -646,6 +646,8 @@ def parse_args(argv):
     p.add_argument("--tz", default=env("TZ", "Europe/Warsaw"))
     p.add_argument("--daily-at", default=env("DAILY_AT"), help="keep running and send a digest every day at HH:MM")
     args = p.parse_args(argv)
+    if args.max_chars < 1:
+        p.error(f"--max-chars / MAX_TRANSCRIPT_CHARS must be at least 1, got {args.max_chars}")
     args.llm_api_key = env("LLM_API_KEY", "")
     retention = env("RETENTION_DAYS", "0").strip()
     if not (retention.isascii() and retention.isdigit() and int(retention) <= 36500):
