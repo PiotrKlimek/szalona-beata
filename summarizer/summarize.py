@@ -383,7 +383,8 @@ class Ollama:
         tags = _request("GET", f"{self.base_url}/api/tags")
         if not any(m.get("name") == self.model for m in tags.get("models", [])):
             print(f"Pulling model {self.model} (first run only)...", file=sys.stderr)
-            _request("POST", f"{self.base_url}/api/pull", {"model": self.model, "stream": False})
+            # no data arrives until the download finishes: allow for a ~2 GB model on a slow link
+            _request("POST", f"{self.base_url}/api/pull", {"model": self.model, "stream": False}, timeout=3600)
 
     def summarize(self, transcript, language):
         reply = _request("POST", f"{self.base_url}/api/chat", {

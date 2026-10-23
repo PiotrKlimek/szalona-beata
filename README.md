@@ -335,6 +335,10 @@ docker compose --profile llm run --rm summarizer --model ollama --ollama-model q
 docker compose --profile llm stop ollama
 ```
 
+The default model is `qwen2.5:3b` (it used to be `qwen2.5:0.5b`). The first run downloads it (~1.9 GB); to keep
+the old tiny model on a very small machine, set `OLLAMA_MODEL=qwen2.5:0.5b`. You can pre-pull a model with
+`docker compose --profile llm up -d ollama && docker compose exec ollama ollama pull qwen2.5:3b`.
+
 Rough RAM needs at Q4 quantization with an ~8k-token context:
 
 | Model | RAM for the model | Machine | Polish summaries |
