@@ -743,18 +743,23 @@ def main(argv=None, now=None):
         llm.ensure_model()
     elif args.model == "openai":
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)
-    call_log = CallLog(args.llm_log, args.retention_days) if llm and args.llm_log else None
-    if not call_log and args.llm_log and args.retention_days and os.path.exists(args.llm_log):
-        CallLog(args.llm_log, args.retention_days).db.close()  # purge an old log even when not logging now
+    call_log = CallLog(args.llm_log, args.retention_days, now) if llm and args.llm_log else None
+
+    def purge_unused_log(at):
+        # an old log keeps chats even when this run doesn't log (dummy/ollama): purge it anyway
+        if not call_log and args.llm_log and args.retention_days and os.path.exists(args.llm_log):
+            CallLog(args.llm_log, args.retention_days, at).db.close()
     synthetic = is_synthetic(db)
 
     if not args.daily_at:
+        purge_unused_log(now)
         run_digest(args, db, groups, target, llm, time.time() if now is None else now, tz, call_log, synthetic)
         return 0
 
     print(f"Scheduled daily at {args.daily_at} ({args.tz}).", file=sys.stderr, flush=True)
     while True:
         time.sleep(seconds_until(args.daily_at, time.time(), tz))
+        purge_unused_log(None)
         try:
             run_digest(args, db, groups, target, llm, time.time(), tz, call_log, synthetic)
         except Exception as e:  # keep the schedule alive; the next run may succeed

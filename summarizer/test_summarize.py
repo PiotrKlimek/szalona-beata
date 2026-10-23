@@ -404,7 +404,7 @@ class RetentionConfigTest(unittest.TestCase):
         self.assertEqual(self.parse("720"), 720)
 
     def test_invalid_values_are_rejected(self):
-        for value in ("-5", "²", "two years"):
+        for value in ("-5", "²", "two years", "36501"):
             with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.parse(value)
 

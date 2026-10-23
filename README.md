@@ -377,7 +377,8 @@ To get history for a new group, unlink and link again (step 3).
 - The bridge's HTTP API (`/send`, `/health`) has no published ports and is reachable only inside the Compose network.
 - **Retention:** with `RETENTION_DAYS` set, the bridge deletes older messages at start and then daily, and doesn't
   store expired messages that arrive again (e.g. history after a re-link). The summarizer deletes older LLM call log
-  entries at start (even in `dummy`/`ollama` mode, if a log exists) and before each new entry. Group names are kept.
+  entries at start, before each new entry, and before each scheduled run in `dummy`/`ollama` mode (if a log
+  exists). Group names are kept.
 
 Unlink completely:
 
