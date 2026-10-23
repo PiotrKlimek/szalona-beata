@@ -499,11 +499,20 @@ class CallLog:
     FIELDS = ("provider", "model", "reasoning_effort", "language", "system_prompt", "transcript", "response",
               "parsed", "prompt_tokens", "completion_tokens", "total_tokens", "duration_ms", "error")
 
-    def __init__(self, path):
+    def __init__(self, path, retention_days=0, now=None):
         self.db = sqlite3.connect(path)
         self.db.executescript(CALL_LOG_SCHEMA)
+        self.retention_days = retention_days
+        self.purge(time.time() if now is None else now)
+
+    def purge(self, now):
+        """Delete entries older than the retention period (0 = keep forever)."""
+        if self.retention_days > 0:
+            self.db.execute("DELETE FROM llm_calls WHERE ts < ?", (int(now - self.retention_days * 86400),))
+            self.db.commit()
 
     def record(self, exchange, group_jid, group_name, ts, synthetic):
+        self.purge(ts)  # the scheduled digest keeps one log open for months
         cols = ("ts", "group_jid", "group_name", "synthetic") + self.FIELDS
         values = (int(ts), group_jid, group_name, int(synthetic)) + tuple(exchange.get(f) for f in self.FIELDS)
         self.db.execute(f"INSERT INTO llm_calls ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})", values)
@@ -607,6 +616,10 @@ def parse_args(argv):
     p.add_argument("--daily-at", default=env("DAILY_AT"), help="keep running and send a digest every day at HH:MM")
     args = p.parse_args(argv)
     args.llm_api_key = env("LLM_API_KEY", "")
+    retention = env("RETENTION_DAYS", "0").strip()
+    if not retention.isdigit():
+        p.error(f"RETENTION_DAYS must be a whole number of days >= 0, got {retention!r}")
+    args.retention_days = int(retention)
     log = env("LLM_LOG_DB", "")
     args.llm_log = None if log == "off" else log or os.path.join(os.path.dirname(args.db) or ".", "llm_log.db")
     effort = env("LLM_REASONING_EFFORT", "low")
@@ -730,7 +743,7 @@ def main(argv=None, now=None):
         llm.ensure_model()
     elif args.model == "openai":
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)
-    call_log = CallLog(args.llm_log) if llm and args.llm_log else None
+    call_log = CallLog(args.llm_log, args.retention_days) if llm and args.llm_log else None
     synthetic = is_synthetic(db)
 
     if not args.daily_at:

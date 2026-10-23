@@ -346,6 +346,54 @@ class BridgeHealthTest(unittest.TestCase):
         self.assertLess(html.index(warning), html.index(">A<"))
 
 
+class CallLogRetentionTest(unittest.TestCase):
+    def test_old_entries_are_deleted_on_open(self):
+        import os
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "llm_log.db")
+        log = summarize.CallLog(path)
+        day = 86400
+        for age_days in (800, 721, 719, 1):
+            log.record({"model": f"{age_days}d"}, "g@g.us", "G", T0 - age_days * day, synthetic=False)
+        log.db.close()
+
+        summarize.CallLog(path, retention_days=720, now=T0)
+
+        left = [r[0] for r in sqlite3.connect(path).execute("SELECT model FROM llm_calls ORDER BY ts")]
+        self.assertEqual(left, ["719d", "1d"])
+
+    def test_zero_retention_keeps_everything(self):
+        import os
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "llm_log.db")
+        summarize.CallLog(path).record({"model": "old"}, "g@g.us", "G", 0, synthetic=False)
+
+        summarize.CallLog(path, retention_days=0, now=T0)
+
+        self.assertEqual(sqlite3.connect(path).execute("SELECT COUNT(*) FROM llm_calls").fetchone(), (1,))
+
+
+class RetentionConfigTest(unittest.TestCase):
+    def parse(self, value):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"RETENTION_DAYS": value}):
+            return summarize.parse_args([]).retention_days
+
+    def test_default_keeps_forever(self):
+        self.assertEqual(self.parse(""), 0)
+
+    def test_value(self):
+        self.assertEqual(self.parse("720"), 720)
+
+    def test_invalid_value_is_rejected(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.parse("-5")
+
+
 class ThreadRenderingTest(unittest.TestCase):
     THREADS = [
         summarize.Thread("Zadanie z angielskiego", ["Str. 20-21 na jutro", "Słówka w zeszycie"]),

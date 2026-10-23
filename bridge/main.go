@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
@@ -68,6 +69,13 @@ func main() {
 	} else if n > 0 {
 		log.Infof("Deleted %d stored messages of groups no longer in WATCH_GROUPS", n)
 	}
+	retention, err := parseRetentionDays(os.Getenv("RETENTION_DAYS"))
+	if err != nil {
+		fatal("Invalid configuration", err)
+	}
+	if retention > 0 {
+		go purgeOldMessages(messages, retention, log)
+	}
 
 	b := &bridge{
 		client: whatsmeow.NewClient(device, waLog.Stdout("WA", "WARN", true)),
@@ -97,6 +105,18 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	b.client.Disconnect()
+}
+
+// purgeOldMessages deletes messages older than the retention period now and then once a day.
+func purgeOldMessages(store *Store, retention time.Duration, log waLog.Logger) {
+	for {
+		if n, err := store.PurgeOlderThan(time.Now().Add(-retention)); err != nil {
+			log.Warnf("Failed to purge old messages: %v", err)
+		} else if n > 0 {
+			log.Infof("Deleted %d messages older than %d days", n, int(retention.Hours()/24))
+		}
+		time.Sleep(24 * time.Hour)
+	}
 }
 
 // login links a new device, either via QR code printed to stdout or,

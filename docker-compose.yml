@@ -19,6 +19,7 @@ x-summarizer-env: &summarizer-env
   LLM_MODEL: ${LLM_MODEL:-}
   LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
   LLM_LOG_DB: ${LLM_LOG_DB:-}
+  RETENTION_DAYS: ${RETENTION_DAYS:-}
 
 services:
   bridge:
@@ -28,6 +29,7 @@ services:
       TZ: ${TZ:-Europe/Warsaw}
       PAIR_PHONE: ${PAIR_PHONE:-}  # optional: link with a pairing code instead of QR
       WATCH_GROUPS: ${WATCH_GROUPS:-}  # comma-separated group names or JIDs whose messages are stored
+      RETENTION_DAYS: ${RETENTION_DAYS:-}  # delete messages older than N days (empty/0 = keep forever)
     volumes:
       - wa-data:/data
     # No published ports: the HTTP API is reachable only inside this compose network.

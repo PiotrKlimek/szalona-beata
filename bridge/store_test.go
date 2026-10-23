@@ -188,3 +188,30 @@ func TestBackfillSenderNamesFillsOnlyUnknownNames(t *testing.T) {
 		}
 	}
 }
+
+func TestPurgeOlderThanDeletesOnlyOldMessages(t *testing.T) {
+	s := newTestStore(t)
+	s.SaveChat("120363000000000001@g.us", "Rowery")
+	for _, m := range []struct {
+		id string
+		ts int64
+	}{{"old", 1000}, {"edge", 2000}, {"new", 3000}} {
+		msg := sampleMessage
+		msg.ID, msg.Timestamp = m.id, time.Unix(m.ts, 0)
+		s.SaveMessage(msg)
+	}
+
+	deleted, err := s.PurgeOlderThan(time.Unix(2000, 0))
+
+	if err != nil || deleted != 1 {
+		t.Fatalf("PurgeOlderThan() = %d, %v; want 1, nil", deleted, err)
+	}
+	var ids string
+	s.db.QueryRow(`SELECT GROUP_CONCAT(id, ',') FROM (SELECT id FROM messages ORDER BY ts)`).Scan(&ids)
+	if ids != "edge,new" {
+		t.Errorf("remaining = %q, want %q", ids, "edge,new")
+	}
+	if s.ChatName("120363000000000001@g.us") != "Rowery" {
+		t.Error("purge must not touch the chats table")
+	}
+}

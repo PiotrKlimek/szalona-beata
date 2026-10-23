@@ -154,3 +154,12 @@ func (s *Store) BackfillSenderNames(resolve func(senderJID string) string) (int6
 	}
 	return updated, nil
 }
+
+// PurgeOlderThan deletes messages sent before cutoff.
+func (s *Store) PurgeOlderThan(cutoff time.Time) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE ts < ?`, cutoff.Unix())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
