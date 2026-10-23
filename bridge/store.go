@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS messages (
 	PRIMARY KEY (chat_jid, id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages (chat_jid, ts);
+CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages (sender_jid);
 `
 
 // Message is a group message as stored for the summarizer.
@@ -116,11 +117,11 @@ func (s *Store) PurgeDisallowed(f groupFilter) (int64, error) {
 	return deleted, nil
 }
 
-// BackfillSenderNames resolves names for senders stored without one.
-// A name equal to the JID's user part (stored by early versions) counts as unknown.
-func (s *Store) BackfillSenderNames(resolve func(senderJID string) string) (int64, error) {
-	rows, err := s.db.Query(`SELECT DISTINCT sender_jid FROM messages
-		WHERE sender_name = '' OR sender_name = substr(sender_jid, 1, instr(sender_jid, '@') - 1)`)
+// RefreshSenderNames applies the currently resolved name (address book first) to
+// every stored message of each sender, so one person shows up under one name.
+// Senders the resolver doesn't know keep their stored name.
+func (s *Store) RefreshSenderNames(resolve func(senderJID string) string) (int64, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT sender_jid FROM messages`)
 	if err != nil {
 		return 0, err
 	}
@@ -144,8 +145,7 @@ func (s *Store) BackfillSenderNames(resolve func(senderJID string) string) (int6
 		if name == "" {
 			continue
 		}
-		res, err := s.db.Exec(`UPDATE messages SET sender_name = ? WHERE sender_jid = ?
-			AND (sender_name = '' OR sender_name = substr(sender_jid, 1, instr(sender_jid, '@') - 1))`, name, jid)
+		res, err := s.db.Exec(`UPDATE messages SET sender_name = ? WHERE sender_jid = ? AND sender_name IS NOT ?`, name, jid, name)
 		if err != nil {
 			return updated, err
 		}
