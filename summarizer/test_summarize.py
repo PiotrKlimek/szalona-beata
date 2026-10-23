@@ -136,6 +136,63 @@ class FormatTranscriptPlaceholderTest(unittest.TestCase):
         self.assertEqual(got, "[10:01] Ania: [image] Plan lekcji\n[10:04] Celina: Dzięki!")
 
 
+class TranscriptOmittedCountTest(unittest.TestCase):
+    MSGS = [
+        summarize.Msg(T0, "Ania", "Jedziemy w sobotę?"),
+        summarize.Msg(T0 + 90, "Bartek", "Tak, 9:00"),
+        summarize.Msg(T0 + 300, "Ania", "Super"),
+    ]
+
+    def test_reports_how_many_messages_were_left_out(self):
+        text, omitted = summarize.build_transcript(self.MSGS, max_chars=50, tz=timezone.utc)
+        self.assertEqual(omitted, 1)
+        self.assertTrue(text.startswith("[... 1 earlier messages omitted]"))
+
+    def test_single_message_longer_than_limit_is_cut_not_dropped(self):
+        msgs = [summarize.Msg(T0, "Ania", "a" * 500)]
+        text, omitted = summarize.build_transcript(msgs, max_chars=60, tz=timezone.utc)
+        self.assertEqual(omitted, 0)
+        self.assertTrue(text.startswith("[10:00] Ania: aaa"), text)
+        self.assertLessEqual(len(text), 60)
+        self.assertTrue(text.endswith("…"))
+
+    def test_newest_message_kept_even_when_it_alone_exceeds_limit(self):
+        msgs = [summarize.Msg(T0, "Ania", "stara"), summarize.Msg(T0 + 60, "Bartek", "b" * 500)]
+        text, omitted = summarize.build_transcript(msgs, max_chars=60, tz=timezone.utc)
+        self.assertEqual(omitted, 1)
+        self.assertIn("Bartek: bbb", text)
+
+    def test_nothing_left_out(self):
+        _, omitted = summarize.build_transcript(self.MSGS, max_chars=10_000, tz=timezone.utc)
+        self.assertEqual(omitted, 0)
+
+
+class TruncationNoticeTest(unittest.TestCase):
+    SECTIONS = [summarize.Section("Klasa 1a (test)", "Wycieczka.", messages=120, omitted=37),
+                summarize.Section("Klasa 2b (test)", "Zebranie.", messages=5)]
+
+    def test_text_digest_notes_left_out_messages_under_the_group(self):
+        got = summarize.build_digest(self.SECTIONS, hours=24, lang="Polish")
+        self.assertIn("*Klasa 1a (test)* (120 wiadomości)\n"
+                      "⚠️ Długa rozmowa: w podsumowaniu pominięto najstarsze – 37 wiadomości.\n"
+                      "Wycieczka.", got)
+        self.assertIn("*Klasa 2b (test)* (5 wiadomości)\nZebranie.", got)  # no note
+
+    def test_english_notice_and_singular(self):
+        got = summarize.build_digest([summarize.Section("A", "x", messages=9, omitted=1)], hours=24)
+        self.assertIn("⚠️ Long chat: 1 message (the oldest) left out of the summary.", got)
+
+    def test_html_notice(self):
+        html = summarize.build_html_digest(self.SECTIONS, hours=24, day="23.10.2026", lang="Polish")
+        self.assertEqual(html.count("pominięto najstarsze"), 1)
+        self.assertLess(html.index("Klasa 1a (test)"), html.index("pominięto najstarsze – 37 wiadomości"))
+        self.assertLess(html.index("pominięto najstarsze – 37 wiadomości"), html.index("Wycieczka."))
+
+    def test_polish_singular(self):
+        got = summarize.build_digest([summarize.Section("A", "x", messages=9, omitted=1)], hours=24, lang="Polish")
+        self.assertIn("pominięto najstarsze – 1 wiadomość.", got)
+
+
 class DummySummaryTest(unittest.TestCase):
     def test_range_spanning_days_includes_dates(self):
         msgs = [
@@ -893,6 +950,16 @@ class ReasoningEffortConfigTest(unittest.TestCase):
         self.assertEqual(self.parse("high"), "high")
 
 
+class MaxCharsConfigTest(unittest.TestCase):
+    def test_non_positive_limit_is_rejected(self):
+        for value in ("0", "-5"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                summarize.parse_args(["--max-chars", value])
+
+    def test_positive_limit(self):
+        self.assertEqual(summarize.parse_args(["--max-chars", "500"]).max_chars, 500)
+
+
 class GroupsFromEnvTest(unittest.TestCase):
     def parse(self, env, argv=()):
         import os
@@ -1263,6 +1330,34 @@ class MainTest(unittest.TestCase):
         self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")
 
         self.assertFalse(os.path.exists(self.log_path))
+
+    def test_truncated_chat_is_noted_in_the_digest(self):
+        import os
+        from unittest import mock
+
+        srv = self.llm_server()
+        env = {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": "off"}
+        with mock.patch.dict(os.environ, env):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai",
+                                      "--allow-real-data", "--max-chars", "20")
+
+        self.assertEqual(code, 0)
+        self.assertIn("⚠️ Long chat: 1 message (the oldest) left out of the summary.", out)
+
+    def test_no_truncation_note_when_model_failed_and_stats_are_shown(self):
+        import os
+        from unittest import mock
+
+        srv = FakeServer({("POST", "/chat/completions"): (500, {"error": {"message": "Internal Server Error"}})})
+        self.addCleanup(srv.close)
+        env = {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": "off"}
+        with mock.patch.dict(os.environ, env), redirect_stderr(io.StringIO()):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai",
+                                      "--allow-real-data", "--max-chars", "20")
+
+        self.assertEqual(code, 0)
+        self.assertIn("model unavailable", out)  # the stats cover every message...
+        self.assertNotIn("Long chat", out)       # ...so nothing was left out
 
     def test_external_llm_without_api_key_exits_with_error(self):
         import os

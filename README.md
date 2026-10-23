@@ -369,6 +369,7 @@ To get history for a new group, unlink and link again (step 3).
 | Red "bridge is not responding" warning | The bridge container is down: `docker compose up -d bridge`, then check `docker compose logs bridge`. |
 | No history after linking | `WATCH_GROUPS` was empty or wrong at link time; history comes only once. Unlink and relink (step 3). |
 | Groq `403 Forbidden`, `error code: 1010` | Cloudflare blocks the default Python User-Agent. Fixed in the code; if you fork the HTTP client, keep a custom `User-Agent`. |
+| "Long chat: … left out of the summary" (PL: "Długa rozmowa: w podsumowaniu pominięto najstarsze – …") under a group | That day's chat exceeded `MAX_TRANSCRIPT_CHARS`, so the oldest messages weren't sent to the model. Raise the limit if your model's context and rate limits allow it. |
 | Groq `429` | Tokens-per-minute limit; retried automatically, see [Limits](#54-limits-and-token-usage). |
 | `refusing to send real chats to an external API` | Intended. Use `--allow-real-data` (or the override for the schedule). |
 | Email not arriving | Check Spam/Promotions and Resend → Emails. Without a domain, `EMAIL_TO` must be the Resend account address. |
@@ -411,6 +412,7 @@ docker volume rm szalona-beata_wa-data
 | `LLM_API_KEY` | | Groq (or other OpenAI-compatible) API key |
 | `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
+| `MAX_TRANSCRIPT_CHARS` | `12000` | Max chat length sent to the model per group; on busier days the oldest messages are left out and the email says so under the group |
 | `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
 | `OLLAMA_MODEL` | `qwen2.5:3b` | Local model for `--model ollama` (needs ~2.5 GB free RAM) |
 | `SUMMARY_LANGUAGE` | `Polish` | Language of the summaries and of the email labels (`Polish` or `English`; other languages get English labels) |
