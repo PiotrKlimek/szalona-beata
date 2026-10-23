@@ -23,10 +23,11 @@ import (
 )
 
 type bridge struct {
-	client *whatsmeow.Client
-	store  *Store
-	filter groupFilter
-	log    waLog.Logger
+	client    *whatsmeow.Client
+	store     *Store
+	filter    groupFilter
+	retention time.Duration // 0 = keep messages forever
+	log       waLog.Logger
 }
 
 func envOr(key, fallback string) string {
@@ -60,6 +61,10 @@ func main() {
 	if err != nil {
 		fatal("Failed to open messages db", err)
 	}
+	retention, err := parseRetentionDays(os.Getenv("RETENTION_DAYS"))
+	if err != nil {
+		fatal("Invalid configuration", err)
+	}
 	filter := parseGroupFilter(os.Getenv("WATCH_GROUPS"))
 	if filter.Empty() {
 		log.Warnf("WATCH_GROUPS is empty - no messages will be stored (group names are still listed)")
@@ -69,19 +74,16 @@ func main() {
 	} else if n > 0 {
 		log.Infof("Deleted %d stored messages of groups no longer in WATCH_GROUPS", n)
 	}
-	retention, err := parseRetentionDays(os.Getenv("RETENTION_DAYS"))
-	if err != nil {
-		fatal("Invalid configuration", err)
-	}
 	if retention > 0 {
 		go purgeOldMessages(messages, retention, log)
 	}
 
 	b := &bridge{
-		client: whatsmeow.NewClient(device, waLog.Stdout("WA", "WARN", true)),
-		store:  messages,
-		filter: filter,
-		log:    log,
+		client:    whatsmeow.NewClient(device, waLog.Stdout("WA", "WARN", true)),
+		store:     messages,
+		filter:    filter,
+		retention: retention,
+		log:       log,
 	}
 	b.client.AddEventHandler(b.handleEvent)
 
@@ -173,6 +175,9 @@ func (b *bridge) handleEvent(evt any) {
 func (b *bridge) save(evt *events.Message, chatName string) bool {
 	if !b.filter.Allows(evt.Info.Chat.String(), chatName) {
 		return false
+	}
+	if isExpired(evt.Info.Timestamp, b.retention, time.Now()) {
+		return false // e.g. old history re-sent after a re-link
 	}
 	msg, ok := toMessage(evt, b.contactName)
 	if !ok {

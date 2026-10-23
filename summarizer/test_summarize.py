@@ -363,6 +363,20 @@ class CallLogRetentionTest(unittest.TestCase):
         left = [r[0] for r in sqlite3.connect(path).execute("SELECT model FROM llm_calls ORDER BY ts")]
         self.assertEqual(left, ["719d", "1d"])
 
+    def test_record_purges_old_entries_in_a_long_running_process(self):
+        # the scheduled digest opens the log once and then only calls record() for months
+        import os
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "llm_log.db")
+        log = summarize.CallLog(path, retention_days=720, now=T0 - 800 * 86400)
+        log.record({"model": "old"}, "g@g.us", "G", T0 - 800 * 86400, synthetic=False)
+
+        log.record({"model": "new"}, "g@g.us", "G", T0, synthetic=False)
+
+        left = [r[0] for r in sqlite3.connect(path).execute("SELECT model FROM llm_calls")]
+        self.assertEqual(left, ["new"])
+
     def test_zero_retention_keeps_everything(self):
         import os
         import tempfile
@@ -389,9 +403,10 @@ class RetentionConfigTest(unittest.TestCase):
     def test_value(self):
         self.assertEqual(self.parse("720"), 720)
 
-    def test_invalid_value_is_rejected(self):
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            self.parse("-5")
+    def test_invalid_values_are_rejected(self):
+        for value in ("-5", "²", "two years"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.parse(value)
 
 
 class ThreadRenderingTest(unittest.TestCase):
@@ -1200,6 +1215,17 @@ class MainTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertFalse(os.path.exists(self.log_path))
+
+    def test_existing_log_is_purged_even_without_llm(self):
+        # switching from openai to dummy must not keep old chats in the log forever
+        import os
+        from unittest import mock
+
+        summarize.CallLog(self.log_path).record({"model": "old"}, BIKES, "Rowery", T0 - 800 * 86400, False)
+        with mock.patch.dict(os.environ, {"RETENTION_DAYS": "720", "LLM_LOG_DB": ""}):
+            self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")
+
+        self.assertEqual(sqlite3.connect(self.log_path).execute("SELECT COUNT(*) FROM llm_calls").fetchone(), (0,))
 
     def test_dummy_mode_writes_no_log(self):
         import os

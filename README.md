@@ -27,7 +27,7 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 | WhatsApp session keys, messages | only your server (Docker volume); messages deleted after `RETENTION_DAYS` |
 | Summaries with `--model dummy` / `ollama` | only your server |
 | Summaries with `--model openai` | the chat text of the selected groups is sent to the LLM provider (Groq by default) |
-| LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database) |
+| LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
 | The email | the email provider (Resend) and your mailbox |
 
 ## Before you start: read this
@@ -375,8 +375,9 @@ To get history for a new group, unlink and link again (step 3).
   linked device. Anyone with root or `docker` group access on the host can reach it. Revoke access anytime by
   deleting *szalona-beata* under **Linked devices** on the phone.
 - The bridge's HTTP API (`/send`, `/health`) has no published ports and is reachable only inside the Compose network.
-- **Retention:** with `RETENTION_DAYS` set, the bridge deletes older messages at start and then daily, and the
-  summarizer deletes older LLM call log entries whenever it writes to the log. Group names are kept.
+- **Retention:** with `RETENTION_DAYS` set, the bridge deletes older messages at start and then daily, and doesn't
+  store expired messages that arrive again (e.g. history after a re-link). The summarizer deletes older LLM call log
+  entries at start (even in `dummy`/`ollama` mode, if a log exists) and before each new entry. Group names are kept.
 
 Unlink completely:
 
@@ -392,7 +393,7 @@ docker volume rm szalona-beata_wa-data
 |---|---|---|
 | `WATCH_GROUPS` | (empty: store nothing) | Groups whose messages the bridge stores (JIDs or exact names, comma-separated) |
 | `PAIR_PHONE` | | Link with a pairing code instead of QR (pass once on the command line) |
-| `RETENTION_DAYS` | `0` (keep forever) | Delete messages and LLM call log entries older than N days (`.env.example`: 720) |
+| `RETENTION_DAYS` | `0` (keep forever) | Delete messages and LLM call log entries older than N days, max 36500 (`.env.example`: 720) |
 | `SUMMARY_MODEL` | `dummy` | `dummy`, `ollama` or `openai` |
 | `DIGEST_GROUPS` | `WATCH_GROUPS` | Groups in the digest |
 | `DAILY_AT`, `DIGEST_HOURS` | `20:00`, `24` | Schedule of the `digest` service |

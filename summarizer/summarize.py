@@ -617,8 +617,8 @@ def parse_args(argv):
     args = p.parse_args(argv)
     args.llm_api_key = env("LLM_API_KEY", "")
     retention = env("RETENTION_DAYS", "0").strip()
-    if not retention.isdigit():
-        p.error(f"RETENTION_DAYS must be a whole number of days >= 0, got {retention!r}")
+    if not (retention.isascii() and retention.isdigit() and int(retention) <= 36500):
+        p.error(f"RETENTION_DAYS must be a whole number of days between 0 and 36500, got {retention!r}")
     args.retention_days = int(retention)
     log = env("LLM_LOG_DB", "")
     args.llm_log = None if log == "off" else log or os.path.join(os.path.dirname(args.db) or ".", "llm_log.db")
@@ -744,6 +744,8 @@ def main(argv=None, now=None):
     elif args.model == "openai":
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)
     call_log = CallLog(args.llm_log, args.retention_days) if llm and args.llm_log else None
+    if not call_log and args.llm_log and args.retention_days and os.path.exists(args.llm_log):
+        CallLog(args.llm_log, args.retention_days).db.close()  # purge an old log even when not logging now
     synthetic = is_synthetic(db)
 
     if not args.daily_at:
