@@ -62,6 +62,7 @@ class Section(NamedTuple):
     name: str
     summary: object  # str, [Thread] or None
     messages: int = 0
+    omitted: int = 0  # messages left out of a too-long transcript
 
 
 # Email/digest labels by SUMMARY_LANGUAGE; plural forms are (one, few, many).
@@ -73,6 +74,7 @@ LABELS = {
         "no_messages": "No messages.", "nothing_notable": "No notable topics.",
         "stats": "{messages} from {people} between {first} and {last}. Most active: {ranking}.",
         "model_unavailable": "model unavailable, showing statistics: {error}",
+        "truncated": "⚠️ Long chat: {count} (the oldest) left out of the summary.",
         "footer": "Generated locally by szalona-beata from your WhatsApp groups.",
         "bridge": {
             "logged_out": "⚠️ The WhatsApp bridge is logged out: new messages are not collected. "
@@ -89,6 +91,7 @@ LABELS = {
         "no_messages": "Brak wiadomości.", "nothing_notable": "Nic istotnego.",
         "stats": "{messages} ({people}), {first}–{last}. Najaktywniejsi: {ranking}.",
         "model_unavailable": "model niedostępny, pokazuję statystyki: {error}",
+        "truncated": "⚠️ Długa rozmowa: podsumowanie pomija najstarsze wiadomości ({n}).",
         "footer": "Wygenerowane lokalnie przez szalona-beata z Twoich grup WhatsApp.",
         "bridge": {
             "logged_out": "⚠️ Mostek WhatsApp jest wylogowany: nowe wiadomości nie są zbierane. "
@@ -165,7 +168,12 @@ def _hhmm(ts, tz):
 
 
 def format_transcript(msgs, max_chars, tz=None):
-    """Render messages as chat lines, keeping the most recent ones within max_chars."""
+    return build_transcript(msgs, max_chars, tz)[0]
+
+
+def build_transcript(msgs, max_chars, tz=None):
+    """Render messages as chat lines, keeping the most recent ones within max_chars.
+    Returns (text, number of messages left out)."""
     lines = [f"[{_hhmm(m.ts, tz)}] {m.sender}: {m.text}" for m in msgs if not BARE_PLACEHOLDER.match(m.text)]
     kept, size = [], 0
     for line in reversed(lines):
@@ -177,7 +185,7 @@ def format_transcript(msgs, max_chars, tz=None):
     omitted = len(lines) - len(kept)
     if omitted:
         kept.insert(0, f"[... {omitted} earlier messages omitted]")
-    return "\n".join(kept)
+    return "\n".join(kept), omitted
 
 
 def dummy_summary(msgs, tz=None, lang="English"):
@@ -201,6 +209,11 @@ def _summary_text(summary, lang="English"):
     return summary or labels(lang)["no_messages"]
 
 
+def _truncated_note(section, lang):
+    L = labels(lang)
+    return L["truncated"].format(n=section.omitted, count=plural(section.omitted, L["message"], lang))
+
+
 def build_digest(sections, hours, title=None, lang="English", warning=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
@@ -210,7 +223,8 @@ def build_digest(sections, hours, title=None, lang="English", warning=None):
     parts = [header] + ([warning] if warning else [])
     for s in sections:
         count = f" ({plural(s.messages, L['message'], lang)})" if s.messages else ""
-        parts.append(f"*{s.name}*{count}\n{_summary_text(s.summary, lang)}")
+        note = f"{_truncated_note(s, lang)}\n" if s.omitted else ""
+        parts.append(f"*{s.name}*{count}\n{note}{_summary_text(s.summary, lang)}")
     return "\n\n".join(parts)
 
 
@@ -312,7 +326,9 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
         CARD.format(
             name=htmllib.escape(s.name),
             meta=(f'<div style="font-size:13px;color:#7a8783;margin:-4px 0 8px">'
-                  f'{plural(s.messages, L["message"], lang)}</div>' if s.messages else ""),
+                  f'{plural(s.messages, L["message"], lang)}</div>' if s.messages else "")
+                 + (f'<div style="font-size:13px;color:#8a5a00;margin:0 0 8px">'
+                    f'{htmllib.escape(_truncated_note(s, lang))}</div>' if s.omitted else ""),
             summary=render_summary_html(s.summary, lang),
         )
         for s in sections
@@ -654,11 +670,13 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
     sections = []
     for jid, name in groups:
         msgs = fetch_messages(db, jid, since)
+        omitted = 0
         if not msgs:
             summary = None
         elif llm:
+            transcript, omitted = build_transcript(msgs, args.max_chars, tz)
             try:
-                summary = llm.summarize(format_transcript(msgs, args.max_chars, tz), args.language)
+                summary = llm.summarize(transcript, args.language)
             except (RuntimeError, OSError) as e:  # API error, timeout, network
                 print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
                 unavailable = labels(lang)["model_unavailable"].format(error=e)
@@ -670,7 +688,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                     print(f"warning: could not log the LLM call: {e}", file=sys.stderr, flush=True)
         else:
             summary = dummy_summary(msgs, tz, lang)
-        sections.append(Section(name, summary, len(msgs)))
+        sections.append(Section(name, summary, len(msgs), omitted))
 
     common = {"title": args.email_title, "lang": lang, "warning": warning}
     digest = build_digest(sections, args.hours, **common)
