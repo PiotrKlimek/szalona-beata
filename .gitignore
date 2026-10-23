@@ -8,3 +8,6 @@
 *.db-shm
 *.db-wal
 data/
+
+# Local previews (contain chat content)
+preview*.html

@@ -1,90 +1,391 @@
-# szalona-beata (POC)
+# szalona-beata
 
-Reads selected WhatsApp groups and produces summaries — fully local, no third-party service.
+Daily email summaries of selected WhatsApp groups (e.g. school class groups), running on your own server.
+Your WhatsApp account is linked only to your own machine. No third-party service ever gets access to it.
 
 ```
-bridge (Go, whatsmeow)  --writes-->  SQLite (volume wa-data)  <--reads--  summarizer (Python)
-   linked device, like                                                       |  dummy: stats only
-   WhatsApp Web                                                              |  ollama: local LLM
-        ^                                                                    |
-        +------------------- POST /send (digest to a group) <---------------+
+                     your server (Docker Compose)
+ ┌────────────────────────────────────────────────────────────────────┐
+ │  bridge (Go, whatsmeow)  ──►  SQLite  ◄──  summarizer (Python)     │
+ │  linked device, like          (volume)      │                      │
+ │  WhatsApp Web                               ├─ dummy: statistics   │
+ │                                             ├─ ollama: local model │
+ │                                             └─ openai: Groq API ───┼──► LLM provider (optional)
+ └─────────────────────────────────────────────┬──────────────────────┘
+                                               └── SMTP ──► Resend ──► your inbox
 ```
 
-- **bridge** links to WhatsApp as a companion device (QR code or pairing code) and stores messages only from
-  groups listed in `WATCH_GROUPS` (private chats and other groups are dropped without being saved; only group
-  names are kept so `--list-groups` works). It exposes `/send` + `/health` inside the compose network
-  (no published ports). Sending is restricted to groups.
-- **summarizer** is a one-shot CLI: `--model dummy` (message/sender statistics, no AI) or `--model ollama`
-  (default `qwen2.5:0.5b`, ~600 MB RAM — proves the pipeline, quality is poor; use a 3B+ model for real use).
-- `--model openai` uses an external OpenAI-compatible API (default: Groq, `openai/gpt-oss-120b`). It refuses
-  to send chats from the real database unless `--allow-real-data` is given — test it with synthetic data:
-  ```sh
-  docker compose run --rm --entrypoint python summarizer sample_data.py /samples/sample.db
-  docker compose run --rm summarizer --db /samples/sample.db --group "Klasa 2c" --model openai
-  ```
-  Rate limits (HTTP 429) are retried after the server's `Retry-After` delay (up to 3 times, max 120 s);
-  if the model stays unavailable, that group falls back to statistics so the digest still goes out.
-- **ollama** serves the model; it's pulled automatically on first use. It runs only on demand
-  (compose profile `llm`) and unloads the model right after each request (`OLLAMA_KEEP_ALIVE=0`).
+The **bridge** links to WhatsApp as a companion device, the same mechanism as WhatsApp Web. It stores messages
+only from the groups you list. The **summarizer** turns the last 24 h of each group into topic threads and
+sends them as an HTML email.
 
-> ⚠️ Unofficial clients violate WhatsApp's ToS. Reading is low-risk; sending can get the account banned.
-> Prefer a secondary number added to the groups. The phone must come online at least every ~14 days
-> or linked devices get logged out.
+| Part | Where data goes |
+|---|---|
+| WhatsApp session keys, messages | only your server (Docker volume) |
+| Summaries with `--model dummy` / `ollama` | only your server |
+| Summaries with `--model openai` | the chat text of the selected groups is sent to the LLM provider (Groq by default) |
+| The email | the email provider (Resend) and your mailbox |
 
-## Usage
+## Before you start: read this
+
+- **WhatsApp's Terms of Service do not allow unofficial clients.** Reading is practically undetectable.
+  Sending messages (`--send-to`) can get the account banned. This project emails summaries and never posts to
+  WhatsApp unless you explicitly use `--send-to`. If you can, link a secondary number that is a member of the groups.
+- **Other people's messages.** Group chats contain messages from other people, for example other parents.
+  Summaries are for your own use. Don't forward them outside the group, and think twice before sending real
+  chats to an external LLM API (see [Groq](#5-optional-better-summaries-with-groq)).
+- **Your phone must come online at least every ~14 days**, or WhatsApp logs out linked devices.
+- **The bridge never sends read receipts or "online" presence.** Your chats stay unread on the phone and nobody
+  sees you online. The only visible trace is a device called *szalona-beata* under *Linked devices*, and only you see it.
+
+## Requirements
+
+- A Linux machine that is always on (a small VPS is fine). The bridge uses ~10 MB RAM. The summarizer runs for
+  seconds and exits. A local LLM needs much more, see [Local models](#local-models-ollama).
+- Docker with Compose v2.20+ (`docker compose version`).
+- About 15 minutes, a phone with WhatsApp, and (optional) accounts at Resend and Groq.
+
+Everything runs in containers. You don't need Go or Python on the host.
+
+---
+
+## 1. Get the code and configure
 
 ```sh
-# 0. Choose the groups to read — BEFORE linking (history is synced only once, at link time)
-cp .env.example .env && $EDITOR .env    # WATCH_GROUPS=Rowery Gdynia, Klasa 3B
+git clone https://github.com/PiotrKlimek/szalona-beata.git
+cd szalona-beata
+cp .env.example .env
+chmod 600 .env        # .env will hold API keys; .gitignore keeps it out of git
+```
 
-# 1. Start the bridge and link it (WhatsApp > Settings > Linked devices > Link a device)
-docker compose up -d bridge
-docker compose logs -f bridge          # scan the QR code shown here; Ctrl+C when "Device linked"
-#    or, instead of QR:  PAIR_PHONE=48500100200 docker compose up -d bridge  → pairing code in logs
+Leave `WATCH_GROUPS` **empty** for now (`WATCH_GROUPS=`). You will find the group IDs in the next step.
 
-# 2. Wait for history sync ("History sync ...: saved N group messages"), then list groups
+## 2. Find the IDs of your groups (discovery link)
+
+The WhatsApp app doesn't show group IDs (JIDs, like `120363012345678901@g.us`). The easiest way to get them is
+to link the bridge once with an empty `WATCH_GROUPS`. In that mode it stores **no messages** at all, only the
+group list.
+
+```sh
+# Link with a pairing code: easier than scanning a QR code from server logs.
+# Pass the phone number (country code, no +) on the command line only, so it isn't stored in .env.
+PAIR_PHONE=48500100200 docker compose up -d bridge
+docker compose logs -f bridge
+#   [Bridge INFO] Pairing code: ABCD-1234 (WhatsApp > Linked devices > Link with phone number)
+```
+
+On the phone: **WhatsApp → Settings → Linked devices → Link a device → "Link with phone number instead"**, then
+type the code. It expires after a few minutes. You should then see `Device linked` and `Synced N groups` in the logs.
+
+> Prefer a QR code? Run `docker compose up -d bridge` without `PAIR_PHONE` and scan the code printed by
+> `docker compose logs -f bridge`. It refreshes every ~20 s.
+
+List your groups:
+
+```sh
 docker compose run --rm summarizer --list-groups
-
-# 3. Summarize (prints only)
-docker compose run --rm summarizer --group "Rowery" --group "3B" --hours 24 --model dummy
-docker compose --profile llm run --rm summarizer --group "Rowery" --model ollama   # starts ollama
-docker compose --profile llm stop ollama                                           # optional, frees ~20 MB
-
-# 4. Send the digest to a group
-docker compose --profile llm run --rm summarizer --group "Rowery" --model ollama   # starts ollama
-docker compose --profile llm stop ollama                                           # optional, frees ~20 MB --send-to "Podsumowania"
+#   120363012345678901@g.us  Class 3A parents  (0 messages)
+#   48500100200-1602752543@g.us  Old group  (0 messages)       ← pre-2020 group, works the same
 ```
 
-### Daily email digest
+Archived or muted groups work normally.
 
-Uses SMTP; defaults target [Resend](https://resend.com) (free: 3,000 emails/month, 100/day).
-Create an API key in Resend, then set `EMAIL_TO`, `EMAIL_FROM` and `SMTP_PASSWORD` in `.env` (see `.env.example`).
-Without a verified domain Resend only sends from `onboarding@resend.dev` to your own Resend account address.
+## 3. Link for real, with your groups
+
+WhatsApp sends message **history only once, at the moment a device is linked**. So now set the groups and link
+again, which makes the history of the chosen groups arrive.
 
 ```sh
-docker compose run --rm summarizer --email-to you@example.com   # one-off test (groups from WATCH_GROUPS)
-docker compose --profile digest up -d digest                     # every day at DAILY_AT (default 20:00)
-# with SUMMARY_MODEL=ollama:  docker compose --profile digest --profile llm up -d digest
-docker compose logs -f digest
+# 1. Remove the discovery session (it contains only session keys + group names)
+docker compose rm -sf bridge
+docker volume rm szalona-beata_wa-data     # name = <project dir>_wa-data, check with: docker volume ls
+
+# 2. Put the chosen JIDs (or exact group names) into .env
+#    WATCH_GROUPS=120363012345678901@g.us, 120363098765432109@g.us
+
+# 3. Link again (new pairing code)
+PAIR_PHONE=48500100200 docker compose up -d bridge
+docker compose logs -f bridge
+#   History sync (RECENT): saved 434 group messages
+
+# 4. Recreate the container without PAIR_PHONE, so the number doesn't stay in its config
+docker compose up -d bridge
 ```
 
-Note: the digest text passes through the email provider.
+On the phone, delete the old *szalona-beata* entry from the discovery link under **Linked devices**.
 
-Changing `WATCH_GROUPS` later: edit `.env`, then `docker compose up -d bridge`. On start the bridge deletes
-stored messages of groups no longer listed; newly added groups are collected from that moment on (no history).
-Note that WhatsApp delivers all messages to a linked device — the filter drops unwatched ones in memory.
+JIDs are better than names because they survive renames. Messages from other groups and from private chats are
+dropped in memory and never written to disk. WhatsApp delivers everything to a linked device, so the filter runs
+in the bridge, not on WhatsApp's side.
 
-`--group` in the summarizer is matched by JID, exact name or unique name fragment (case-insensitive).
-All settings are listed in `.env.example`.
-To use Ollama on another machine: `docker compose run --rm summarizer --ollama-url http://host:11434 ...`.
-
-To unlink: remove the device on the phone, then `docker compose down && docker volume rm szalona-beata_wa-data`.
-
-## Tests
+Check that it works:
 
 ```sh
-./test.sh          # Go (bridge) + Python (summarizer) unit tests, run in Docker
+docker compose run --rm -e EMAIL_TO= summarizer --hours 168 --model dummy
+#   *Class 3A parents*
+#   60 messages from 10 people between 16.10 15:27 and 22.10 14:46. Most active: ...
 ```
 
-Image builds also run the tests. `bridge/main.go` (whatsmeow wiring) is integration glue and is verified
-by linking a real account; all logic lives in tested files (`text.go`, `convert.go`, `store.go`, `http.go`).
+## 4. Email delivery with Resend
+
+[Resend](https://resend.com) sends email through SMTP. The free plan has 3,000 emails/month, 100/day and
+1 domain. That was true at the time of writing (October 2026); check their pricing page.
+
+### 4.1 Create an account and an API key
+
+1. Sign up at **https://resend.com/signup** (email, Google or GitHub) and confirm your email address.
+   Remember this address. Until you add your own domain, Resend delivers **only to the account's own address**.
+2. In the dashboard open **API Keys → Create API Key**:
+   - Name: `szalona-beata`
+   - Permission: **Sending access** (full access is not needed)
+   - Domain: **All domains**
+3. Click **Add** and copy the key (`re_...`). **It is shown only once.**
+
+### 4.2 Store the key without it appearing on screen or in shell history
+
+```sh
+printf 'Resend API key: '; read -rs KEY; echo
+printf 'SMTP_PASSWORD=%s\n' "$KEY" >> .env; unset KEY
+```
+
+Then set in `.env`:
+
+```sh
+EMAIL_TO=the-address-you-signed-up-with@example.com
+EMAIL_FROM=Szalona Beata <onboarding@resend.dev>     # Resend's test sender, works without a domain
+```
+
+The SMTP host, port and user default to Resend (`smtp.resend.com:465`, user `resend`, password = API key).
+Any other SMTP server works through `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER` and `SMTP_SECURITY` (`ssl|starttls|none`).
+
+### 4.3 Send a test email
+
+```sh
+docker compose run --rm summarizer --hours 24
+#   Emailed to the-address-you-signed-up-with@example.com.
+```
+
+Emails from `resend.dev` often land in **Spam** or **Promotions**, so check there. The Resend dashboard
+(**Emails**) shows the delivery status.
+
+> **Every manual run emails** while `EMAIL_TO` is set in `.env`. To only print, use `-e EMAIL_TO=`
+> (`docker compose run --rm -e EMAIL_TO= summarizer ...`). To preview the HTML without sending:
+> `docker compose run --rm -e EMAIL_TO= -u "$(id -u):$(id -g)" -v "$PWD":/out summarizer --html-out /out/preview.html`
+> (the file contains real chat content: don't commit it).
+
+### 4.4 Optional: your own domain, to email other people
+
+1. Resend → **Domains → Add Domain**. Use a subdomain (e.g. `digest.example.com`) so your main domain's
+   mail setup is left alone.
+2. Add the DNS records Resend shows at your DNS provider: a DKIM `TXT` record, plus `MX` and SPF `TXT` records
+   for the `send` subdomain (DMARC is optional).
+3. Click **Verify DNS Records**. It takes minutes to hours. Check with `dig TXT resend._domainkey.digest.example.com`.
+4. Change `.env`: `EMAIL_FROM=Szalona Beata <digest@digest.example.com>` and list recipients:
+   `EMAIL_TO=me@example.com, partner@example.com`.
+
+Emails from a verified domain also land in spam less often.
+
+### 4.5 Customize the email
+
+```sh
+EMAIL_SUBJECT=Class groups summary, last {hours}h {date}     # placeholders: {date} {hours} {groups}
+EMAIL_TITLE=Class groups summary                              # heading at the top of the email
+```
+
+## 5. Optional: better summaries with Groq
+
+`--model dummy` only counts messages. For real summaries ("trip on Thursday 8:00, 65 PLN by Monday; open
+question: ...") you need a language model. Small local models (0.5B–3B) make things up, see [Local models](#local-models-ollama).
+[Groq](https://groq.com) has a free API with large open models that handle Polish well.
+
+### 5.1 Create an account and an API key
+
+1. Sign up at **https://console.groq.com** (email, Google or GitHub). No credit card is needed for the free plan.
+2. Open **API Keys → Create API Key**, name it `szalona-beata`, and copy the key (`gsk_...`). **It is shown only once.**
+3. Store it the same way as the Resend key:
+
+```sh
+printf 'Groq API key: '; read -rs KEY; echo
+printf 'LLM_API_KEY=%s\n' "$KEY" >> .env; unset KEY
+```
+
+The defaults are Groq's OpenAI-compatible endpoint and `openai/gpt-oss-120b`. Any OpenAI-compatible API
+works (Mistral, OpenRouter, Ollama's `/v1`) through `LLM_BASE_URL` and `LLM_MODEL`.
+
+### 5.2 Try it on made-up data first
+
+`--model openai` **refuses to send chats from the real database** unless you pass `--allow-real-data`.
+Start with a synthetic database of invented groups and people:
+
+```sh
+docker compose run --rm --entrypoint python summarizer sample_data.py /samples/sample.db   # once
+docker compose run --rm -e EMAIL_TO= summarizer --db /samples/sample.db \
+  --group "Klasa 2c" --group "Rodzice 4a" --model openai
+```
+
+```
+*Klasa 2c (test)*
+▸ Wycieczka do Centrum Nauki
+- Wyjazd: czwartek 6.11, zbiórka 8:00 pod szkołą, powrót ok. 14:30
+- Koszt 65 zł, wpłata do poniedziałku
+▸ Zgubiona niebieska bluza
+- Znaleziono, problem rozwiązany
+Tokens: 1223 in + 1777 out = 3000 total
+```
+
+Message times are relative to when the sample was created. To refresh them, delete the database first
+(`docker compose run --rm --entrypoint rm summarizer /samples/sample.db`), because the generator never
+overwrites an existing file.
+
+Interleaved topics come out as separate threads (shown as separate boxes in the email). Unanswered questions
+stay questions ("Pytanie: ...") instead of turning into decisions.
+
+### 5.3 Use it on your groups
+
+Decide whether you're comfortable sending your groups' messages to the provider. Free plans may use data to
+improve their services, so check the provider's terms.
+
+```sh
+docker compose run --rm summarizer --hours 24 --model openai --allow-real-data
+```
+
+### 5.4 Limits and token usage
+
+Measured on a free Groq account in October 2026 (`openai/gpt-oss-120b`, from the API's `x-ratelimit-*` headers):
+
+| Limit | Value | One digest of 3 groups |
+|---|---|---|
+| Requests per day | 1,000 | 3 (one per group) |
+| Tokens per minute | 8,000 | ~1.6k–3.4k |
+
+A daily digest fits easily. On a very busy day a burst over 8k tokens/minute gets HTTP 429. The summarizer
+waits for `Retry-After` and retries (3×, at most 120 s each). If the model still fails, that group falls back
+to statistics, so the email always goes out. Your current limits are at `console.groq.com/settings/limits`.
+
+`gpt-oss` is a reasoning model, so hidden reasoning counts as output tokens. `LLM_REASONING_EFFORT` trades
+quality for tokens:
+
+| `LLM_REASONING_EFFORT` | Output tokens (same day, 3 groups) | Style |
+|---|---|---|
+| `low` (default) | ~540 | more "who said what" |
+| `medium` | ~1,200 | synthesized decisions and open questions (recommended) |
+| `off` | n/a | omit the parameter, for models without reasoning |
+
+## 6. Daily schedule
+
+The `digest` service keeps running and sends one digest every day at `DAILY_AT` (default `20:00`, in `TZ`,
+DST-safe). It summarizes `DIGEST_GROUPS` (default: `WATCH_GROUPS`) over the last `DIGEST_HOURS`.
+
+```sh
+# .env: SUMMARY_MODEL=dummy | ollama | openai, DAILY_AT=20:00
+docker compose --profile digest up -d digest
+docker compose logs -f digest        # "Scheduled daily at 20:00 (Europe/Warsaw)", later "Emailed to ..."
+docker compose --profile digest rm -sf digest     # stop the schedule
+```
+
+With `SUMMARY_MODEL=openai` the scheduled run needs the same explicit consent as a manual one. Add it in a
+`docker-compose.override.yml`, which Compose loads automatically:
+
+```yaml
+services:
+  digest:
+    command: ["--daily-at", "${DAILY_AT:-20:00}", "--hours", "${DIGEST_HOURS:-24}", "--allow-real-data"]
+```
+
+## Local models (Ollama)
+
+`--model ollama` keeps everything on your server. Ollama starts only on demand (profile `llm`) and unloads the
+model right after each request.
+
+```sh
+docker compose --profile llm run --rm summarizer --model ollama --ollama-model qwen2.5:7b
+docker compose --profile llm stop ollama
+```
+
+Rough RAM needs at Q4 quantization with an ~8k-token context:
+
+| Model | RAM for the model | Machine | Polish summaries |
+|---|---|---|---|
+| `qwen2.5:0.5b` (default) | ~0.6 GB | any | unusable, makes things up; only proves the pipeline |
+| 3–4B (Qwen, Gemma 3, Llama 3.2) | 2.5–4.5 GB | 4 GB + swap / 8 GB | acceptable |
+| 7–8B (Qwen 2.5/3, Llama 3.1) | 5.5–6.5 GB | 8 GB | good |
+| Bielik 11B (Polish), Gemma 3 12B | 8–10 GB | 12–16 GB | very good |
+
+On 2 vCPUs a 7–8B model needs a few minutes per group. That's fine once a day. **An Apple Silicon Mac (M1+)** is
+a good model host. Run Ollama natively (not in Docker, which has no GPU access on macOS), connect it over
+[Tailscale](https://tailscale.com) (never expose Ollama to the internet, it has no authentication), and point the
+summarizer at it with `--ollama-url http://<mac>:11434`. The Mac must be awake at digest time.
+
+## Changing the groups later
+
+Edit `WATCH_GROUPS` in `.env`, then run `docker compose up -d bridge`. On start the bridge **deletes stored
+messages of groups no longer listed**. Newly added groups are collected from that moment on, with no history.
+To get history for a new group, unlink and link again (step 3).
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Sender shown as a long number | The group hides phone numbers (LID) and the name wasn't known yet. The bridge fills names in after each history batch and on reconnect. |
+| `Logged out` in bridge logs | Device removed on the phone or phone offline for ~14 days: remove the `wa-data` volume and link again. |
+| No history after linking | `WATCH_GROUPS` was empty or wrong at link time; history comes only once. Unlink and relink (step 3). |
+| Groq `403 Forbidden`, `error code: 1010` | Cloudflare blocks the default Python User-Agent. Fixed in the code; if you fork the HTTP client, keep a custom `User-Agent`. |
+| Groq `429` | Tokens-per-minute limit; retried automatically, see [Limits](#54-limits-and-token-usage). |
+| `refusing to send real chats to an external API` | Intended. Use `--allow-real-data` (or the override for the schedule). |
+| Email not arriving | Check Spam/Promotions and Resend → Emails. Without a domain, `EMAIL_TO` must be the Resend account address. |
+
+## Security notes
+
+- `.env` holds the Resend and Groq keys: keep it `chmod 600`. `.gitignore` excludes it, along with `*.db`.
+- The `wa-data` volume holds the **WhatsApp session keys**. Anyone with that file can read your WhatsApp as a
+  linked device. Anyone with root or `docker` group access on the host can reach it. Revoke access anytime by
+  deleting *szalona-beata* under **Linked devices** on the phone.
+- The bridge's HTTP API (`/send`, `/health`) has no published ports and is reachable only inside the Compose network.
+
+Unlink completely:
+
+```sh
+docker compose --profile digest --profile llm down
+docker volume rm szalona-beata_wa-data
+# and delete the device on the phone
+```
+
+## Configuration reference
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WATCH_GROUPS` | (empty: store nothing) | Groups whose messages the bridge stores (JIDs or exact names, comma-separated) |
+| `PAIR_PHONE` | | Link with a pairing code instead of QR (pass once on the command line) |
+| `SUMMARY_MODEL` | `dummy` | `dummy`, `ollama` or `openai` |
+| `DIGEST_GROUPS` | `WATCH_GROUPS` | Groups in the digest |
+| `DAILY_AT`, `DIGEST_HOURS` | `20:00`, `24` | Schedule of the `digest` service |
+| `EMAIL_TO`, `EMAIL_FROM` | | Recipients (comma-separated) and sender |
+| `EMAIL_SUBJECT`, `EMAIL_TITLE` | `WhatsApp digest {date}: {groups}`, `WhatsApp digest` | Subject template and email heading |
+| `SMTP_PASSWORD` | | Resend API key (or your SMTP password) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_SECURITY` | `smtp.resend.com`, `465`, `resend`, `ssl` | SMTP server |
+| `LLM_API_KEY` | | Groq (or other OpenAI-compatible) API key |
+| `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
+| `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
+| `OLLAMA_MODEL` | `qwen2.5:0.5b` | Local model for `--model ollama` |
+| `SUMMARY_LANGUAGE` | `Polish` | Language of the summaries |
+| `TZ` | `Europe/Warsaw` | Time zone for times, dates and the schedule |
+
+Most summarizer settings can also be overridden per run with flags: `docker compose run --rm summarizer --help`.
+
+## Development
+
+```
+bridge/        Go: whatsmeow wiring (main.go) + tested logic (text, convert, filter, names, store, http)
+summarizer/    Python stdlib only: summarize.py, sample_data.py, test_summarize.py
+test.sh        runs both test suites in Docker (no local toolchains needed)
+```
+
+```sh
+./test.sh
+```
+
+The code was written test-first, and image builds run the tests too. `bridge/main.go` is integration glue,
+verified by linking a real account. Everything else has unit tests that run against real SQLite, local HTTP and
+SMTP test servers.
+
+**When you change code, update this README (and `.env.example`) in the same commit.**
