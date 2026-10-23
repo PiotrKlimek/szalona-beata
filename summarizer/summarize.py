@@ -68,25 +68,76 @@ class Section(NamedTuple):
 
 READING_WPM = 200  # typical silent reading speed
 
+# Email/digest labels by SUMMARY_LANGUAGE; plural forms are (one, few, many).
+LABELS = {
+    "english": {
+        "digest": "Digest", "html_title": "WhatsApp digest", "last": "last {hours}h",
+        "message": ("message", "messages", "messages"), "person": ("person", "people", "people"),
+        "group": ("group", "groups", "groups"),
+        "savings": "≈{chat} min of chat reading condensed into ≈{digest} min",
+        "no_messages": "No messages.", "nothing_notable": "No notable topics.",
+        "stats": "{messages} from {people} between {first} and {last}. Most active: {ranking}.",
+        "model_unavailable": "model unavailable, showing statistics: {error}",
+        "footer": "Generated locally by szalona-beata from your WhatsApp groups.",
+        "bridge": {
+            "logged_out": "⚠️ The WhatsApp bridge is logged out: new messages are not collected. "
+                          "Link the device again (README, step 3).",
+            "disconnected": "⚠️ The WhatsApp bridge is not connected to WhatsApp: this digest may be incomplete.",
+            "unreachable": "⚠️ The WhatsApp bridge is not responding (check the bridge container): "
+                           "this digest may be incomplete.",
+        },
+    },
+    "polish": {
+        "digest": "Podsumowanie", "html_title": "Podsumowanie WhatsApp", "last": "ostatnie {hours} h",
+        "message": ("wiadomość", "wiadomości", "wiadomości"), "person": ("osoba", "osoby", "osób"),
+        "group": ("grupa", "grupy", "grup"),
+        "savings": "≈{chat} min czytania czatu skrócone do ≈{digest} min",
+        "no_messages": "Brak wiadomości.", "nothing_notable": "Nic istotnego.",
+        "stats": "{messages} ({people}), {first}–{last}. Najaktywniejsi: {ranking}.",
+        "model_unavailable": "model niedostępny, pokazuję statystyki: {error}",
+        "footer": "Wygenerowane lokalnie przez szalona-beata z Twoich grup WhatsApp.",
+        "bridge": {
+            "logged_out": "⚠️ Mostek WhatsApp jest wylogowany: nowe wiadomości nie są zbierane. "
+                          "Połącz urządzenie ponownie (README, krok 3).",
+            "disconnected": "⚠️ Mostek WhatsApp nie ma połączenia z WhatsAppem: podsumowanie może być niepełne.",
+            "unreachable": "⚠️ Mostek WhatsApp nie odpowiada (sprawdź kontener bridge): "
+                           "podsumowanie może być niepełne.",
+        },
+    },
+}
+
+
+def labels(lang):
+    return LABELS.get(lang.lower(), LABELS["english"])
+
+
+def plural(n, forms, lang):
+    """'1 wiadomość', '3 wiadomości', '5 osób' - Polish has three plural forms."""
+    one, few, many = forms
+    if n == 1:
+        return f"{n} {one}"
+    if lang.lower() == "polish":
+        return f"{n} {few if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else many}"
+    return f"{n} {many}"
+
 
 def reading_minutes(words):
     return math.ceil(words / READING_WPM)
 
 
-def _plural_messages(n):
-    return f"{n} message" if n == 1 else f"{n} messages"
-
-
-def _savings_line(sections):
+def _savings_line(sections, lang):
     """'120 messages · ≈8 min of chat reading condensed into ≈1 min', or None without messages."""
+    L = labels(lang)
     total = sum(s.messages for s in sections)
     if not total:
         return None
-    digest_min = max(1, reading_minutes(sum(len(_summary_text(s.summary).split()) for s in sections)))
+    digest_words = sum(len(_summary_text(s.summary, lang).split()) for s in sections)
+    digest_min = max(1, reading_minutes(digest_words))
     chat_min = reading_minutes(sum(s.words for s in sections))
+    count = plural(total, L["message"], lang)
     if chat_min <= digest_min:  # nothing saved - don't claim it
-        return _plural_messages(total)
-    return f"{_plural_messages(total)} · ≈{chat_min} min of chat reading condensed into ≈{digest_min} min"
+        return count
+    return f"{count} · " + L["savings"].format(chat=chat_min, digest=digest_min)
 
 
 class Msg(NamedTuple):
@@ -148,33 +199,37 @@ def format_transcript(msgs, max_chars, tz=None):
     return "\n".join(kept)
 
 
-def dummy_summary(msgs, tz=None):
+def dummy_summary(msgs, tz=None, lang="English"):
     """Statistics-only summary, used to test the pipeline without any model."""
+    L = labels(lang)
     senders = Counter(m.sender for m in msgs)
     ranking = ", ".join(f"{name} ({n})" for name, n in senders.most_common(5))
     first, last = (datetime.fromtimestamp(m.ts, tz) for m in (msgs[0], msgs[-1]))
     fmt = "%H:%M" if first.date() == last.date() else "%d.%m %H:%M"
-    return (
-        f"{len(msgs)} messages from {len(senders)} people between "
-        f"{first.strftime(fmt)} and {last.strftime(fmt)}. Most active: {ranking}."
+    return L["stats"].format(
+        messages=plural(len(msgs), L["message"], lang), people=plural(len(senders), L["person"], lang),
+        first=first.strftime(fmt), last=last.strftime(fmt), ranking=ranking,
     )
 
 
-def _summary_text(summary):
+def _summary_text(summary, lang="English"):
     if isinstance(summary, list):
         return "\n".join(f"▸ {t.title}\n" + "\n".join(f"- {p}" for p in t.points) for t in summary)
-    return summary or "No messages."
+    if summary == NOTHING_NOTABLE:
+        return labels(lang)["nothing_notable"]
+    return summary or labels(lang)["no_messages"]
 
 
-def build_digest(sections, hours, title="Digest"):
+def build_digest(sections, hours, title=None, lang="English", warning=None):
+    L = labels(lang)
     sections = [Section(*s) for s in sections]
-    header = f"📋 {title} (last {hours}h)"
-    if savings := _savings_line(sections):
+    header = f"📋 {title or L['digest']} ({L['last'].format(hours=hours)})"
+    if savings := _savings_line(sections, lang):
         header += f"\n{savings}"
-    parts = [header]
+    parts = [header] + ([warning] if warning else [])
     for s in sections:
-        count = f" ({_plural_messages(s.messages)})" if s.messages else ""
-        parts.append(f"*{s.name}*{count}\n{_summary_text(s.summary)}")
+        count = f" ({plural(s.messages, L['message'], lang)})" if s.messages else ""
+        parts.append(f"*{s.name}*{count}\n{_summary_text(s.summary, lang)}")
     return "\n\n".join(parts)
 
 
@@ -194,16 +249,15 @@ HTML_PAGE = """<!doctype html>
 <tr><td align="center" style="padding:24px 12px">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2a27">
 <tr><td style="background:#0b5f53;border-radius:12px 12px 0 0;padding:22px 24px">
-<div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a8dcd1">Szalona Beata</div>
-<div style="font-size:22px;font-weight:700;color:#ffffff;margin-top:4px">{title}</div>
-<div style="font-size:14px;color:#d6eee8;margin-top:4px">{day} &middot; last {hours}h &middot; {count} groups</div>
+{kicker}<div style="font-size:22px;font-weight:700;color:#ffffff;margin-top:4px">{title}</div>
+<div style="font-size:14px;color:#d6eee8;margin-top:4px">{day} &middot; {last} &middot; {count}</div>
 {savings}
 </td></tr>
 <tr><td style="background:#ffffff;border-radius:0 0 12px 12px;padding:8px 24px 16px">
-{cards}
+{warning}{cards}
 </td></tr>
 <tr><td style="padding:16px 24px;font-size:12px;color:#7a8783;text-align:center">
-Generated locally by szalona-beata from your WhatsApp groups.
+{footer}
 </td></tr>
 </table>
 </td></tr>
@@ -230,7 +284,7 @@ THREAD_BLOCK = (
 )
 
 
-def render_summary_html(summary):
+def render_summary_html(summary, lang="English"):
     """Render a summary as safe HTML: a list of Threads becomes one block per thread;
     plain text (optional "- " bullets and **bold**) becomes paragraphs and lists."""
     if isinstance(summary, list):
@@ -242,8 +296,9 @@ def render_summary_html(summary):
             )
             for n, t in enumerate(summary, start=1)
         )
-    if not summary:
-        return '<p style="margin:0 0 8px;color:#7a8783;font-style:italic">No messages.</p>'
+    if not summary or summary == NOTHING_NOTABLE:
+        text = labels(lang)["nothing_notable" if summary else "no_messages"]
+        return f'<p style="margin:0 0 8px;color:#7a8783;font-style:italic">{text}</p>'
     parts, items = [], []
 
     def flush():
@@ -263,20 +318,34 @@ def render_summary_html(summary):
     return "".join(parts)
 
 
-def build_html_digest(sections, hours, day, title="WhatsApp digest"):
+KICKER = ('<div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a8dcd1">'
+          'Szalona Beata</div>\n')
+WARNING_BANNER = ('<div data-warning="1" style="background:#fdecea;color:#8a1c12;border-radius:8px;'
+                  'padding:10px 12px;margin:16px 0 0;font-weight:600">{}</div>\n')
+
+
+def build_html_digest(sections, hours, day, title=None, lang="English", warning=None):
+    L = labels(lang)
     sections = [Section(*s) for s in sections]
     cards = "\n".join(
         CARD.format(
             name=htmllib.escape(s.name),
-            meta=(f'<div style="font-size:13px;color:#7a8783;margin:-4px 0 8px">{_plural_messages(s.messages)}</div>'
-                  if s.messages else ""),
-            summary=render_summary_html(s.summary),
+            meta=(f'<div style="font-size:13px;color:#7a8783;margin:-4px 0 8px">'
+                  f'{plural(s.messages, L["message"], lang)}</div>' if s.messages else ""),
+            summary=render_summary_html(s.summary, lang),
         )
         for s in sections
     )
-    savings = _savings_line(sections)
+    savings = _savings_line(sections, lang)
     return HTML_PAGE.format(
-        title=htmllib.escape(title), day=htmllib.escape(day), hours=hours, count=len(sections), cards=cards,
+        title=htmllib.escape(title or L["html_title"]),
+        kicker="" if title else KICKER,  # a custom title already names the sender
+        day=htmllib.escape(day),
+        last=L["last"].format(hours=hours),
+        count=plural(len(sections), L["group"], lang),
+        cards=cards,
+        warning=WARNING_BANNER.format(htmllib.escape(warning)) if warning else "",
+        footer=L["footer"],
         savings=(f'<div style="display:inline-block;margin-top:12px;padding:6px 10px;border-radius:6px;'
                  f'background:#0e7466;color:#ffffff;font-size:14px">⏱ {htmllib.escape(savings)}</div>'
                  if savings else ""),
@@ -460,6 +529,19 @@ class CallLog:
         self.db.commit()
 
 
+def check_bridge(bridge_url):
+    """None if the bridge is linked and connected, else 'logged_out', 'disconnected' or 'unreachable'."""
+    try:
+        health = _request("GET", f"{bridge_url.rstrip('/')}/health", timeout=10)
+    except (RuntimeError, OSError, ValueError):
+        return "unreachable"
+    if not health.get("logged_in"):
+        return "logged_out"
+    if not health.get("connected"):
+        return "disconnected"
+    return None
+
+
 def send_to_bridge(bridge_url, jid, text):
     _request("POST", f"{bridge_url.rstrip('/')}/send", {"jid": jid, "text": text}, timeout=60)
 
@@ -566,6 +648,13 @@ def parse_args(argv):
 def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=False):
     """Build one digest and deliver it (print, and optionally group and/or email)."""
     since = int(now - args.hours * 3600)
+    lang = args.language
+    warning = None
+    if not synthetic:  # sample databases have no bridge behind them
+        if status := check_bridge(args.bridge_url):
+            warning = labels(lang)["bridge"][status]
+            print(f"warning: bridge {status}", file=sys.stderr, flush=True)
+    usage_before = dict(getattr(llm, "usage", None) or {})
     sections = []
     for jid, name in groups:
         msgs = fetch_messages(db, jid, since)
@@ -576,27 +665,29 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                 summary = llm.summarize(format_transcript(msgs, args.max_chars, tz), args.language)
             except (RuntimeError, OSError) as e:  # API error, timeout, network
                 print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
-                summary = f"{dummy_summary(msgs, tz)}\n(model unavailable, showing statistics: {e})"
+                unavailable = labels(lang)["model_unavailable"].format(error=e)
+                summary = f"{dummy_summary(msgs, tz, lang)}\n({unavailable})"
             if call_log and getattr(llm, "last_exchange", None):
                 call_log.record(llm.last_exchange, jid, name, now, synthetic)
         else:
-            summary = dummy_summary(msgs, tz)
+            summary = dummy_summary(msgs, tz, lang)
         sections.append(Section(name, summary, len(msgs), sum(len(m.text.split()) for m in msgs)))
 
-    title = {"title": args.email_title} if args.email_title else {}
-    digest = build_digest(sections, args.hours, **title)
+    common = {"title": args.email_title, "lang": lang, "warning": warning}
+    digest = build_digest(sections, args.hours, **common)
     print(digest, flush=True)
     if usage := getattr(llm, "usage", None):
+        run = {k: v - usage_before.get(k, 0) for k, v in usage.items()}  # this run only
         print(
-            f"\nTokens: {usage['prompt_tokens']} in + {usage['completion_tokens']} out "
-            f"= {usage['total_tokens']} total",
+            f"\nTokens: {run['prompt_tokens']} in + {run['completion_tokens']} out "
+            f"= {run['total_tokens']} total",
             file=sys.stderr,
         )
     if target:
         send_to_bridge(args.bridge_url, target[0], digest)
         print(f"\nSent to {target[1]}.", file=sys.stderr)
     day = datetime.fromtimestamp(now, tz).strftime("%d.%m.%Y")
-    html = build_html_digest(sections, args.hours, day, **title)
+    html = build_html_digest(sections, args.hours, day, **common)
     if args.html_out:
         with open(args.html_out, "w", encoding="utf-8") as f:
             f.write(html)

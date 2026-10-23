@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -276,6 +276,85 @@ class MessageCountsTest(unittest.TestCase):
     def test_singular_message(self):
         got = summarize.build_digest([summarize.Section("A", "x", messages=1, words=3)], hours=24)
         self.assertIn("*A* (1 message)", got)
+
+
+class PolishLabelsTest(unittest.TestCase):
+    def test_polish_plural_forms(self):
+        forms = ("wiadomość", "wiadomości", "wiadomości")
+        got = [summarize.plural(n, forms, "Polish") for n in (1, 2, 4, 5, 12, 22, 25, 101)]
+        self.assertEqual(got, ["1 wiadomość", "2 wiadomości", "4 wiadomości", "5 wiadomości",
+                               "12 wiadomości", "22 wiadomości", "25 wiadomości", "101 wiadomości"])
+        people = ("osoba", "osoby", "osób")
+        self.assertEqual([summarize.plural(n, people, "Polish") for n in (1, 3, 5, 13, 24)],
+                         ["1 osoba", "3 osoby", "5 osób", "13 osób", "24 osoby"])
+
+    def test_polish_text_digest(self):
+        sections = [summarize.Section("Klasa 1a (test)", "Wycieczka.", messages=120, words=1500),
+                    summarize.Section("Klasa 2b (test)", None),
+                    summarize.Section("Klasa 3c (test)", summarize.NOTHING_NOTABLE, messages=2, words=4)]
+        got = summarize.build_digest(sections, hours=24, lang="Polish")
+        self.assertTrue(got.startswith(
+            "📋 Podsumowanie (ostatnie 24 h)\n"
+            "122 wiadomości · ≈8 min czytania czatu skrócone do ≈1 min\n\n"), got)
+        self.assertIn("*Klasa 1a (test)* (120 wiadomości)\nWycieczka.", got)
+        self.assertIn("*Klasa 2b (test)*\nBrak wiadomości.", got)
+        self.assertIn("*Klasa 3c (test)* (2 wiadomości)\nNic istotnego.", got)
+
+    def test_polish_html_digest(self):
+        html = summarize.build_html_digest(
+            [summarize.Section("Klasa 1a (test)", None), summarize.Section("Klasa 2b (test)", "x", 1, 1)],
+            hours=24, day="23.10.2026", lang="Polish")
+        self.assertIn("23.10.2026 &middot; ostatnie 24 h &middot; 2 grupy", html)
+        self.assertIn("Brak wiadomości.", html)
+        self.assertIn("1 wiadomość", html)
+        self.assertIn("Wygenerowane lokalnie", html)
+        self.assertNotIn("last 24h", html)
+
+    def test_polish_dummy_summary(self):
+        msgs = [summarize.Msg(T0, "Ania", "a"), summarize.Msg(T0 + 60, "Bartek", "b"),
+                summarize.Msg(T0 + 7200, "Ania", "c")]
+        self.assertEqual(
+            summarize.dummy_summary(msgs, tz=timezone.utc, lang="Polish"),
+            "3 wiadomości (2 osoby), 10:00–12:00. Najaktywniejsi: Ania (2), Bartek (1).",
+        )
+
+    def test_kicker_hidden_with_custom_title(self):
+        default = summarize.build_html_digest([("A", "x")], hours=24, day="1.1.2026")
+        custom = summarize.build_html_digest([("A", "x")], hours=24, day="1.1.2026", title="Podsumowanie od Beaty")
+        self.assertIn("Szalona Beata", default)
+        self.assertNotIn("Szalona Beata", custom)
+
+
+class BridgeHealthTest(unittest.TestCase):
+    def status(self, response):
+        srv = FakeServer({("GET", "/health"): response})
+        self.addCleanup(srv.close)
+        return summarize.check_bridge(srv.url)
+
+    def test_healthy(self):
+        self.assertIsNone(self.status((200, {"connected": True, "logged_in": True})))
+
+    def test_logged_out(self):
+        self.assertEqual(self.status((200, {"connected": True, "logged_in": False})), "logged_out")
+
+    def test_disconnected(self):
+        self.assertEqual(self.status((200, {"connected": False, "logged_in": True})), "disconnected")
+
+    def test_unreachable(self):
+        import socket
+
+        with socket.socket() as sock:  # a port nothing listens on
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        self.assertEqual(summarize.check_bridge(f"http://127.0.0.1:{port}"), "unreachable")
+
+    def test_warning_heads_text_and_html_digest(self):
+        warning = "⚠️ Mostek WhatsApp jest wylogowany"
+        text = summarize.build_digest([("A", None)], hours=24, warning=warning)
+        html = summarize.build_html_digest([("A", None)], hours=24, day="1.1.2026", warning=warning)
+        self.assertLess(text.index(warning), text.index("*A*"))
+        self.assertIn('data-warning="1"', html)
+        self.assertLess(html.index(warning), html.index(">A<"))
 
 
 class ThreadRenderingTest(unittest.TestCase):
@@ -832,6 +911,15 @@ class MainTest(unittest.TestCase):
         db.commit()
         db.close()
 
+        # a healthy bridge unless a test says otherwise
+        self.bridge = FakeServer({("GET", "/health"): (200, {"connected": True, "logged_in": True})})
+        self.addCleanup(self.bridge.close)
+        from unittest import mock
+
+        env = mock.patch.dict(os.environ, {"BRIDGE_URL": self.bridge.url, "SUMMARY_LANGUAGE": "English"})
+        env.start()
+        self.addCleanup(env.stop)
+
     def run_main(self, *args):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -1090,6 +1178,59 @@ class MainTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LLM_API_KEY": ""}):
             code, _ = self.run_main("--group", "rowery", "--model", "openai", "--allow-real-data")
         self.assertEqual(code, 2)
+
+    def test_logged_out_bridge_warns_in_digest_and_still_emails(self):
+        import email
+        import os
+        from unittest import mock
+
+        bridge = FakeServer({("GET", "/health"): (200, {"connected": False, "logged_in": False})})
+        self.addCleanup(bridge.close)
+        smtp = FakeSMTPServer()
+        self.addCleanup(smtp.close)
+        env = {"BRIDGE_URL": bridge.url, "SUMMARY_LANGUAGE": "Polish",
+               "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(smtp.port), "SMTP_SECURITY": "none",
+               "SMTP_PASSWORD": "x", "EMAIL_FROM": "a@example.com"}
+        with mock.patch.dict(os.environ, env):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+
+        self.assertEqual(code, 0)
+        self.assertIn("wylogowany", out)
+        msg = email.message_from_string(smtp.envelopes[0][2], policy=email.policy.default)
+        self.assertIn("wylogowany", msg.get_body(("html",)).get_content())
+
+    def test_synthetic_database_skips_bridge_check(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        sample = os.path.join(tempfile.mkdtemp(), "sample.db")
+        sample_data.create_sample_db(sample, now=T0)
+        with mock.patch.dict(os.environ, {"LLM_LOG_DB": "off"}), redirect_stdout(io.StringIO()):
+            summarize.main(["--db", sample, "--group", "Klasa 2c", "--model", "dummy"], now=T0)
+
+        self.assertEqual(self.bridge.requests, [])
+
+    def test_token_usage_is_printed_per_run(self):
+        # the scheduled digest reuses one client for days; each run must show only its own usage
+        import os
+        from unittest import mock
+
+        srv = self.llm_server()  # 50 in + 10 out per call
+        with mock.patch.dict(os.environ, {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": "off"}):
+            args = summarize.parse_args(["--db", self.db_path, "--hours", "2", "--model", "openai"])
+        llm = summarize.OpenAICompat(srv.url, "k", "m")
+        db = sqlite3.connect(self.db_path)
+        groups = [(BIKES, "Rowery")]
+
+        outputs = []
+        for _ in range(2):
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                summarize.run_digest(args, db, groups, None, llm, T0 + 3600, timezone.utc, synthetic=True)
+            outputs.append(err.getvalue())
+
+        self.assertIn("Tokens: 50 in + 10 out = 60 total", outputs[1])
 
     def test_unknown_group_exits_with_error(self):
         code, _ = self.run_main("--group", "nonexistent", "--model", "dummy")

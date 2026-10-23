@@ -19,6 +19,8 @@ The **bridge** links to WhatsApp as a companion device, the same mechanism as Wh
 only from the groups you list. The **summarizer** turns the last 24 h of each group into topic threads and
 sends them as an HTML email. The email shows how many messages each group had and how much reading time the
 summary saves (e.g. "120 messages · ≈8 min of chat reading condensed into ≈1 min", at 200 words/minute).
+Before each digest the summarizer checks the bridge. If WhatsApp has logged the device out or the bridge is
+down, the email starts with a red warning instead of quietly reporting "no messages".
 
 | Part | Where data goes |
 |---|---|
@@ -358,7 +360,8 @@ To get history for a new group, unlink and link again (step 3).
 | Symptom | Cause / fix |
 |---|---|
 | Sender shown as a long number | The group hides phone numbers (LID) and the name wasn't known yet. The bridge fills names in after each history batch and on reconnect. |
-| `Logged out` in bridge logs | Device removed on the phone or phone offline for ~14 days: remove the `wa-data` volume and link again. |
+| Red "bridge is logged out" warning in the email, `Logged out` in bridge logs | Device removed on the phone or phone offline for ~14 days: remove the `wa-data` volume and link again (step 3). |
+| Red "bridge is not responding" warning | The bridge container is down: `docker compose up -d bridge`, then check `docker compose logs bridge`. |
 | No history after linking | `WATCH_GROUPS` was empty or wrong at link time; history comes only once. Unlink and relink (step 3). |
 | Groq `403 Forbidden`, `error code: 1010` | Cloudflare blocks the default Python User-Agent. Fixed in the code; if you fork the HTTP client, keep a custom `User-Agent`. |
 | Groq `429` | Tokens-per-minute limit; retried automatically, see [Limits](#54-limits-and-token-usage). |
@@ -399,7 +402,7 @@ docker volume rm szalona-beata_wa-data
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
 | `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
 | `OLLAMA_MODEL` | `qwen2.5:0.5b` | Local model for `--model ollama` |
-| `SUMMARY_LANGUAGE` | `Polish` | Language of the summaries |
+| `SUMMARY_LANGUAGE` | `Polish` | Language of the summaries and of the email labels (`Polish` or `English`; other languages get English labels) |
 | `TZ` | `Europe/Warsaw` | Time zone for times, dates and the schedule |
 
 Most summarizer settings can also be overridden per run with flags: `docker compose run --rm summarizer --help`.
@@ -417,10 +420,8 @@ Next steps:
       using the [call log](#55-call-log-for-prompt-tuning). A `--replay` command for this would help.
 - [ ] **Consistent sender names.** A message keeps the sender's own push name if it had one, otherwise it gets
       the address-book name, so one person can show up under two names. Prefer the address-book name.
-- [ ] **Token counter in schedule mode.** `Tokens: ...` is cumulative across days in the long-running `digest`
-      service. It should be printed per run.
-- [ ] **Email localization.** Labels like "last 24h", "groups", "No messages" are English while the summaries
-      are Polish. The small "SZALONA BEATA" line above a custom `EMAIL_TITLE` duplicates the title.
+- [ ] **Data retention.** Messages and the LLM call log grow forever and contain other people's chats.
+      Delete entries older than e.g. 30–90 days automatically.
 - [ ] **License.** Not chosen yet: without one, the code is visible but all rights are reserved.
 
 ## Development
