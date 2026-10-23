@@ -378,7 +378,8 @@ To get history for a new group, unlink and link again (step 3).
 - **Retention:** with `RETENTION_DAYS` set, the bridge deletes older messages at start and then daily, and doesn't
   store expired messages that arrive again (e.g. history after a re-link). The summarizer deletes older LLM call log
   entries at start, before each new entry, and before each scheduled run in `dummy`/`ollama` mode (if a log
-  exists). Group names are kept.
+  exists). Group names are kept. A failing purge or log write (e.g. the log is locked) only prints a warning:
+  the digest still goes out.
 
 Unlink completely:
 

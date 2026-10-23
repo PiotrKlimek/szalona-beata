@@ -1205,6 +1205,22 @@ class MainTest(unittest.TestCase):
         self.assertIn("Internal Server Error", error)
         self.assertIsNone(response)
 
+    def test_failing_log_write_does_not_block_the_digest(self):
+        import os
+        from unittest import mock
+
+        srv = self.llm_server()
+        env = {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": ""}
+        locked = sqlite3.OperationalError("database is locked")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(summarize.CallLog, "record", side_effect=locked), \
+                redirect_stderr(err):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+
+        self.assertEqual(code, 0)
+        self.assertIn("▸ Wyjazd", out)
+        self.assertIn("warning: could not log", err.getvalue())
+
     def test_llm_log_can_be_disabled(self):
         import os
         from unittest import mock
@@ -1226,6 +1242,20 @@ class MainTest(unittest.TestCase):
             self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")
 
         self.assertEqual(sqlite3.connect(self.log_path).execute("SELECT COUNT(*) FROM llm_calls").fetchone(), (0,))
+
+    def test_failing_log_purge_does_not_block_the_digest(self):
+        # e.g. the log is locked by someone querying it at digest time
+        import os
+        from unittest import mock
+
+        os.mkdir(self.log_path)  # exists, but SQLite can't open it
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"RETENTION_DAYS": "720", "LLM_LOG_DB": ""}), redirect_stderr(err):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")
+
+        self.assertEqual(code, 0)
+        self.assertIn("*Rowery* (2 messages)", out)
+        self.assertIn("warning: could not purge", err.getvalue())
 
     def test_dummy_mode_writes_no_log(self):
         import os

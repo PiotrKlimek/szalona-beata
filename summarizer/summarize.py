@@ -662,7 +662,10 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                 unavailable = labels(lang)["model_unavailable"].format(error=e)
                 summary = f"{dummy_summary(msgs, tz, lang)}\n({unavailable})"
             if call_log and getattr(llm, "last_exchange", None):
-                call_log.record(llm.last_exchange, jid, name, now, synthetic)
+                try:
+                    call_log.record(llm.last_exchange, jid, name, now, synthetic)
+                except (sqlite3.Error, OSError) as e:  # logging must never block the digest
+                    print(f"warning: could not log the LLM call: {e}", file=sys.stderr, flush=True)
         else:
             summary = dummy_summary(msgs, tz, lang)
         sections.append(Section(name, summary, len(msgs)))
@@ -746,9 +749,13 @@ def main(argv=None, now=None):
     call_log = CallLog(args.llm_log, args.retention_days, now) if llm and args.llm_log else None
 
     def purge_unused_log(at):
-        # an old log keeps chats even when this run doesn't log (dummy/ollama): purge it anyway
+        # an old log keeps chats even when this run doesn't log (dummy/ollama): purge it anyway,
+        # but never let a failing purge (locked file, full disk) stop the digest
         if not call_log and args.llm_log and args.retention_days and os.path.exists(args.llm_log):
-            CallLog(args.llm_log, args.retention_days, at).db.close()
+            try:
+                CallLog(args.llm_log, args.retention_days, at).db.close()
+            except (sqlite3.Error, OSError) as e:
+                print(f"warning: could not purge {args.llm_log}: {e}", file=sys.stderr, flush=True)
     synthetic = is_synthetic(db)
 
     if not args.daily_at:
@@ -757,6 +764,7 @@ def main(argv=None, now=None):
         return 0
 
     print(f"Scheduled daily at {args.daily_at} ({args.tz}).", file=sys.stderr, flush=True)
+    purge_unused_log(None)
     while True:
         time.sleep(seconds_until(args.daily_at, time.time(), tz))
         purge_unused_log(None)
