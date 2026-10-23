@@ -9,6 +9,7 @@ and prints the digest or sends it to a group through the bridge.
 import argparse
 import html as htmllib
 import json
+import math
 import os
 import re
 import smtplib
@@ -56,6 +57,36 @@ QUESTION_LABEL = {"polish": "Pytanie", "english": "Question", "german": "Frage"}
 class Thread(NamedTuple):
     title: str
     points: list
+
+
+class Section(NamedTuple):
+    name: str
+    summary: object  # str, [Thread] or None
+    messages: int = 0
+    words: int = 0
+
+
+READING_WPM = 200  # typical silent reading speed
+
+
+def reading_minutes(words):
+    return math.ceil(words / READING_WPM)
+
+
+def _plural_messages(n):
+    return f"{n} message" if n == 1 else f"{n} messages"
+
+
+def _savings_line(sections):
+    """'120 messages · ≈8 min of chat reading condensed into ≈1 min', or None without messages."""
+    total = sum(s.messages for s in sections)
+    if not total:
+        return None
+    digest_min = max(1, reading_minutes(sum(len(_summary_text(s.summary).split()) for s in sections)))
+    chat_min = reading_minutes(sum(s.words for s in sections))
+    if chat_min <= digest_min:  # nothing saved - don't claim it
+        return _plural_messages(total)
+    return f"{_plural_messages(total)} · ≈{chat_min} min of chat reading condensed into ≈{digest_min} min"
 
 
 class Msg(NamedTuple):
@@ -136,9 +167,14 @@ def _summary_text(summary):
 
 
 def build_digest(sections, hours, title="Digest"):
-    parts = [f"📋 {title} (last {hours}h)"]
-    for name, summary in sections:
-        parts.append(f"*{name}*\n{_summary_text(summary)}")
+    sections = [Section(*s) for s in sections]
+    header = f"📋 {title} (last {hours}h)"
+    if savings := _savings_line(sections):
+        header += f"\n{savings}"
+    parts = [header]
+    for s in sections:
+        count = f" ({_plural_messages(s.messages)})" if s.messages else ""
+        parts.append(f"*{s.name}*{count}\n{_summary_text(s.summary)}")
     return "\n\n".join(parts)
 
 
@@ -161,6 +197,7 @@ HTML_PAGE = """<!doctype html>
 <div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a8dcd1">Szalona Beata</div>
 <div style="font-size:22px;font-weight:700;color:#ffffff;margin-top:4px">{title}</div>
 <div style="font-size:14px;color:#d6eee8;margin-top:4px">{day} &middot; last {hours}h &middot; {count} groups</div>
+{savings}
 </td></tr>
 <tr><td style="background:#ffffff;border-radius:0 0 12px 12px;padding:8px 24px 16px">
 {cards}
@@ -177,6 +214,7 @@ Generated locally by szalona-beata from your WhatsApp groups.
 CARD = """<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px">
 <tr><td style="border-left:4px solid #25a18e;padding:4px 0 4px 14px">
 <div style="font-size:17px;font-weight:700;color:#0b5f53;margin:0 0 8px">{name}</div>
+{meta}
 <div style="font-size:15px;line-height:1.5">{summary}</div>
 </td></tr></table>"""
 
@@ -226,12 +264,22 @@ def render_summary_html(summary):
 
 
 def build_html_digest(sections, hours, day, title="WhatsApp digest"):
+    sections = [Section(*s) for s in sections]
     cards = "\n".join(
-        CARD.format(name=htmllib.escape(name), summary=render_summary_html(summary))
-        for name, summary in sections
+        CARD.format(
+            name=htmllib.escape(s.name),
+            meta=(f'<div style="font-size:13px;color:#7a8783;margin:-4px 0 8px">{_plural_messages(s.messages)}</div>'
+                  if s.messages else ""),
+            summary=render_summary_html(s.summary),
+        )
+        for s in sections
     )
+    savings = _savings_line(sections)
     return HTML_PAGE.format(
-        title=htmllib.escape(title), day=htmllib.escape(day), hours=hours, count=len(sections), cards=cards
+        title=htmllib.escape(title), day=htmllib.escape(day), hours=hours, count=len(sections), cards=cards,
+        savings=(f'<div style="display:inline-block;margin-top:12px;padding:6px 10px;border-radius:6px;'
+                 f'background:#0e7466;color:#ffffff;font-size:14px">⏱ {htmllib.escape(savings)}</div>'
+                 if savings else ""),
     )
 
 
@@ -533,7 +581,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                 call_log.record(llm.last_exchange, jid, name, now, synthetic)
         else:
             summary = dummy_summary(msgs, tz)
-        sections.append((name, summary))
+        sections.append(Section(name, summary, len(msgs), sum(len(m.text.split()) for m in msgs)))
 
     title = {"title": args.email_title} if args.email_title else {}
     digest = build_digest(sections, args.hours, **title)
@@ -553,7 +601,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         with open(args.html_out, "w", encoding="utf-8") as f:
             f.write(html)
     if args.email_to:
-        groups_list = ", ".join(name for name, _ in sections)
+        groups_list = ", ".join(s.name for s in sections)
         subject = args.email_subject.format(date=day, hours=args.hours, groups=groups_list)
         send_email(args.smtp, args.email_from, args.email_to, subject, digest, html=html)
         print(f"\nEmailed to {', '.join(args.email_to)}.", file=sys.stderr)

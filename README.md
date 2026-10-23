@@ -17,7 +17,8 @@ Your WhatsApp account is linked only to your own machine. No third-party service
 
 The **bridge** links to WhatsApp as a companion device, the same mechanism as WhatsApp Web. It stores messages
 only from the groups you list. The **summarizer** turns the last 24 h of each group into topic threads and
-sends them as an HTML email.
+sends them as an HTML email. The email shows how many messages each group had and how much reading time the
+summary saves (e.g. "120 messages · ≈8 min of chat reading condensed into ≈1 min", at 200 words/minute).
 
 | Part | Where data goes |
 |---|---|
@@ -401,8 +402,6 @@ school class groups since October 2026.
 
 Next steps:
 
-- [ ] **Own sending domain in Resend.** Verify a (sub)domain, switch `EMAIL_FROM` to it and allow more
-      recipients ([4.4](#44-optional-your-own-domain-to-email-other-people)).
 - [ ] **Prompt quality.** The model occasionally adds details that aren't in the chat (e.g. a year nobody
       wrote) or labels a plan as a "decision". Tighten the prompt and compare on the same transcripts
       using the [call log](#55-call-log-for-prompt-tuning). A `--replay` command for this would help.

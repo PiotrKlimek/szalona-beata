@@ -231,6 +231,53 @@ class BuildHtmlDigestTest(unittest.TestCase):
         self.assertNotIn("<3 &", html)
 
 
+class ReadingTimeTest(unittest.TestCase):
+    def test_minutes_round_up_at_200_words_per_minute(self):
+        self.assertEqual(
+            [summarize.reading_minutes(w) for w in (0, 1, 200, 201, 1000)],
+            [0, 1, 1, 2, 5],
+        )
+
+
+class MessageCountsTest(unittest.TestCase):
+    SECTIONS = [
+        summarize.Section("Klasa 1a (test)", "Wycieczka 6.11.", messages=120, words=1500),
+        summarize.Section("Klasa 2b (test)", None),
+    ]
+
+    def test_text_digest_shows_counts_and_reading_time_saved(self):
+        got = summarize.build_digest(self.SECTIONS, hours=24)
+        # 1500 words -> 8 min; the digest itself is a few dozen words -> 1 min
+        self.assertTrue(got.startswith(
+            "📋 Digest (last 24h)\n"
+            "120 messages · ≈8 min of chat reading condensed into ≈1 min\n\n"
+        ), got)
+        self.assertIn("*Klasa 1a (test)* (120 messages)\nWycieczka 6.11.", got)
+        self.assertIn("*Klasa 2b (test)*\nNo messages.", got)  # no "(0 messages)"
+
+    def test_html_shows_group_count_and_total_savings(self):
+        html = summarize.build_html_digest(self.SECTIONS, hours=24, day="23.10.2026")
+
+        self.assertIn("120 messages", html)
+        self.assertIn("≈8 min of chat reading condensed into ≈1 min", html)
+        self.assertLess(html.index("Klasa 1a (test)"), html.index("120 messages", html.index("Klasa 1a (test)")))
+        self.assertLess(html.index("120 messages", html.index("Klasa 1a (test)")), html.index("Wycieczka 6.11."))
+
+    def test_no_savings_line_without_messages(self):
+        quiet = [summarize.Section("Klasa 2b (test)", None)]
+        self.assertNotIn("condensed", summarize.build_digest(quiet, hours=24))
+        self.assertNotIn("condensed", summarize.build_html_digest(quiet, hours=24, day="23.10.2026"))
+
+    def test_no_savings_claim_when_chat_is_as_short_as_summary(self):
+        got = summarize.build_digest([summarize.Section("A", "Krótko.", messages=4, words=20)], hours=24)
+        self.assertTrue(got.startswith("📋 Digest (last 24h)\n4 messages\n\n"), got)
+        self.assertNotIn("condensed", got)
+
+    def test_singular_message(self):
+        got = summarize.build_digest([summarize.Section("A", "x", messages=1, words=3)], hours=24)
+        self.assertIn("*A* (1 message)", got)
+
+
 class ThreadRenderingTest(unittest.TestCase):
     THREADS = [
         summarize.Thread("Zadanie z angielskiego", ["Str. 20-21 na jutro", "Słówka w zeszycie"]),
@@ -800,7 +847,7 @@ class MainTest(unittest.TestCase):
     def test_dummy_digest_for_selected_groups(self):
         code, out = self.run_main("--group", "rowery", "--group", "3b", "--hours", "2", "--model", "dummy")
         self.assertEqual(code, 0)
-        self.assertIn("*Rowery*\n2 messages from 2 people", out)
+        self.assertIn("*Rowery* (2 messages)\n2 messages from 2 people", out)
         self.assertIn("*Klasa 3B*\nNo messages.", out)
 
     def test_emails_digest_when_email_to_given(self):
@@ -821,7 +868,7 @@ class MainTest(unittest.TestCase):
         _, rcpts, data = srv.envelopes[0]
         self.assertEqual(rcpts, ["piko@example.com"])
         msg = email.message_from_string(data, policy=email.policy.default)
-        self.assertIn("*Rowery*\n2 messages from 2 people", msg.get_body(("plain",)).get_content())
+        self.assertIn("*Rowery* (2 messages)\n2 messages from 2 people", msg.get_body(("plain",)).get_content())
         self.assertIn("2 messages from 2 people", msg.get_body(("html",)).get_content())
         self.assertIn("Rowery", msg["Subject"])
 
@@ -927,7 +974,7 @@ class MainTest(unittest.TestCase):
             code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
 
         self.assertEqual(code, 0)
-        self.assertIn("*Rowery*\nUstalono.", out)
+        self.assertIn("*Rowery* (2 messages)\nUstalono.", out)
 
     def test_external_llm_runs_on_synthetic_data_without_flag(self):
         import os
@@ -943,7 +990,7 @@ class MainTest(unittest.TestCase):
             code = summarize.main(["--db", sample, "--group", "Klasa 2c", "--model", "openai"], now=T0)
 
         self.assertEqual(code, 0)
-        self.assertIn("*Klasa 2c (test)*\nWycieczka 6.11.", out.getvalue())
+        self.assertIn("*Klasa 2c (test)* (16 messages)\nWycieczka 6.11.", out.getvalue())
         self.assertNotIn("Tokens", out.getvalue())  # usage goes to stderr, not into the digest
         self.assertIn("Marta Zielińska: Dzień dobry!", srv.requests[0][2]["messages"][1]["content"])
         log = os.path.join(os.path.dirname(sample), "llm_log.db")
@@ -970,7 +1017,7 @@ class MainTest(unittest.TestCase):
             )
 
         self.assertEqual(code, 0)
-        self.assertIn("*Rowery*\n2 messages from 2 people", out)
+        self.assertIn("*Rowery* (2 messages)\n2 messages from 2 people", out)
         self.assertIn("model unavailable", out)
         self.assertEqual(len(smtp.envelopes), 1)
 
