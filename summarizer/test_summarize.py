@@ -413,6 +413,48 @@ class OpenAICompatTest(unittest.TestCase):
 
         self.assertEqual(got, content)
 
+    def test_last_exchange_records_what_was_sent_and_received(self):
+        content = '{"threads": [{"title": "Wycieczka", "points": ["6.11"]}]}'
+        srv = self.serve({("POST", "/v1/chat/completions"): (200, {
+            "choices": [{"message": {"content": content}}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+        })})
+        llm = summarize.OpenAICompat(srv.url + "/v1", "k", "openai/gpt-oss-120b", reasoning_effort="medium")
+
+        llm.summarize("[10:00] Ania: Wycieczka 6.11", "Polish")
+
+        sent = srv.requests[0][2]
+        ex = llm.last_exchange
+        self.assertEqual(ex["model"], "openai/gpt-oss-120b")
+        self.assertEqual(ex["reasoning_effort"], "medium")
+        self.assertEqual(ex["system_prompt"], sent["messages"][0]["content"])
+        self.assertEqual(ex["transcript"], "[10:00] Ania: Wycieczka 6.11")
+        self.assertEqual(ex["response"], content)
+        self.assertTrue(ex["parsed"])
+        self.assertEqual((ex["prompt_tokens"], ex["completion_tokens"], ex["total_tokens"]), (120, 30, 150))
+        self.assertIsNone(ex["error"])
+        self.assertGreaterEqual(ex["duration_ms"], 0)
+
+    def test_last_exchange_marks_unparsed_reply(self):
+        srv = self.serve({("POST", "/v1/chat/completions"): (200, {"choices": [{"message": {"content": "plain"}}]})})
+        llm = summarize.OpenAICompat(srv.url + "/v1", "k", "m")
+
+        llm.summarize("x", "Polish")
+
+        self.assertFalse(llm.last_exchange["parsed"])
+        self.assertEqual(llm.last_exchange["response"], "plain")
+
+    def test_last_exchange_records_error(self):
+        srv = self.serve({("POST", "/v1/chat/completions"): (500, {"error": {"message": "boom"}})})
+        llm = summarize.OpenAICompat(srv.url + "/v1", "k", "m")
+
+        with self.assertRaises(RuntimeError):
+            llm.summarize("x", "Polish")
+
+        self.assertIn("boom", llm.last_exchange["error"])
+        self.assertIsNone(llm.last_exchange["response"])
+        self.assertEqual(llm.last_exchange["transcript"], "x")
+
     def test_accumulates_token_usage_across_calls(self):
         srv = self.serve({("POST", "/v1/chat/completions"): (200, {
             "choices": [{"message": {"content": "ok"}}],
@@ -729,9 +771,12 @@ class MainTest(unittest.TestCase):
         import os
         import tempfile
 
-        fd, self.db_path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
-        self.addCleanup(os.remove, self.db_path)
+        import shutil
+
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.db_path = os.path.join(self.dir, "messages.db")
+        self.log_path = os.path.join(self.dir, "llm_log.db")  # default: next to --db
         db = sqlite3.connect(self.db_path)
         db.executescript(SCHEMA)
         db.executemany("INSERT INTO chats VALUES (?, ?)", [(BIKES, "Rowery"), (SCHOOL, "Klasa 3B")])
@@ -901,6 +946,8 @@ class MainTest(unittest.TestCase):
         self.assertIn("*Klasa 2c (test)*\nWycieczka 6.11.", out.getvalue())
         self.assertNotIn("Tokens", out.getvalue())  # usage goes to stderr, not into the digest
         self.assertIn("Marta Zielińska: Dzień dobry!", srv.requests[0][2]["messages"][1]["content"])
+        log = os.path.join(os.path.dirname(sample), "llm_log.db")
+        self.assertEqual(sqlite3.connect(log).execute("SELECT synthetic FROM llm_calls").fetchone(), (1,))
 
     def test_unavailable_model_falls_back_to_stats_and_still_emails(self):
         import email
@@ -926,6 +973,68 @@ class MainTest(unittest.TestCase):
         self.assertIn("*Rowery*\n2 messages from 2 people", out)
         self.assertIn("model unavailable", out)
         self.assertEqual(len(smtp.envelopes), 1)
+
+    def llm_server(self, content='{"threads": [{"title": "Wyjazd", "points": ["Tak"]}]}'):
+        srv = FakeServer({("POST", "/chat/completions"): (200, {
+            "choices": [{"message": {"content": content}}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
+        })})
+        self.addCleanup(srv.close)
+        return srv
+
+    def test_llm_calls_are_logged_next_to_the_database(self):
+        import os
+        from unittest import mock
+
+        srv = self.llm_server()
+        with mock.patch.dict(os.environ, {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": ""}):
+            code, _ = self.run_main("--group", "rowery", "--group", "3b", "--hours", "2",
+                                    "--model", "openai", "--allow-real-data")
+
+        self.assertEqual(code, 0)
+        rows = sqlite3.connect(self.log_path).execute(
+            "SELECT group_jid, group_name, provider, model, transcript, response, parsed, "
+            "total_tokens, error, synthetic, ts FROM llm_calls"
+        ).fetchall()
+        # only Rowery has messages; groups without messages don't call the model
+        self.assertEqual(len(rows), 1)
+        jid, name, provider, model, transcript, response, parsed, tokens, error, synthetic, ts = rows[0]
+        self.assertEqual((jid, name, provider, model), (BIKES, "Rowery", "openai", "openai/gpt-oss-120b"))
+        self.assertIn("Ania: Jedziemy?", transcript)
+        self.assertIn('"Wyjazd"', response)
+        self.assertEqual((parsed, tokens, error, synthetic), (1, 60, None, 0))
+        self.assertEqual(ts, T0 + 3600)
+
+    def test_failed_llm_call_is_logged_with_error(self):
+        import os
+        from unittest import mock
+
+        srv = FakeServer({("POST", "/chat/completions"): (500, {"error": {"message": "Internal Server Error"}})})
+        self.addCleanup(srv.close)
+        with mock.patch.dict(os.environ, {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": ""}):
+            self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+
+        (error, response), = sqlite3.connect(self.log_path).execute("SELECT error, response FROM llm_calls")
+        self.assertIn("Internal Server Error", error)
+        self.assertIsNone(response)
+
+    def test_llm_log_can_be_disabled(self):
+        import os
+        from unittest import mock
+
+        srv = self.llm_server()
+        with mock.patch.dict(os.environ, {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": "off"}):
+            code, _ = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(self.log_path))
+
+    def test_dummy_mode_writes_no_log(self):
+        import os
+
+        self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")
+
+        self.assertFalse(os.path.exists(self.log_path))
 
     def test_external_llm_without_api_key_exits_with_error(self):
         import os

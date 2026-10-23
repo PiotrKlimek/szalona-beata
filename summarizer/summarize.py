@@ -327,28 +327,89 @@ class OpenAICompat:
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     def summarize(self, transcript, language):
+        system_prompt = THREADS_PROMPT.format(
+            language=language, question=QUESTION_LABEL.get(language.lower(), "Question"))
         payload = {
             "model": self.model,
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": THREADS_PROMPT.format(
-                    language=language, question=QUESTION_LABEL.get(language.lower(), "Question"))},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": transcript},
             ],
         }
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
-        reply = _request(
-            "POST",
-            f"{self.base_url}/chat/completions",
-            payload,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            retries=3,
-        )
+        # What was sent and received, for the call log (prompt tuning).
+        self.last_exchange = ex = {
+            "provider": "openai", "model": self.model, "reasoning_effort": self.reasoning_effort,
+            "language": language, "system_prompt": system_prompt, "transcript": transcript,
+            "response": None, "parsed": False, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "duration_ms": 0, "error": None,
+        }
+        started = time.monotonic()
+        try:
+            reply = _request(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                payload,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                retries=3,
+            )
+        except (RuntimeError, OSError) as e:
+            ex["error"] = str(e)
+            raise
+        finally:
+            ex["duration_ms"] = int((time.monotonic() - started) * 1000)
+        usage = reply.get("usage") or {}
         for key in self.usage:
-            self.usage[key] += (reply.get("usage") or {}).get(key, 0)
-        return parse_threads(reply["choices"][0]["message"]["content"])
+            self.usage[key] += usage.get(key, 0)
+            ex[key] = usage.get(key, 0)
+        ex["response"] = reply["choices"][0]["message"]["content"]
+        result = parse_threads(ex["response"])
+        ex["parsed"] = isinstance(result, list) or result == NOTHING_NOTABLE
+        return result
+
+
+CALL_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id                INTEGER PRIMARY KEY,
+    ts                INTEGER NOT NULL,   -- digest time (unix)
+    group_jid         TEXT,
+    group_name        TEXT,
+    synthetic         INTEGER NOT NULL,   -- 1 = made-up sample data
+    provider          TEXT,
+    model             TEXT,
+    reasoning_effort  TEXT,
+    language          TEXT,
+    system_prompt     TEXT,
+    transcript        TEXT,
+    response          TEXT,               -- raw model output; NULL if the call failed
+    parsed            INTEGER,            -- 1 = valid threads JSON
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    total_tokens      INTEGER,
+    duration_ms       INTEGER,
+    error             TEXT
+);
+"""
+
+
+class CallLog:
+    """Stores every LLM prompt and response in SQLite, to tune the prompt on real cases later."""
+
+    FIELDS = ("provider", "model", "reasoning_effort", "language", "system_prompt", "transcript", "response",
+              "parsed", "prompt_tokens", "completion_tokens", "total_tokens", "duration_ms", "error")
+
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.executescript(CALL_LOG_SCHEMA)
+
+    def record(self, exchange, group_jid, group_name, ts, synthetic):
+        cols = ("ts", "group_jid", "group_name", "synthetic") + self.FIELDS
+        values = (int(ts), group_jid, group_name, int(synthetic)) + tuple(exchange.get(f) for f in self.FIELDS)
+        self.db.execute(f"INSERT INTO llm_calls ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})", values)
+        self.db.commit()
 
 
 def send_to_bridge(bridge_url, jid, text):
@@ -435,6 +496,8 @@ def parse_args(argv):
     p.add_argument("--daily-at", default=env("DAILY_AT"), help="keep running and send a digest every day at HH:MM")
     args = p.parse_args(argv)
     args.llm_api_key = env("LLM_API_KEY", "")
+    log = env("LLM_LOG_DB", "")
+    args.llm_log = None if log == "off" else log or os.path.join(os.path.dirname(args.db) or ".", "llm_log.db")
     effort = env("LLM_REASONING_EFFORT", "low")
     args.llm_reasoning_effort = None if effort == "off" else effort
     args.email_to = [a.strip() for a in args.email_to.split(",") if a.strip()]
@@ -452,7 +515,7 @@ def parse_args(argv):
     return args
 
 
-def run_digest(args, db, groups, target, llm, now, tz):
+def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=False):
     """Build one digest and deliver it (print, and optionally group and/or email)."""
     since = int(now - args.hours * 3600)
     sections = []
@@ -466,6 +529,8 @@ def run_digest(args, db, groups, target, llm, now, tz):
             except (RuntimeError, OSError) as e:  # API error, timeout, network
                 print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
                 summary = f"{dummy_summary(msgs, tz)}\n(model unavailable, showing statistics: {e})"
+            if call_log and getattr(llm, "last_exchange", None):
+                call_log.record(llm.last_exchange, jid, name, now, synthetic)
         else:
             summary = dummy_summary(msgs, tz)
         sections.append((name, summary))
@@ -545,16 +610,18 @@ def main(argv=None, now=None):
         llm.ensure_model()
     elif args.model == "openai":
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)
+    call_log = CallLog(args.llm_log) if llm and args.llm_log else None
+    synthetic = is_synthetic(db)
 
     if not args.daily_at:
-        run_digest(args, db, groups, target, llm, time.time() if now is None else now, tz)
+        run_digest(args, db, groups, target, llm, time.time() if now is None else now, tz, call_log, synthetic)
         return 0
 
     print(f"Scheduled daily at {args.daily_at} ({args.tz}).", file=sys.stderr, flush=True)
     while True:
         time.sleep(seconds_until(args.daily_at, time.time(), tz))
         try:
-            run_digest(args, db, groups, target, llm, time.time(), tz)
+            run_digest(args, db, groups, target, llm, time.time(), tz, call_log, synthetic)
         except Exception as e:  # keep the schedule alive; the next run may succeed
             print(f"error: digest failed: {e}", file=sys.stderr, flush=True)
 

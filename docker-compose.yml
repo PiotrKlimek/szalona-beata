@@ -18,6 +18,7 @@ x-summarizer-env: &summarizer-env
   LLM_BASE_URL: ${LLM_BASE_URL:-}
   LLM_MODEL: ${LLM_MODEL:-}
   LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
+  LLM_LOG_DB: ${LLM_LOG_DB:-}
 
 services:
   bridge:

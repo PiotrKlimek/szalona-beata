@@ -24,6 +24,7 @@ sends them as an HTML email.
 | WhatsApp session keys, messages | only your server (Docker volume) |
 | Summaries with `--model dummy` / `ollama` | only your server |
 | Summaries with `--model openai` | the chat text of the selected groups is sent to the LLM provider (Groq by default) |
+| LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database) |
 | The email | the email provider (Resend) and your mailbox |
 
 ## Before you start: read this
@@ -271,6 +272,25 @@ quality for tokens:
 | `medium` | ~1,200 | synthesized decisions and open questions (recommended) |
 | `off` | n/a | omit the parameter, for models without reasoning |
 
+### 5.5 Call log for prompt tuning
+
+Every `--model openai` call is stored in SQLite: the system prompt, the transcript sent, the raw response,
+whether it parsed as threads JSON, tokens, duration and errors. The log is `llm_log.db` in the same directory
+as `--db`, so real runs log to `/data/llm_log.db` and sample runs to `/samples/llm_log.db` (rows also carry a
+`synthetic` flag). It contains chat content, so it stays on your server like the messages do.
+Set `LLM_LOG_DB=off` to disable it, or a path to move it. `--model ollama` is not logged.
+
+```sh
+docker compose run --rm --entrypoint python summarizer -c "
+import sqlite3
+db = sqlite3.connect('/data/llm_log.db')
+for row in db.execute('SELECT datetime(ts, \'unixepoch\'), group_name, model, reasoning_effort, parsed, total_tokens, error FROM llm_calls ORDER BY id DESC LIMIT 10'):
+    print(row)"
+```
+
+To compare prompt versions, take stored transcripts (`SELECT transcript FROM llm_calls WHERE id = ?`), run
+them with the changed prompt, and compare the outputs with the stored `response`.
+
 ## 6. Daily schedule
 
 The `digest` service keeps running and sends one digest every day at `DAILY_AT` (default `20:00`, in `TZ`,
@@ -366,6 +386,7 @@ docker volume rm szalona-beata_wa-data
 | `LLM_API_KEY` | | Groq (or other OpenAI-compatible) API key |
 | `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
+| `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
 | `OLLAMA_MODEL` | `qwen2.5:0.5b` | Local model for `--model ollama` |
 | `SUMMARY_LANGUAGE` | `Polish` | Language of the summaries |
 | `TZ` | `Europe/Warsaw` | Time zone for times, dates and the schedule |
@@ -383,7 +404,8 @@ Next steps:
 - [ ] **Own sending domain in Resend.** Verify a (sub)domain, switch `EMAIL_FROM` to it and allow more
       recipients ([4.4](#44-optional-your-own-domain-to-email-other-people)).
 - [ ] **Prompt quality.** The model occasionally adds details that aren't in the chat (e.g. a year nobody
-      wrote) or labels a plan as a "decision". Tighten the prompt and compare on the same day's data.
+      wrote) or labels a plan as a "decision". Tighten the prompt and compare on the same transcripts
+      using the [call log](#55-call-log-for-prompt-tuning). A `--replay` command for this would help.
 - [ ] **Consistent sender names.** A message keeps the sender's own push name if it had one, otherwise it gets
       the address-book name, so one person can show up under two names. Prefer the address-book name.
 - [ ] **Token counter in schedule mode.** `Tokens: ...` is cumulative across days in the long-running `digest`
@@ -402,6 +424,9 @@ test.sh        runs both test suites in Docker (no local toolchains needed)
 
 ```sh
 ./test.sh
+# after changing code, rebuild ALL images: one-off runs (summarizer) and the schedule (digest) use separate images
+docker compose --profile tools --profile digest build
+docker compose --profile digest up -d --force-recreate bridge digest
 ```
 
 The code was written test-first, and image builds run the tests too. `bridge/main.go` is integration glue,
