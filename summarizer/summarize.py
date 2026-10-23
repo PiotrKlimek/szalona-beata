@@ -383,7 +383,8 @@ class Ollama:
         tags = _request("GET", f"{self.base_url}/api/tags")
         if not any(m.get("name") == self.model for m in tags.get("models", [])):
             print(f"Pulling model {self.model} (first run only)...", file=sys.stderr)
-            _request("POST", f"{self.base_url}/api/pull", {"model": self.model, "stream": False})
+            # no data arrives until the download finishes: allow for a ~2 GB model on a slow link
+            _request("POST", f"{self.base_url}/api/pull", {"model": self.model, "stream": False}, timeout=3600)
 
     def summarize(self, transcript, language):
         reply = _request("POST", f"{self.base_url}/api/chat", {
@@ -608,7 +609,8 @@ def parse_args(argv):
                    help="subject template with {date}, {hours} and {groups}")
     p.add_argument("--html-out", help="also write the HTML email to this file (preview without sending)")
     p.add_argument("--ollama-url", default=env("OLLAMA_URL", "http://ollama:11434"))
-    p.add_argument("--ollama-model", default=env("OLLAMA_MODEL", "qwen2.5:0.5b"))
+    # 0.5B models make things up; 3B is the smallest that gives usable summaries (~2.5 GB RAM)
+    p.add_argument("--ollama-model", default=env("OLLAMA_MODEL", "qwen2.5:3b"))
     p.add_argument("--bridge-url", default=env("BRIDGE_URL", "http://bridge:8080"))
     p.add_argument("--language", default=env("SUMMARY_LANGUAGE", "Polish"))
     p.add_argument("--max-chars", type=int, default=int(env("MAX_TRANSCRIPT_CHARS", "12000")))

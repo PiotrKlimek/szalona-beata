@@ -199,7 +199,7 @@ EMAIL_TITLE=Class groups summary                              # heading at the t
 ## 5. Optional: better summaries with Groq
 
 `--model dummy` only counts messages. For real summaries ("trip on Thursday 8:00, 65 PLN by Monday; open
-question: ...") you need a language model. Small local models (0.5B–3B) make things up, see [Local models](#local-models-ollama).
+question: ...") you need a language model. Tiny local models (0.5B) make things up and 3B ones are only acceptable, see [Local models](#local-models-ollama).
 [Groq](https://groq.com) has a free API with large open models that handle Polish well.
 
 ### 5.1 Create an account and an API key
@@ -335,12 +335,16 @@ docker compose --profile llm run --rm summarizer --model ollama --ollama-model q
 docker compose --profile llm stop ollama
 ```
 
+The default model is `qwen2.5:3b` (it used to be `qwen2.5:0.5b`). The first run downloads it (~1.9 GB); to keep
+the old tiny model on a very small machine, set `OLLAMA_MODEL=qwen2.5:0.5b`. You can pre-pull a model with
+`docker compose --profile llm up -d ollama && docker compose exec ollama ollama pull qwen2.5:3b`.
+
 Rough RAM needs at Q4 quantization with an ~8k-token context:
 
 | Model | RAM for the model | Machine | Polish summaries |
 |---|---|---|---|
-| `qwen2.5:0.5b` (default) | ~0.6 GB | any | unusable, makes things up; only proves the pipeline |
-| 3–4B (Qwen, Gemma 3, Llama 3.2) | 2.5–4.5 GB | 4 GB + swap / 8 GB | acceptable |
+| `qwen2.5:0.5b` | ~0.6 GB | any | unusable, makes things up; only proves the pipeline |
+| 3–4B (`qwen2.5:3b` = default, Gemma 3, Llama 3.2) | 2.5–4.5 GB | 4 GB + swap / 8 GB | acceptable |
 | 7–8B (Qwen 2.5/3, Llama 3.1) | 5.5–6.5 GB | 8 GB | good |
 | Bielik 11B (Polish), Gemma 3 12B | 8–10 GB | 12–16 GB | very good |
 
@@ -408,7 +412,7 @@ docker volume rm szalona-beata_wa-data
 | `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
 | `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
-| `OLLAMA_MODEL` | `qwen2.5:0.5b` | Local model for `--model ollama` |
+| `OLLAMA_MODEL` | `qwen2.5:3b` | Local model for `--model ollama` (needs ~2.5 GB free RAM) |
 | `SUMMARY_LANGUAGE` | `Polish` | Language of the summaries and of the email labels (`Polish` or `English`; other languages get English labels) |
 | `TZ` | `Europe/Warsaw` | Time zone for times, dates and the schedule |
 
