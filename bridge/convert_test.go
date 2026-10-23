@@ -29,7 +29,7 @@ func groupEvent(pushName string, msg *waE2E.Message) *events.Message {
 
 func noLookup(t *testing.T) func(types.JID) string {
 	return func(types.JID) string {
-		t.Error("name lookup called although push name was present")
+		t.Error("name lookup called for a message that should be skipped")
 		return ""
 	}
 }
@@ -37,7 +37,7 @@ func noLookup(t *testing.T) func(types.JID) string {
 func TestToMessageMapsGroupTextMessage(t *testing.T) {
 	evt := groupEvent("Ania", &waE2E.Message{Conversation: proto.String("cześć")})
 
-	got, ok := toMessage(evt, noLookup(t))
+	got, ok := toMessage(evt, func(types.JID) string { return "" }) // not in the address book
 
 	want := Message{
 		ChatJID:    "120363000000000001@g.us",
@@ -49,6 +49,16 @@ func TestToMessageMapsGroupTextMessage(t *testing.T) {
 	}
 	if !ok || got != want {
 		t.Errorf("toMessage() = %+v, %v; want %+v, true", got, ok, want)
+	}
+}
+
+func TestToMessagePrefersAddressBookNameOverPushName(t *testing.T) {
+	evt := groupEvent("Ania", &waE2E.Message{Conversation: proto.String("cześć")})
+
+	got, ok := toMessage(evt, func(types.JID) string { return "Anna Kowalska" })
+
+	if !ok || got.SenderName != "Anna Kowalska" {
+		t.Errorf("SenderName = %q, ok=%v; want %q", got.SenderName, ok, "Anna Kowalska")
 	}
 }
 

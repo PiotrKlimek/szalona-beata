@@ -207,7 +207,7 @@ func (b *bridge) saveHistory(v *events.HistorySync) {
 		}
 	}
 	b.log.Infof("History sync (%s): saved %d group messages", v.Data.GetSyncType(), saved)
-	b.backfillNames()
+	b.refreshNames()
 }
 
 func (b *bridge) syncGroups() {
@@ -220,7 +220,7 @@ func (b *bridge) syncGroups() {
 		b.saveChat(g.JID.String(), g.Name)
 	}
 	b.log.Infof("Synced %d groups", len(groups))
-	b.backfillNames()
+	b.refreshNames()
 }
 
 func (b *bridge) saveChat(jid, name string) {
@@ -247,10 +247,10 @@ func (b *bridge) contact(ctx context.Context, jid types.JID) types.ContactInfo {
 	return c
 }
 
-// backfillNames fills in sender names that were unknown when messages were
-// saved; contact names often arrive in a later history sync batch.
-func (b *bridge) backfillNames() {
-	n, err := b.store.BackfillSenderNames(func(senderJID string) string {
+// refreshNames re-applies sender names to stored messages: contact names often
+// arrive in a later history sync batch, and the address book name wins.
+func (b *bridge) refreshNames() {
+	n, err := b.store.RefreshSenderNames(func(senderJID string) string {
 		jid, err := types.ParseJID(senderJID)
 		if err != nil {
 			return ""
@@ -258,9 +258,9 @@ func (b *bridge) backfillNames() {
 		return b.contactName(jid)
 	})
 	if err != nil {
-		b.log.Warnf("Failed to backfill sender names: %v", err)
+		b.log.Warnf("Failed to refresh sender names: %v", err)
 	} else if n > 0 {
-		b.log.Infof("Filled in sender names for %d messages", n)
+		b.log.Infof("Updated sender names for %d messages", n)
 	}
 }
 

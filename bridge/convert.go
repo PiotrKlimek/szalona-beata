@@ -6,9 +6,9 @@ import (
 )
 
 // toMessage converts a WhatsApp event into a storable Message. Only group
-// messages with text (or a media placeholder) are accepted. lookupName is
-// consulted for the sender's name when the event carries no push name,
-// which is common for history-sync messages.
+// messages with text (or a media placeholder) are accepted. The sender's name
+// comes from lookupName (address book first) so one person keeps one name;
+// the event's push name is the fallback for senders unknown to the store.
 func toMessage(evt *events.Message, lookupName func(types.JID) string) (Message, bool) {
 	if evt.Info.Chat.Server != types.GroupServer {
 		return Message{}, false
@@ -17,9 +17,9 @@ func toMessage(evt *events.Message, lookupName func(types.JID) string) (Message,
 	if text == "" {
 		return Message{}, false
 	}
-	name := evt.Info.PushName
+	name := lookupName(evt.Info.Sender)
 	if name == "" {
-		name = lookupName(evt.Info.Sender)
+		name = evt.Info.PushName
 	}
 	return Message{
 		ChatJID:    evt.Info.Chat.String(),

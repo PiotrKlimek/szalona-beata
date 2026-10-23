@@ -152,40 +152,35 @@ func TestPurgeDisallowedDeletesOnlyMessagesOfUnlistedGroups(t *testing.T) {
 	}
 }
 
-func TestBackfillSenderNamesFillsOnlyUnknownNames(t *testing.T) {
+func TestRefreshSenderNamesAppliesResolvedNamesToStoredMessages(t *testing.T) {
 	s := newTestStore(t)
 	for _, m := range []Message{
 		{ID: "1", SenderJID: "111111111111111@lid", SenderName: "111111111111111"}, // legacy: id as name
 		{ID: "2", SenderJID: "111111111111111@lid", SenderName: ""},
-		{ID: "3", SenderJID: "222222222222222@lid", SenderName: ""}, // resolver doesn't know
-		{ID: "4", SenderJID: "48500100200@s.whatsapp.net", SenderName: "Ania"},
+		{ID: "3", SenderJID: "222222222222222@lid", SenderName: ""},            // resolver doesn't know
+		{ID: "4", SenderJID: "48500100200@s.whatsapp.net", SenderName: "Ania"}, // push name, has address book entry
+		{ID: "5", SenderJID: "48500100200@s.whatsapp.net", SenderName: "Anna Kowalska"},
+		{ID: "6", SenderJID: "48500100300@s.whatsapp.net", SenderName: "Bartek"}, // resolver doesn't know: keep
 	} {
 		m.ChatJID, m.Timestamp, m.Text = "120363000000000001@g.us", time.Unix(1761200000, 0), "x"
 		s.SaveMessage(m)
 	}
-	var asked []string
 	resolve := func(jid string) string {
-		asked = append(asked, jid)
-		if jid == "111111111111111@lid" {
-			return "Ewa Testowa"
-		}
-		return ""
+		return map[string]string{
+			"111111111111111@lid":        "Ewa Testowa",
+			"48500100200@s.whatsapp.net": "Anna Kowalska",
+		}[jid]
 	}
 
-	updated, err := s.BackfillSenderNames(resolve)
+	updated, err := s.RefreshSenderNames(resolve)
 
-	if err != nil || updated != 2 {
-		t.Fatalf("BackfillSenderNames() = %d, %v; want 2, nil", updated, err)
+	if err != nil || updated != 3 {
+		t.Fatalf("RefreshSenderNames() = %d, %v; want 3, nil", updated, err)
 	}
 	var names string
 	s.db.QueryRow(`SELECT GROUP_CONCAT(sender_name, '|') FROM (SELECT sender_name FROM messages ORDER BY id)`).Scan(&names)
-	if names != "Ewa Testowa|Ewa Testowa||Ania" {
+	if names != "Ewa Testowa|Ewa Testowa||Anna Kowalska|Anna Kowalska|Bartek" {
 		t.Errorf("names = %q", names)
-	}
-	for _, jid := range asked {
-		if jid == "48500100200@s.whatsapp.net" {
-			t.Error("resolver asked about a sender that already has a name")
-		}
 	}
 }
 

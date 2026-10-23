@@ -116,11 +116,11 @@ func (s *Store) PurgeDisallowed(f groupFilter) (int64, error) {
 	return deleted, nil
 }
 
-// BackfillSenderNames resolves names for senders stored without one.
-// A name equal to the JID's user part (stored by early versions) counts as unknown.
-func (s *Store) BackfillSenderNames(resolve func(senderJID string) string) (int64, error) {
-	rows, err := s.db.Query(`SELECT DISTINCT sender_jid FROM messages
-		WHERE sender_name = '' OR sender_name = substr(sender_jid, 1, instr(sender_jid, '@') - 1)`)
+// RefreshSenderNames applies the currently resolved name (address book first) to
+// every stored message of each sender, so one person shows up under one name.
+// Senders the resolver doesn't know keep their stored name.
+func (s *Store) RefreshSenderNames(resolve func(senderJID string) string) (int64, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT sender_jid FROM messages`)
 	if err != nil {
 		return 0, err
 	}
@@ -144,8 +144,7 @@ func (s *Store) BackfillSenderNames(resolve func(senderJID string) string) (int6
 		if name == "" {
 			continue
 		}
-		res, err := s.db.Exec(`UPDATE messages SET sender_name = ? WHERE sender_jid = ?
-			AND (sender_name = '' OR sender_name = substr(sender_jid, 1, instr(sender_jid, '@') - 1))`, name, jid)
+		res, err := s.db.Exec(`UPDATE messages SET sender_name = ? WHERE sender_jid = ? AND sender_name != ?`, name, jid, name)
 		if err != nil {
 			return updated, err
 		}

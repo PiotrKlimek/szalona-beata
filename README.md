@@ -359,7 +359,8 @@ To get history for a new group, unlink and link again (step 3).
 
 | Symptom | Cause / fix |
 |---|---|
-| Sender shown as a long number | The group hides phone numbers (LID) and the name wasn't known yet. The bridge fills names in after each history batch and on reconnect. |
+| Sender shown as a long number | The group hides phone numbers (LID) and the name wasn't known yet. The bridge refreshes names after each history batch and on reconnect. |
+| Which name is shown for a sender | The name from your address book if you have one, otherwise the name they set in WhatsApp. Stored messages are renamed when a better name becomes known, so one person appears under one name. |
 | Red "bridge is logged out" warning in the email, `Logged out` in bridge logs | Device removed on the phone or phone offline for ~14 days: remove the `wa-data` volume and link again (step 3). |
 | Red "bridge is not responding" warning | The bridge container is down: `docker compose up -d bridge`, then check `docker compose logs bridge`. |
 | No history after linking | `WATCH_GROUPS` was empty or wrong at link time; history comes only once. Unlink and relink (step 3). |
@@ -424,8 +425,6 @@ Next steps:
 - [ ] **Prompt quality.** The model occasionally adds details that aren't in the chat (e.g. a year nobody
       wrote) or labels a plan as a "decision". Tighten the prompt and compare on the same transcripts
       using the [call log](#55-call-log-for-prompt-tuning). A `--replay` command for this would help.
-- [ ] **Consistent sender names.** A message keeps the sender's own push name if it had one, otherwise it gets
-      the address-book name, so one person can show up under two names. Prefer the address-book name.
 - [ ] **License.** Not chosen yet: without one, the code is visible but all rights are reserved.
 
 ## Development
