@@ -14,3 +14,6 @@ preview*.html
 
 # Local compose overrides (e.g. --allow-real-data consent)
 docker-compose.override.yml
+
+# Local deployment notes
+*.local.md

@@ -372,6 +372,26 @@ docker volume rm szalona-beata_wa-data
 
 Most summarizer settings can also be overridden per run with flags: `docker compose run --rm summarizer --help`.
 
+## Status and roadmap
+
+Working end to end: linking, group allowlist, history sync, sender names (incl. LID), dummy / Ollama / Groq
+summaries with topic threads, HTML email via Resend, daily schedule, retries and fallback. Tested on real
+school class groups since October 2026.
+
+Next steps:
+
+- [ ] **Own sending domain in Resend.** Verify a (sub)domain, switch `EMAIL_FROM` to it and allow more
+      recipients ([4.4](#44-optional-your-own-domain-to-email-other-people)).
+- [ ] **Prompt quality.** The model occasionally adds details that aren't in the chat (e.g. a year nobody
+      wrote) or labels a plan as a "decision". Tighten the prompt and compare on the same day's data.
+- [ ] **Consistent sender names.** A message keeps the sender's own push name if it had one, otherwise it gets
+      the address-book name, so one person can show up under two names. Prefer the address-book name.
+- [ ] **Token counter in schedule mode.** `Tokens: ...` is cumulative across days in the long-running `digest`
+      service. It should be printed per run.
+- [ ] **Email localization.** Labels like "last 24h", "groups", "No messages" are English while the summaries
+      are Polish. The small "SZALONA BEATA" line above a custom `EMAIL_TITLE` duplicates the title.
+- [ ] **License.** Not chosen yet: without one, the code is visible but all rights are reserved.
+
 ## Development
 
 ```
