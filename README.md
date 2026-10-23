@@ -313,6 +313,16 @@ services:
     command: ["--daily-at", "${DAILY_AT:-20:00}", "--hours", "${DIGEST_HOURS:-24}", "--allow-real-data"]
 ```
 
+The same override can give the schedule **different recipients** than manual runs, e.g. to send the daily
+digest to the whole family while your tests go only to you (`EMAIL_TO` in `.env`):
+
+```yaml
+services:
+  digest:
+    environment:
+      EMAIL_TO: me@example.com, partner@example.com
+```
+
 ## Local models (Ollama)
 
 `--model ollama` keeps everything on your server. Ollama starts only on demand (profile `llm`) and unloads the
