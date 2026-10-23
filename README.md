@@ -24,10 +24,10 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 
 | Part | Where data goes |
 |---|---|
-| WhatsApp session keys, messages | only your server (Docker volume) |
+| WhatsApp session keys, messages | only your server (Docker volume); messages deleted after `RETENTION_DAYS` |
 | Summaries with `--model dummy` / `ollama` | only your server |
 | Summaries with `--model openai` | the chat text of the selected groups is sent to the LLM provider (Groq by default) |
-| LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database) |
+| LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
 | The email | the email provider (Resend) and your mailbox |
 
 ## Before you start: read this
@@ -375,6 +375,11 @@ To get history for a new group, unlink and link again (step 3).
   linked device. Anyone with root or `docker` group access on the host can reach it. Revoke access anytime by
   deleting *szalona-beata* under **Linked devices** on the phone.
 - The bridge's HTTP API (`/send`, `/health`) has no published ports and is reachable only inside the Compose network.
+- **Retention:** with `RETENTION_DAYS` set, the bridge deletes older messages at start and then daily, and doesn't
+  store expired messages that arrive again (e.g. history after a re-link). The summarizer deletes older LLM call log
+  entries at start, before each new entry, and before each scheduled run in `dummy`/`ollama` mode (if a log
+  exists). Group names are kept. A failing purge or log write (e.g. the log is locked) only prints a warning:
+  the digest still goes out.
 
 Unlink completely:
 
@@ -390,6 +395,7 @@ docker volume rm szalona-beata_wa-data
 |---|---|---|
 | `WATCH_GROUPS` | (empty: store nothing) | Groups whose messages the bridge stores (JIDs or exact names, comma-separated) |
 | `PAIR_PHONE` | | Link with a pairing code instead of QR (pass once on the command line) |
+| `RETENTION_DAYS` | `0` (keep forever) | Delete messages and LLM call log entries older than N days, max 36500 (`.env.example`: 720) |
 | `SUMMARY_MODEL` | `dummy` | `dummy`, `ollama` or `openai` |
 | `DIGEST_GROUPS` | `WATCH_GROUPS` | Groups in the digest |
 | `DAILY_AT`, `DIGEST_HOURS` | `20:00`, `24` | Schedule of the `digest` service |
@@ -420,8 +426,6 @@ Next steps:
       using the [call log](#55-call-log-for-prompt-tuning). A `--replay` command for this would help.
 - [ ] **Consistent sender names.** A message keeps the sender's own push name if it had one, otherwise it gets
       the address-book name, so one person can show up under two names. Prefer the address-book name.
-- [ ] **Data retention.** Messages and the LLM call log grow forever and contain other people's chats.
-      Delete entries older than e.g. 30–90 days automatically.
 - [ ] **License.** Not chosen yet: without one, the code is visible but all rights are reserved.
 
 ## Development

@@ -346,6 +346,69 @@ class BridgeHealthTest(unittest.TestCase):
         self.assertLess(html.index(warning), html.index(">A<"))
 
 
+class CallLogRetentionTest(unittest.TestCase):
+    def test_old_entries_are_deleted_on_open(self):
+        import os
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "llm_log.db")
+        log = summarize.CallLog(path)
+        day = 86400
+        for age_days in (800, 721, 719, 1):
+            log.record({"model": f"{age_days}d"}, "g@g.us", "G", T0 - age_days * day, synthetic=False)
+        log.db.close()
+
+        summarize.CallLog(path, retention_days=720, now=T0)
+
+        left = [r[0] for r in sqlite3.connect(path).execute("SELECT model FROM llm_calls ORDER BY ts")]
+        self.assertEqual(left, ["719d", "1d"])
+
+    def test_record_purges_old_entries_in_a_long_running_process(self):
+        # the scheduled digest opens the log once and then only calls record() for months
+        import os
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "llm_log.db")
+        log = summarize.CallLog(path, retention_days=720, now=T0 - 800 * 86400)
+        log.record({"model": "old"}, "g@g.us", "G", T0 - 800 * 86400, synthetic=False)
+
+        log.record({"model": "new"}, "g@g.us", "G", T0, synthetic=False)
+
+        left = [r[0] for r in sqlite3.connect(path).execute("SELECT model FROM llm_calls")]
+        self.assertEqual(left, ["new"])
+
+    def test_zero_retention_keeps_everything(self):
+        import os
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "llm_log.db")
+        summarize.CallLog(path).record({"model": "old"}, "g@g.us", "G", 0, synthetic=False)
+
+        summarize.CallLog(path, retention_days=0, now=T0)
+
+        self.assertEqual(sqlite3.connect(path).execute("SELECT COUNT(*) FROM llm_calls").fetchone(), (1,))
+
+
+class RetentionConfigTest(unittest.TestCase):
+    def parse(self, value):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"RETENTION_DAYS": value}):
+            return summarize.parse_args([]).retention_days
+
+    def test_default_keeps_forever(self):
+        self.assertEqual(self.parse(""), 0)
+
+    def test_value(self):
+        self.assertEqual(self.parse("720"), 720)
+
+    def test_invalid_values_are_rejected(self):
+        for value in ("-5", "²", "two years", "36501"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.parse(value)
+
+
 class ThreadRenderingTest(unittest.TestCase):
     THREADS = [
         summarize.Thread("Zadanie z angielskiego", ["Str. 20-21 na jutro", "Słówka w zeszycie"]),
@@ -1142,6 +1205,22 @@ class MainTest(unittest.TestCase):
         self.assertIn("Internal Server Error", error)
         self.assertIsNone(response)
 
+    def test_failing_log_write_does_not_block_the_digest(self):
+        import os
+        from unittest import mock
+
+        srv = self.llm_server()
+        env = {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": ""}
+        locked = sqlite3.OperationalError("database is locked")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(summarize.CallLog, "record", side_effect=locked), \
+                redirect_stderr(err):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+
+        self.assertEqual(code, 0)
+        self.assertIn("▸ Wyjazd", out)
+        self.assertIn("warning: could not log", err.getvalue())
+
     def test_llm_log_can_be_disabled(self):
         import os
         from unittest import mock
@@ -1152,6 +1231,31 @@ class MainTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertFalse(os.path.exists(self.log_path))
+
+    def test_existing_log_is_purged_even_without_llm(self):
+        # switching from openai to dummy must not keep old chats in the log forever
+        import os
+        from unittest import mock
+
+        summarize.CallLog(self.log_path).record({"model": "old"}, BIKES, "Rowery", T0 - 800 * 86400, False)
+        with mock.patch.dict(os.environ, {"RETENTION_DAYS": "720", "LLM_LOG_DB": ""}):
+            self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")
+
+        self.assertEqual(sqlite3.connect(self.log_path).execute("SELECT COUNT(*) FROM llm_calls").fetchone(), (0,))
+
+    def test_failing_log_purge_does_not_block_the_digest(self):
+        # e.g. the log is locked by someone querying it at digest time
+        import os
+        from unittest import mock
+
+        os.mkdir(self.log_path)  # exists, but SQLite can't open it
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"RETENTION_DAYS": "720", "LLM_LOG_DB": ""}), redirect_stderr(err):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")
+
+        self.assertEqual(code, 0)
+        self.assertIn("*Rowery* (2 messages)", out)
+        self.assertIn("warning: could not purge", err.getvalue())
 
     def test_dummy_mode_writes_no_log(self):
         import os

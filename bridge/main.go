@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
@@ -22,10 +23,11 @@ import (
 )
 
 type bridge struct {
-	client *whatsmeow.Client
-	store  *Store
-	filter groupFilter
-	log    waLog.Logger
+	client    *whatsmeow.Client
+	store     *Store
+	filter    groupFilter
+	retention time.Duration // 0 = keep messages forever
+	log       waLog.Logger
 }
 
 func envOr(key, fallback string) string {
@@ -59,6 +61,10 @@ func main() {
 	if err != nil {
 		fatal("Failed to open messages db", err)
 	}
+	retention, err := parseRetentionDays(os.Getenv("RETENTION_DAYS"))
+	if err != nil {
+		fatal("Invalid configuration", err)
+	}
 	filter := parseGroupFilter(os.Getenv("WATCH_GROUPS"))
 	if filter.Empty() {
 		log.Warnf("WATCH_GROUPS is empty - no messages will be stored (group names are still listed)")
@@ -68,12 +74,16 @@ func main() {
 	} else if n > 0 {
 		log.Infof("Deleted %d stored messages of groups no longer in WATCH_GROUPS", n)
 	}
+	if retention > 0 {
+		go purgeOldMessages(messages, retention, log)
+	}
 
 	b := &bridge{
-		client: whatsmeow.NewClient(device, waLog.Stdout("WA", "WARN", true)),
-		store:  messages,
-		filter: filter,
-		log:    log,
+		client:    whatsmeow.NewClient(device, waLog.Stdout("WA", "WARN", true)),
+		store:     messages,
+		filter:    filter,
+		retention: retention,
+		log:       log,
 	}
 	b.client.AddEventHandler(b.handleEvent)
 
@@ -97,6 +107,18 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	b.client.Disconnect()
+}
+
+// purgeOldMessages deletes messages older than the retention period now and then once a day.
+func purgeOldMessages(store *Store, retention time.Duration, log waLog.Logger) {
+	for {
+		if n, err := store.PurgeOlderThan(time.Now().Add(-retention)); err != nil {
+			log.Warnf("Failed to purge old messages: %v", err)
+		} else if n > 0 {
+			log.Infof("Deleted %d messages older than %d days", n, int(retention.Hours()/24))
+		}
+		time.Sleep(24 * time.Hour)
+	}
 }
 
 // login links a new device, either via QR code printed to stdout or,
@@ -153,6 +175,9 @@ func (b *bridge) handleEvent(evt any) {
 func (b *bridge) save(evt *events.Message, chatName string) bool {
 	if !b.filter.Allows(evt.Info.Chat.String(), chatName) {
 		return false
+	}
+	if isExpired(evt.Info.Timestamp, b.retention, time.Now()) {
+		return false // e.g. old history re-sent after a re-link
 	}
 	msg, ok := toMessage(evt, b.contactName)
 	if !ok {
