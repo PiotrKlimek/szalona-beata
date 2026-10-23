@@ -431,7 +431,6 @@ Next steps:
 - [ ] **Prompt quality.** The model occasionally adds details that aren't in the chat (e.g. a year nobody
       wrote) or labels a plan as a "decision". Tighten the prompt and compare on the same transcripts
       using the [call log](#55-call-log-for-prompt-tuning). A `--replay` command for this would help.
-- [ ] **License.** Not chosen yet: without one, the code is visible but all rights are reserved.
 
 ## Development
 
@@ -453,3 +452,18 @@ verified by linking a real account. Everything else has unit tests that run agai
 SMTP test servers.
 
 **When you change code, update this README (and `.env.example`) in the same commit.**
+
+## License
+
+[MIT](LICENSE) © 2026 Piotr Klimek.
+
+Dependencies keep their own licenses:
+
+- [whatsmeow](https://github.com/tulir/whatsmeow) and `go.mau.fi/util` are MPL-2.0 (file-level copyleft: changes
+  to their own files must stay open; this project uses them unmodified).
+- whatsmeow depends on `go.mau.fi/libsignal`, which is **GPL-3.0**. A compiled `bridge` binary or image is
+  therefore a GPL-3.0 combined work: if you distribute one, you must do so under GPL-3.0 terms. This repository
+  distributes only source code (the images are built locally by `docker compose`), and MIT is GPL-compatible.
+- The other Go dependencies are MIT, BSD-3-Clause, Apache-2.0 or ISC (e.g. go-sqlite3 and qrterminal: MIT,
+  Go protobuf and golang.org/x: BSD-3-Clause).
+- The summarizer uses only the Python standard library.
