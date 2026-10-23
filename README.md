@@ -278,13 +278,13 @@ DST-safe). It summarizes `DIGEST_GROUPS` (default: `WATCH_GROUPS`) over the last
 
 ```sh
 # .env: SUMMARY_MODEL=dummy | ollama | openai, DAILY_AT=20:00
-docker compose --profile digest up -d digest
+docker compose --profile digest up -d digest      # restarts automatically after reboots
 docker compose logs -f digest        # "Scheduled daily at 20:00 (Europe/Warsaw)", later "Emailed to ..."
 docker compose --profile digest rm -sf digest     # stop the schedule
 ```
 
 With `SUMMARY_MODEL=openai` the scheduled run needs the same explicit consent as a manual one. Add it in a
-`docker-compose.override.yml`, which Compose loads automatically:
+`docker-compose.override.yml`, which Compose loads automatically (it's in `.gitignore`, the consent stays local):
 
 ```yaml
 services:
