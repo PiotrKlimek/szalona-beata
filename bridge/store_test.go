@@ -184,6 +184,42 @@ func TestRefreshSenderNamesAppliesResolvedNamesToStoredMessages(t *testing.T) {
 	}
 }
 
+func TestRefreshSenderNamesIsIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	for _, m := range []Message{
+		{ID: "1", SenderJID: "48500100200@s.whatsapp.net", SenderName: "Ania"},
+		{ID: "2", SenderJID: "48500100300@s.whatsapp.net", SenderName: "Bartek Nowak"}, // already the resolved name
+	} {
+		m.ChatJID, m.Timestamp, m.Text = "120363000000000001@g.us", time.Unix(1761200000, 0), "x"
+		s.SaveMessage(m)
+	}
+	resolve := func(jid string) string {
+		return map[string]string{
+			"48500100200@s.whatsapp.net": "Anna Kowalska",
+			"48500100300@s.whatsapp.net": "Bartek Nowak",
+		}[jid]
+	}
+
+	first, _ := s.RefreshSenderNames(resolve)
+	second, err := s.RefreshSenderNames(resolve)
+
+	if first != 1 || second != 0 || err != nil {
+		t.Errorf("updates = %d then %d (err %v); want 1 then 0", first, second, err)
+	}
+}
+
+func TestRefreshSenderNamesFixesNullNames(t *testing.T) {
+	s := newTestStore(t)
+	// rows written outside the bridge may have NULL names
+	s.db.Exec(`INSERT INTO messages (chat_jid, id, sender_jid, sender_name, ts, text) VALUES ('g@g.us', '1', 'x@lid', NULL, 1, 'x')`)
+
+	updated, err := s.RefreshSenderNames(func(string) string { return "Ewa Testowa" })
+
+	if err != nil || updated != 1 {
+		t.Errorf("RefreshSenderNames() = %d, %v; want 1, nil", updated, err)
+	}
+}
+
 func TestPurgeOlderThanDeletesOnlyOldMessages(t *testing.T) {
 	s := newTestStore(t)
 	s.SaveChat("120363000000000001@g.us", "Rowery")

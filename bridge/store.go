@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS messages (
 	PRIMARY KEY (chat_jid, id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages (chat_jid, ts);
+CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages (sender_jid);
 `
 
 // Message is a group message as stored for the summarizer.
@@ -144,7 +145,7 @@ func (s *Store) RefreshSenderNames(resolve func(senderJID string) string) (int64
 		if name == "" {
 			continue
 		}
-		res, err := s.db.Exec(`UPDATE messages SET sender_name = ? WHERE sender_jid = ? AND sender_name != ?`, name, jid, name)
+		res, err := s.db.Exec(`UPDATE messages SET sender_name = ? WHERE sender_jid = ? AND sender_name IS NOT ?`, name, jid, name)
 		if err != nil {
 			return updated, err
 		}

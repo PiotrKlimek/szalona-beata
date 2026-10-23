@@ -27,17 +27,21 @@ func groupEvent(pushName string, msg *waE2E.Message) *events.Message {
 	}
 }
 
-func noLookup(t *testing.T) func(types.JID) string {
-	return func(types.JID) string {
+func noLookup(t *testing.T) nameLookup {
+	return func(types.JID) (string, string) {
 		t.Error("name lookup called for a message that should be skipped")
-		return ""
+		return "", ""
 	}
+}
+
+func names(full, push string) nameLookup {
+	return func(types.JID) (string, string) { return full, push }
 }
 
 func TestToMessageMapsGroupTextMessage(t *testing.T) {
 	evt := groupEvent("Ania", &waE2E.Message{Conversation: proto.String("cześć")})
 
-	got, ok := toMessage(evt, func(types.JID) string { return "" }) // not in the address book
+	got, ok := toMessage(evt, names("", "")) // unknown to the contact store
 
 	want := Message{
 		ChatJID:    "120363000000000001@g.us",
@@ -52,28 +56,35 @@ func TestToMessageMapsGroupTextMessage(t *testing.T) {
 	}
 }
 
-func TestToMessagePrefersAddressBookNameOverPushName(t *testing.T) {
-	evt := groupEvent("Ania", &waE2E.Message{Conversation: proto.String("cześć")})
-
-	got, ok := toMessage(evt, func(types.JID) string { return "Anna Kowalska" })
-
-	if !ok || got.SenderName != "Anna Kowalska" {
-		t.Errorf("SenderName = %q, ok=%v; want %q", got.SenderName, ok, "Anna Kowalska")
+func TestToMessageSenderNameOrder(t *testing.T) {
+	tests := []struct {
+		name                        string
+		eventPush, full, storedPush string
+		want                        string
+	}{
+		{"address book wins over the event push name", "Ania", "Anna Kowalska", "Ania", "Anna Kowalska"},
+		// the store's push name is updated asynchronously, so the event's is newer
+		{"event push name wins over the stored one", "Ania (nowe)", "", "Ania", "Ania (nowe)"},
+		{"stored push name when the event has none (history)", "", "", "Ania", "Ania"},
+		{"nothing known", "", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := toMessage(groupEvent(tt.eventPush, &waE2E.Message{Conversation: proto.String("x")}),
+				names(tt.full, tt.storedPush))
+			if !ok || got.SenderName != tt.want {
+				t.Errorf("SenderName = %q, want %q", got.SenderName, tt.want)
+			}
+		})
 	}
 }
 
-func TestToMessageFallsBackToContactNameWithoutPushName(t *testing.T) {
-	evt := groupEvent("", &waE2E.Message{Conversation: proto.String("cześć")})
+func TestToMessageLooksUpTheSender(t *testing.T) {
 	var lookedUp types.JID
-
-	got, ok := toMessage(evt, func(jid types.JID) string {
+	toMessage(groupEvent("", &waE2E.Message{Conversation: proto.String("x")}), func(jid types.JID) (string, string) {
 		lookedUp = jid
-		return "Anna Kowalska"
+		return "", ""
 	})
-
-	if !ok || got.SenderName != "Anna Kowalska" {
-		t.Errorf("SenderName = %q, ok=%v; want %q", got.SenderName, ok, "Anna Kowalska")
-	}
 	if lookedUp != senderJID {
 		t.Errorf("looked up %v, want %v", lookedUp, senderJID)
 	}

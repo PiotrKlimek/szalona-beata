@@ -359,8 +359,8 @@ To get history for a new group, unlink and link again (step 3).
 
 | Symptom | Cause / fix |
 |---|---|
-| Sender shown as a long number | The group hides phone numbers (LID) and the name wasn't known yet. The bridge refreshes names after each history batch and on reconnect. |
-| Which name is shown for a sender | The name from your address book if you have one, otherwise the name they set in WhatsApp. Stored messages are renamed when a better name becomes known, so one person appears under one name. |
+| Sender shown as a long number | The group hides phone numbers (LID) and the name wasn't known yet. The bridge refreshes names a few seconds after each history batch, reconnect, address-book change or WhatsApp name change. |
+| Which name is shown for a sender | The name from your address book if you have one, otherwise the name they set in WhatsApp (the newest one). Stored messages are renamed when the name changes, so one person appears under one name, also in older messages. |
 | Red "bridge is logged out" warning in the email, `Logged out` in bridge logs | Device removed on the phone or phone offline for ~14 days: remove the `wa-data` volume and link again (step 3). |
 | Red "bridge is not responding" warning | The bridge container is down: `docker compose up -d bridge`, then check `docker compose logs bridge`. |
 | No history after linking | `WATCH_GROUPS` was empty or wrong at link time; history comes only once. Unlink and relink (step 3). |
