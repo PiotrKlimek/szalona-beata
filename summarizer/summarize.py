@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""Summarize WhatsApp group messages collected by wa-bridge.
+
+Reads the bridge's SQLite database (read-only), summarizes selected groups
+with either a trivial statistics "model" (dummy) or a local Ollama model,
+and prints the digest or sends it to a group through the bridge.
+"""
+
+import argparse
+import html as htmllib
+import json
+import os
+import re
+import smtplib
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from typing import NamedTuple
+
+SYSTEM_PROMPT = (
+    "You summarize WhatsApp group chats. Write a short summary in {language}: "
+    "the main topics, decisions, dates and open questions, as 3-6 bullet points. "
+    "Do not invent anything that is not in the chat."
+)
+
+
+# Media without a caption, e.g. "[image]" - noise for a language model.
+BARE_PLACEHOLDER = re.compile(r"^\[[a-z ]+\]$")
+
+
+THREADS_PROMPT = (
+    "You summarize WhatsApp group chats. Messages about different topics are often interleaved; "
+    "split the chat into separate threads, one per topic (e.g. homework, a lost item, a trip), "
+    "and put every message on that topic into its thread. For each thread write a short title "
+    "(max 6 words) and 1-4 concise points with decisions, dates, amounts and open questions. "
+    "Messages about the same thing (e.g. a link and the text it points to) form one thread - "
+    "never split one topic into several threads. "
+    "Write unanswered questions as questions, never as decisions or facts, "
+    "always prefixed exactly like this: '{question}: ...'. "
+    "Skip greetings and thanks-only chatter. Do not invent anything that is not in the chat. "
+    "Write titles and points in {language}. Respond with JSON only: "
+    '{{"threads": [{{"title": "...", "points": ["...", "..."]}}]}}'
+)
+
+NOTHING_NOTABLE = "No notable topics."
+
+# Label for unanswered questions; models copy an English example word, so give it in the target language.
+QUESTION_LABEL = {"polish": "Pytanie", "english": "Question", "german": "Frage"}
+
+
+class Thread(NamedTuple):
+    title: str
+    points: list
+
+
+class Msg(NamedTuple):
+    ts: int
+    sender: str
+    text: str
+
+
+def is_synthetic(db):
+    """True for databases made by sample_data.py (made-up chats, safe for external APIs)."""
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'synthetic'").fetchone() is not None
+
+
+def resolve_group(db, query):
+    """Find a group by JID, exact name, or unique name substring (case-insensitive)."""
+    chats = db.execute("SELECT jid, COALESCE(name, '') FROM chats").fetchall()
+    for jid, name in chats:
+        if query == jid:
+            return jid, name
+    q = query.lower()
+    exact = [(jid, name) for jid, name in chats if name.lower() == q]
+    if exact:
+        return exact[0]
+    partial = [(jid, name) for jid, name in chats if q in name.lower()]
+    if len(partial) == 1:
+        return partial[0]
+    if partial:
+        names = ", ".join(sorted(name for _, name in partial))
+        raise ValueError(f"'{query}' matches several groups: {names}")
+    raise ValueError(f"no group matches '{query}' (try --list-groups)")
+
+
+def fetch_messages(db, jid, since_ts):
+    rows = db.execute(
+        "SELECT ts, COALESCE(NULLIF(sender_name, ''), sender_jid), text FROM messages "
+        "WHERE chat_jid = ? AND ts >= ? ORDER BY ts",
+        (jid, since_ts),
+    )
+    return [Msg(ts, sender.split("@")[0], text) for ts, sender, text in rows]
+
+
+def _hhmm(ts, tz):
+    return datetime.fromtimestamp(ts, tz).strftime("%H:%M")
+
+
+def format_transcript(msgs, max_chars, tz=None):
+    """Render messages as chat lines, keeping the most recent ones within max_chars."""
+    lines = [f"[{_hhmm(m.ts, tz)}] {m.sender}: {m.text}" for m in msgs if not BARE_PLACEHOLDER.match(m.text)]
+    kept, size = [], 0
+    for line in reversed(lines):
+        size += len(line) + (1 if kept else 0)
+        if size > max_chars:
+            break
+        kept.append(line)
+    kept.reverse()
+    omitted = len(lines) - len(kept)
+    if omitted:
+        kept.insert(0, f"[... {omitted} earlier messages omitted]")
+    return "\n".join(kept)
+
+
+def dummy_summary(msgs, tz=None):
+    """Statistics-only summary, used to test the pipeline without any model."""
+    senders = Counter(m.sender for m in msgs)
+    ranking = ", ".join(f"{name} ({n})" for name, n in senders.most_common(5))
+    first, last = (datetime.fromtimestamp(m.ts, tz) for m in (msgs[0], msgs[-1]))
+    fmt = "%H:%M" if first.date() == last.date() else "%d.%m %H:%M"
+    return (
+        f"{len(msgs)} messages from {len(senders)} people between "
+        f"{first.strftime(fmt)} and {last.strftime(fmt)}. Most active: {ranking}."
+    )
+
+
+def _summary_text(summary):
+    if isinstance(summary, list):
+        return "\n".join(f"▸ {t.title}\n" + "\n".join(f"- {p}" for p in t.points) for t in summary)
+    return summary or "No messages."
+
+
+def build_digest(sections, hours, title="Digest"):
+    parts = [f"📋 {title} (last {hours}h)"]
+    for name, summary in sections:
+        parts.append(f"*{name}*\n{_summary_text(summary)}")
+    return "\n\n".join(parts)
+
+
+BULLET = re.compile(r"^\s*[-*•]\s+(.*)$")
+BOLD = re.compile(r"\*\*(.+?)\*\*")
+
+# Email clients strip <style> blocks, so styles are inline.
+P_STYLE = "margin:0 0 8px"
+UL_STYLE = "margin:0 0 8px;padding-left:20px"
+LI_STYLE = "margin:0 0 4px"
+
+HTML_PAGE = """<!doctype html>
+<html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>{title} {day}</title></head>
+<body style="margin:0;padding:0;background:#f2f4f3">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f2f4f3">
+<tr><td align="center" style="padding:24px 12px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2a27">
+<tr><td style="background:#0b5f53;border-radius:12px 12px 0 0;padding:22px 24px">
+<div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a8dcd1">Szalona Beata</div>
+<div style="font-size:22px;font-weight:700;color:#ffffff;margin-top:4px">{title}</div>
+<div style="font-size:14px;color:#d6eee8;margin-top:4px">{day} &middot; last {hours}h &middot; {count} groups</div>
+</td></tr>
+<tr><td style="background:#ffffff;border-radius:0 0 12px 12px;padding:8px 24px 16px">
+{cards}
+</td></tr>
+<tr><td style="padding:16px 24px;font-size:12px;color:#7a8783;text-align:center">
+Generated locally by szalona-beata from your WhatsApp groups.
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>
+"""
+
+CARD = """<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px">
+<tr><td style="border-left:4px solid #25a18e;padding:4px 0 4px 14px">
+<div style="font-size:17px;font-weight:700;color:#0b5f53;margin:0 0 8px">{name}</div>
+<div style="font-size:15px;line-height:1.5">{summary}</div>
+</td></tr></table>"""
+
+
+def _inline_html(text):
+    return BOLD.sub(r"<strong>\1</strong>", htmllib.escape(text))
+
+
+THREAD_BLOCK = (
+    '<div data-thread="{n}" style="background:#f3f8f6;border-radius:8px;padding:10px 12px;margin:0 0 10px">'
+    '<div style="font-weight:700;color:#1f2a27;margin:0 0 6px">{title}</div>'
+    '<ul style="' + UL_STYLE + ';margin-bottom:0">{items}</ul></div>'
+)
+
+
+def render_summary_html(summary):
+    """Render a summary as safe HTML: a list of Threads becomes one block per thread;
+    plain text (optional "- " bullets and **bold**) becomes paragraphs and lists."""
+    if isinstance(summary, list):
+        return "".join(
+            THREAD_BLOCK.format(
+                n=n,
+                title=_inline_html(t.title),
+                items="".join(f'<li style="{LI_STYLE}">{_inline_html(p)}</li>' for p in t.points),
+            )
+            for n, t in enumerate(summary, start=1)
+        )
+    if not summary:
+        return '<p style="margin:0 0 8px;color:#7a8783;font-style:italic">No messages.</p>'
+    parts, items = [], []
+
+    def flush():
+        if items:
+            lis = "".join(f'<li style="{LI_STYLE}">{i}</li>' for i in items)
+            parts.append(f'<ul style="{UL_STYLE}">{lis}</ul>')
+            items.clear()
+
+    for line in summary.splitlines():
+        if m := BULLET.match(line):
+            items.append(_inline_html(m.group(1)))
+            continue
+        flush()
+        if line.strip():
+            parts.append(f'<p style="{P_STYLE}">{_inline_html(line.strip())}</p>')
+    flush()
+    return "".join(parts)
+
+
+def build_html_digest(sections, hours, day, title="WhatsApp digest"):
+    cards = "\n".join(
+        CARD.format(name=htmllib.escape(name), summary=render_summary_html(summary))
+        for name, summary in sections
+    )
+    return HTML_PAGE.format(
+        title=htmllib.escape(title), day=htmllib.escape(day), hours=hours, count=len(sections), cards=cards
+    )
+
+
+# Longer server-requested waits (e.g. an exhausted daily quota) are not worth blocking for.
+MAX_RETRY_WAIT = 120
+
+
+def _request(method, url, payload=None, timeout=600, headers=None, retries=0):
+    """JSON request; HTTP 429 is retried up to `retries` times after the server's Retry-After delay."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        # Some API fronts (e.g. Groq's Cloudflare) reject urllib's default User-Agent.
+        headers={"Content-Type": "application/json", "User-Agent": "szalona-beata/0.1", **(headers or {})},
+    )
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries:
+                try:
+                    wait = float(e.headers.get("Retry-After", 10))
+                except ValueError:
+                    wait = 10
+                if wait <= MAX_RETRY_WAIT:
+                    print(f"Rate limited, retrying in {wait:g}s...", file=sys.stderr, flush=True)
+                    time.sleep(wait)
+                    continue
+            _raise_http_error(method, url, e)
+
+
+def _raise_http_error(method, url, e):
+    try:
+        detail = json.load(e).get("error", e.reason)
+    except ValueError:
+        detail = e.reason
+    if isinstance(detail, dict):  # OpenAI-style {"error": {"message": ...}}
+        detail = detail.get("message", detail)
+    raise RuntimeError(f"{method} {url} failed ({e.code}): {detail}") from None
+
+
+class Ollama:
+    def __init__(self, base_url, model):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    def ensure_model(self):
+        tags = _request("GET", f"{self.base_url}/api/tags")
+        if not any(m.get("name") == self.model for m in tags.get("models", [])):
+            print(f"Pulling model {self.model} (first run only)...", file=sys.stderr)
+            _request("POST", f"{self.base_url}/api/pull", {"model": self.model, "stream": False})
+
+    def summarize(self, transcript, language):
+        reply = _request("POST", f"{self.base_url}/api/chat", {
+            "model": self.model,
+            "stream": False,
+            "options": {"temperature": 0.2, "num_ctx": 8192},
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT.format(language=language)},
+                {"role": "user", "content": transcript},
+            ],
+        })
+        return reply["message"]["content"].strip()
+
+
+def parse_threads(content):
+    """Turn a JSON threads reply into [Thread]; anything unexpected is returned as plain text."""
+    text = content.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    try:
+        data = json.loads(fenced.group(1) if fenced else text)
+        threads = [
+            Thread(t["title"].strip(), [p.strip() for p in t["points"] if isinstance(p, str) and p.strip()])
+            for t in data["threads"]
+        ]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return text
+    threads = [t for t in threads if t.title]
+    return threads or NOTHING_NOTABLE
+
+
+class OpenAICompat:
+    """Any OpenAI-compatible chat completions API (Groq, Mistral, OpenRouter, Ollama's /v1...)."""
+
+    def __init__(self, base_url, api_key, model, reasoning_effort=None):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def summarize(self, transcript, language):
+        payload = {
+            "model": self.model,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": THREADS_PROMPT.format(
+                    language=language, question=QUESTION_LABEL.get(language.lower(), "Question"))},
+                {"role": "user", "content": transcript},
+            ],
+        }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        reply = _request(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            retries=3,
+        )
+        for key in self.usage:
+            self.usage[key] += (reply.get("usage") or {}).get(key, 0)
+        return parse_threads(reply["choices"][0]["message"]["content"])
+
+
+def send_to_bridge(bridge_url, jid, text):
+    _request("POST", f"{bridge_url.rstrip('/')}/send", {"jid": jid, "text": text}, timeout=60)
+
+
+class SMTPConfig(NamedTuple):
+    host: str
+    port: int
+    user: str
+    password: str
+    security: str  # "ssl", "starttls" or "none"
+
+
+def send_email(smtp, sender, to, subject, body, html=None):
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to)
+    msg["Subject"] = subject
+    msg.set_content(body)
+    if html:
+        msg.add_alternative(html, subtype="html")
+    if smtp.security == "ssl":
+        conn = smtplib.SMTP_SSL(smtp.host, smtp.port, timeout=60)
+    else:
+        conn = smtplib.SMTP(smtp.host, smtp.port, timeout=60)
+    with conn:
+        if smtp.security == "starttls":
+            conn.starttls()
+        if smtp.user:
+            conn.login(smtp.user, smtp.password)
+        conn.send_message(msg)
+
+
+def seconds_until(hhmm, now, tz):
+    """Seconds from `now` until the next local wall-clock time HH:MM (strictly in the future)."""
+    if not re.fullmatch(r"\d{1,2}:\d{2}", hhmm):
+        raise ValueError(f"expected HH:MM, got {hhmm!r}")
+    at = datetime.strptime(hhmm, "%H:%M").time()
+    today = datetime.fromtimestamp(now, tz).date()
+    for day in (today, today + timedelta(days=1)):
+        target = datetime.combine(day, at, tzinfo=tz).timestamp()
+        if target > now:
+            return target - now
+    raise AssertionError("unreachable")
+
+
+def _local_tz(name):
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        return timezone.utc
+
+
+def parse_args(argv):
+    def env(key, default=None):
+        return os.environ.get(key) or default  # empty counts as unset
+
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--db", default=env("DB_PATH", "/data/messages.db"))
+    p.add_argument("--list-groups", action="store_true", help="list known groups and exit")
+    p.add_argument("--group", action="append", default=[], help="group name, name fragment or JID (repeatable)")
+    p.add_argument("--hours", type=int, default=24, help="summarize messages from the last N hours")
+    p.add_argument("--model", choices=["dummy", "ollama", "openai"], default=env("SUMMARY_MODEL", "dummy"),
+                   help="dummy: stats; ollama: local model; openai: external OpenAI-compatible API (Groq by default)")
+    p.add_argument("--allow-real-data", action="store_true",
+                   help="let --model openai send chats from a non-synthetic database to the external API")
+    p.add_argument("--llm-base-url", default=env("LLM_BASE_URL", "https://api.groq.com/openai/v1"))
+    p.add_argument("--llm-model", default=env("LLM_MODEL", "openai/gpt-oss-120b"))
+    p.add_argument("--send-to", help="group to send the digest to (otherwise just print it)")
+    p.add_argument("--email-to", default=env("EMAIL_TO", ""), help="comma-separated addresses to email the digest to")
+    p.add_argument("--email-from", default=env("EMAIL_FROM", ""))
+    p.add_argument("--email-title", default=env("EMAIL_TITLE"), help="heading at the top of the email")
+    p.add_argument("--email-subject", default=env("EMAIL_SUBJECT", "WhatsApp digest {date}: {groups}"),
+                   help="subject template with {date}, {hours} and {groups}")
+    p.add_argument("--html-out", help="also write the HTML email to this file (preview without sending)")
+    p.add_argument("--ollama-url", default=env("OLLAMA_URL", "http://ollama:11434"))
+    p.add_argument("--ollama-model", default=env("OLLAMA_MODEL", "qwen2.5:0.5b"))
+    p.add_argument("--bridge-url", default=env("BRIDGE_URL", "http://bridge:8080"))
+    p.add_argument("--language", default=env("SUMMARY_LANGUAGE", "Polish"))
+    p.add_argument("--max-chars", type=int, default=int(env("MAX_TRANSCRIPT_CHARS", "12000")))
+    p.add_argument("--tz", default=env("TZ", "Europe/Warsaw"))
+    p.add_argument("--daily-at", default=env("DAILY_AT"), help="keep running and send a digest every day at HH:MM")
+    args = p.parse_args(argv)
+    args.llm_api_key = env("LLM_API_KEY", "")
+    effort = env("LLM_REASONING_EFFORT", "low")
+    args.llm_reasoning_effort = None if effort == "off" else effort
+    args.email_to = [a.strip() for a in args.email_to.split(",") if a.strip()]
+    if not args.group:
+        groups_env = env("DIGEST_GROUPS") or env("WATCH_GROUPS", "")
+        args.group = [g.strip() for g in groups_env.split(",") if g.strip()]
+    # Defaults target Resend (password = API key); any SMTP server works.
+    args.smtp = SMTPConfig(
+        host=env("SMTP_HOST", "smtp.resend.com"),
+        port=int(env("SMTP_PORT", "465")),
+        user=env("SMTP_USER", "resend"),
+        password=env("SMTP_PASSWORD", ""),
+        security=env("SMTP_SECURITY", "ssl"),
+    )
+    return args
+
+
+def run_digest(args, db, groups, target, llm, now, tz):
+    """Build one digest and deliver it (print, and optionally group and/or email)."""
+    since = int(now - args.hours * 3600)
+    sections = []
+    for jid, name in groups:
+        msgs = fetch_messages(db, jid, since)
+        if not msgs:
+            summary = None
+        elif llm:
+            try:
+                summary = llm.summarize(format_transcript(msgs, args.max_chars, tz), args.language)
+            except (RuntimeError, OSError) as e:  # API error, timeout, network
+                print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
+                summary = f"{dummy_summary(msgs, tz)}\n(model unavailable, showing statistics: {e})"
+        else:
+            summary = dummy_summary(msgs, tz)
+        sections.append((name, summary))
+
+    title = {"title": args.email_title} if args.email_title else {}
+    digest = build_digest(sections, args.hours, **title)
+    print(digest, flush=True)
+    if usage := getattr(llm, "usage", None):
+        print(
+            f"\nTokens: {usage['prompt_tokens']} in + {usage['completion_tokens']} out "
+            f"= {usage['total_tokens']} total",
+            file=sys.stderr,
+        )
+    if target:
+        send_to_bridge(args.bridge_url, target[0], digest)
+        print(f"\nSent to {target[1]}.", file=sys.stderr)
+    day = datetime.fromtimestamp(now, tz).strftime("%d.%m.%Y")
+    html = build_html_digest(sections, args.hours, day, **title)
+    if args.html_out:
+        with open(args.html_out, "w", encoding="utf-8") as f:
+            f.write(html)
+    if args.email_to:
+        groups_list = ", ".join(name for name, _ in sections)
+        subject = args.email_subject.format(date=day, hours=args.hours, groups=groups_list)
+        send_email(args.smtp, args.email_from, args.email_to, subject, digest, html=html)
+        print(f"\nEmailed to {', '.join(args.email_to)}.", file=sys.stderr)
+
+
+def main(argv=None, now=None):
+    args = parse_args(argv)
+    tz = _local_tz(args.tz)
+    db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+
+    if args.list_groups:
+        rows = db.execute(
+            "SELECT c.jid, COALESCE(c.name, ''), COUNT(m.id) FROM chats c "
+            "LEFT JOIN messages m ON m.chat_jid = c.jid GROUP BY c.jid ORDER BY c.name"
+        )
+        for jid, name, count in rows:
+            print(f"{jid}  {name}  ({count} messages)")
+        return 0
+
+    if not args.group:
+        print("error: give at least one --group (see --list-groups)", file=sys.stderr)
+        return 2
+    if args.email_to and not (args.email_from and args.smtp.password):
+        print("error: emailing needs EMAIL_FROM and SMTP_PASSWORD (see .env.example)", file=sys.stderr)
+        return 2
+    try:
+        args.email_subject.format(date="", hours=0, groups="")
+    except (KeyError, IndexError, ValueError) as e:
+        print(f"error: bad EMAIL_SUBJECT template ({e!r}); use {{date}}, {{hours}}, {{groups}}", file=sys.stderr)
+        return 2
+    if args.model == "openai":
+        if not args.llm_api_key:
+            print("error: --model openai needs LLM_API_KEY", file=sys.stderr)
+            return 2
+        if not is_synthetic(db) and not args.allow_real_data:
+            print(
+                "error: refusing to send real chats to an external API; use a sample database "
+                "(sample_data.py) or pass --allow-real-data",
+                file=sys.stderr,
+            )
+            return 2
+    try:
+        groups = [resolve_group(db, g) for g in args.group]
+        target = resolve_group(db, args.send_to) if args.send_to else None
+        if args.daily_at:
+            seconds_until(args.daily_at, time.time(), tz)  # validate early
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    llm = None
+    if args.model == "ollama":
+        llm = Ollama(args.ollama_url, args.ollama_model)
+        llm.ensure_model()
+    elif args.model == "openai":
+        llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)
+
+    if not args.daily_at:
+        run_digest(args, db, groups, target, llm, time.time() if now is None else now, tz)
+        return 0
+
+    print(f"Scheduled daily at {args.daily_at} ({args.tz}).", file=sys.stderr, flush=True)
+    while True:
+        time.sleep(seconds_until(args.daily_at, time.time(), tz))
+        try:
+            run_digest(args, db, groups, target, llm, time.time(), tz)
+        except Exception as e:  # keep the schedule alive; the next run may succeed
+            print(f"error: digest failed: {e}", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

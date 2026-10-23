@@ -1,0 +1,77 @@
+x-summarizer-env: &summarizer-env
+  TZ: ${TZ:-Europe/Warsaw}
+  WATCH_GROUPS: ${WATCH_GROUPS:-}
+  DIGEST_GROUPS: ${DIGEST_GROUPS:-}
+  SUMMARY_MODEL: ${SUMMARY_MODEL:-dummy}
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:0.5b}
+  SUMMARY_LANGUAGE: ${SUMMARY_LANGUAGE:-Polish}
+  EMAIL_FROM: ${EMAIL_FROM:-}
+  EMAIL_TO: ${EMAIL_TO:-}
+  EMAIL_SUBJECT: ${EMAIL_SUBJECT:-}
+  EMAIL_TITLE: ${EMAIL_TITLE:-}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_SECURITY: ${SMTP_SECURITY:-}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_BASE_URL: ${LLM_BASE_URL:-}
+  LLM_MODEL: ${LLM_MODEL:-}
+  LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
+
+services:
+  bridge:
+    build: ./bridge
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+      PAIR_PHONE: ${PAIR_PHONE:-}  # optional: link with a pairing code instead of QR
+      WATCH_GROUPS: ${WATCH_GROUPS:-}  # comma-separated group names or JIDs whose messages are stored
+    volumes:
+      - wa-data:/data
+    # No published ports: the HTTP API is reachable only inside this compose network.
+
+  # Started only on demand (profile "llm"); the model is unloaded right after each request.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [llm]
+    environment:
+      OLLAMA_KEEP_ALIVE: "0"
+    volumes:
+      - ollama-models:/root/.ollama
+
+  # One-off runs: docker compose run --rm summarizer ...
+  summarizer:
+    build: ./summarizer
+    profiles: [tools]
+    environment: *summarizer-env
+    volumes:
+      - wa-data:/data
+      - samples:/samples  # synthetic test databases (sample_data.py)
+    depends_on:
+      bridge:
+        condition: service_started
+      ollama:
+        condition: service_started
+        required: false  # only when run with --profile llm
+
+  # Daily digest by email: docker compose --profile digest up -d digest
+  digest:
+    build: ./summarizer
+    profiles: [digest]
+    restart: unless-stopped
+    command: ["--daily-at", "${DAILY_AT:-20:00}", "--hours", "${DIGEST_HOURS:-24}"]
+    environment: *summarizer-env
+    volumes:
+      - wa-data:/data
+    depends_on:
+      bridge:
+        condition: service_started
+      ollama:
+        condition: service_started
+        required: false  # only when run with --profile llm
+
+volumes:
+  wa-data:
+  ollama-models:
+  samples:

@@ -1,0 +1,10 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Local data (WhatsApp session keys, messages)
+*.db
+*.db-shm
+*.db-wal
+data/
