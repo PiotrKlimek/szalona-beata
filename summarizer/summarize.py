@@ -91,7 +91,7 @@ LABELS = {
         "no_messages": "Brak wiadomości.", "nothing_notable": "Nic istotnego.",
         "stats": "{messages} ({people}), {first}–{last}. Najaktywniejsi: {ranking}.",
         "model_unavailable": "model niedostępny, pokazuję statystyki: {error}",
-        "truncated": "⚠️ Długa rozmowa: podsumowanie pomija najstarsze wiadomości ({n}).",
+        "truncated": "⚠️ Długa rozmowa: w podsumowaniu pominięto najstarsze – {count}.",
         "footer": "Wygenerowane lokalnie przez szalona-beata z Twoich grup WhatsApp.",
         "bridge": {
             "logged_out": "⚠️ Mostek WhatsApp jest wylogowany: nowe wiadomości nie są zbierane. "
@@ -168,12 +168,14 @@ def _hhmm(ts, tz):
 
 
 def format_transcript(msgs, max_chars, tz=None):
+    """The transcript text only (see build_transcript)."""
     return build_transcript(msgs, max_chars, tz)[0]
 
 
 def build_transcript(msgs, max_chars, tz=None):
     """Render messages as chat lines, keeping the most recent ones within max_chars.
-    Returns (text, number of messages left out)."""
+    Returns (text, number of messages left out). Captionless media ("[image]") is
+    never sent, so it doesn't count as left out."""
     lines = [f"[{_hhmm(m.ts, tz)}] {m.sender}: {m.text}" for m in msgs if not BARE_PLACEHOLDER.match(m.text)]
     kept, size = [], 0
     for line in reversed(lines):
@@ -181,6 +183,8 @@ def build_transcript(msgs, max_chars, tz=None):
         if size > max_chars:
             break
         kept.append(line)
+    if lines and not kept:  # the newest message alone is too long: cut it rather than send nothing
+        kept.append(lines[-1][: max_chars - 1] + "…")
     kept.reverse()
     omitted = len(lines) - len(kept)
     if omitted:
@@ -211,7 +215,7 @@ def _summary_text(summary, lang="English"):
 
 def _truncated_note(section, lang):
     L = labels(lang)
-    return L["truncated"].format(n=section.omitted, count=plural(section.omitted, L["message"], lang))
+    return L["truncated"].format(count=plural(section.omitted, L["message"], lang))
 
 
 def build_digest(sections, hours, title=None, lang="English", warning=None):
@@ -313,6 +317,18 @@ def render_summary_html(summary, lang="English"):
     return "".join(parts)
 
 
+def _card_meta_html(section, lang):
+    """Message count and, for truncated chats, the left-out note under a group's name."""
+    html = ""
+    if section.messages:
+        count = plural(section.messages, labels(lang)["message"], lang)
+        html += f'<div style="font-size:13px;color:#7a8783;margin:-4px 0 8px">{count}</div>'
+    if section.omitted:
+        note = htmllib.escape(_truncated_note(section, lang))
+        html += f'<div style="font-size:13px;color:#8a5a00;margin:0 0 8px">{note}</div>'
+    return html
+
+
 KICKER = ('<div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a8dcd1">'
           'Szalona Beata</div>\n')
 WARNING_BANNER = ('<div data-warning="1" style="background:#fdecea;color:#8a1c12;border-radius:8px;'
@@ -325,10 +341,7 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
     cards = "\n".join(
         CARD.format(
             name=htmllib.escape(s.name),
-            meta=(f'<div style="font-size:13px;color:#7a8783;margin:-4px 0 8px">'
-                  f'{plural(s.messages, L["message"], lang)}</div>' if s.messages else "")
-                 + (f'<div style="font-size:13px;color:#8a5a00;margin:0 0 8px">'
-                    f'{htmllib.escape(_truncated_note(s, lang))}</div>' if s.omitted else ""),
+            meta=_card_meta_html(s, lang),
             summary=render_summary_html(s.summary, lang),
         )
         for s in sections
@@ -679,6 +692,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                 summary = llm.summarize(transcript, args.language)
             except (RuntimeError, OSError) as e:  # API error, timeout, network
                 print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
+                omitted = 0  # the fallback statistics cover every message
                 unavailable = labels(lang)["model_unavailable"].format(error=e)
                 summary = f"{dummy_summary(msgs, tz, lang)}\n({unavailable})"
             if call_log and getattr(llm, "last_exchange", None):

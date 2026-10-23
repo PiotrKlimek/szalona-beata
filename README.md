@@ -369,7 +369,7 @@ To get history for a new group, unlink and link again (step 3).
 | Red "bridge is not responding" warning | The bridge container is down: `docker compose up -d bridge`, then check `docker compose logs bridge`. |
 | No history after linking | `WATCH_GROUPS` was empty or wrong at link time; history comes only once. Unlink and relink (step 3). |
 | Groq `403 Forbidden`, `error code: 1010` | Cloudflare blocks the default Python User-Agent. Fixed in the code; if you fork the HTTP client, keep a custom `User-Agent`. |
-| "Long chat: … left out of the summary" under a group | That day's chat exceeded `MAX_TRANSCRIPT_CHARS`, so the oldest messages weren't sent to the model. Raise the limit if your model's context and rate limits allow it. |
+| "Long chat: … left out of the summary" (PL: "Długa rozmowa: w podsumowaniu pominięto najstarsze – …") under a group | That day's chat exceeded `MAX_TRANSCRIPT_CHARS`, so the oldest messages weren't sent to the model. Raise the limit if your model's context and rate limits allow it. |
 | Groq `429` | Tokens-per-minute limit; retried automatically, see [Limits](#54-limits-and-token-usage). |
 | `refusing to send real chats to an external API` | Intended. Use `--allow-real-data` (or the override for the schedule). |
 | Email not arriving | Check Spam/Promotions and Resend → Emails. Without a domain, `EMAIL_TO` must be the Resend account address. |
