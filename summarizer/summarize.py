@@ -9,7 +9,6 @@ and prints the digest or sends it to a group through the bridge.
 import argparse
 import html as htmllib
 import json
-import math
 import os
 import re
 import smtplib
@@ -63,10 +62,7 @@ class Section(NamedTuple):
     name: str
     summary: object  # str, [Thread] or None
     messages: int = 0
-    words: int = 0
 
-
-READING_WPM = 200  # typical silent reading speed
 
 # Email/digest labels by SUMMARY_LANGUAGE; plural forms are (one, few, many).
 LABELS = {
@@ -74,7 +70,6 @@ LABELS = {
         "digest": "Digest", "html_title": "WhatsApp digest", "last": "last {hours}h",
         "message": ("message", "messages", "messages"), "person": ("person", "people", "people"),
         "group": ("group", "groups", "groups"),
-        "savings": "≈{chat} min of chat reading condensed into ≈{digest} min",
         "no_messages": "No messages.", "nothing_notable": "No notable topics.",
         "stats": "{messages} from {people} between {first} and {last}. Most active: {ranking}.",
         "model_unavailable": "model unavailable, showing statistics: {error}",
@@ -91,7 +86,6 @@ LABELS = {
         "digest": "Podsumowanie", "html_title": "Podsumowanie WhatsApp", "last": "ostatnie {hours} h",
         "message": ("wiadomość", "wiadomości", "wiadomości"), "person": ("osoba", "osoby", "osób"),
         "group": ("grupa", "grupy", "grup"),
-        "savings": "≈{chat} min czytania czatu skrócone do ≈{digest} min",
         "no_messages": "Brak wiadomości.", "nothing_notable": "Nic istotnego.",
         "stats": "{messages} ({people}), {first}–{last}. Najaktywniejsi: {ranking}.",
         "model_unavailable": "model niedostępny, pokazuję statystyki: {error}",
@@ -121,23 +115,10 @@ def plural(n, forms, lang):
     return f"{n} {many}"
 
 
-def reading_minutes(words):
-    return math.ceil(words / READING_WPM)
-
-
-def _savings_line(sections, lang):
-    """'120 messages · ≈8 min of chat reading condensed into ≈1 min', or None without messages."""
-    L = labels(lang)
+def _total_line(sections, lang):
+    """'122 messages' across all groups, or None without messages."""
     total = sum(s.messages for s in sections)
-    if not total:
-        return None
-    digest_words = sum(len(_summary_text(s.summary, lang).split()) for s in sections)
-    digest_min = max(1, reading_minutes(digest_words))
-    chat_min = reading_minutes(sum(s.words for s in sections))
-    count = plural(total, L["message"], lang)
-    if chat_min <= digest_min:  # nothing saved - don't claim it
-        return count
-    return f"{count} · " + L["savings"].format(chat=chat_min, digest=digest_min)
+    return plural(total, labels(lang)["message"], lang) if total else None
 
 
 class Msg(NamedTuple):
@@ -224,8 +205,8 @@ def build_digest(sections, hours, title=None, lang="English", warning=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     header = f"📋 {title or L['digest']} ({L['last'].format(hours=hours)})"
-    if savings := _savings_line(sections, lang):
-        header += f"\n{savings}"
+    if total := _total_line(sections, lang):
+        header += f"\n{total}"
     parts = [header] + ([warning] if warning else [])
     for s in sections:
         count = f" ({plural(s.messages, L['message'], lang)})" if s.messages else ""
@@ -251,7 +232,7 @@ HTML_PAGE = """<!doctype html>
 <tr><td style="background:#0b5f53;border-radius:12px 12px 0 0;padding:22px 24px">
 {kicker}<div style="font-size:22px;font-weight:700;color:#ffffff;margin-top:4px">{title}</div>
 <div style="font-size:14px;color:#d6eee8;margin-top:4px">{day} &middot; {last} &middot; {count}</div>
-{savings}
+{total}
 </td></tr>
 <tr><td style="background:#ffffff;border-radius:0 0 12px 12px;padding:8px 24px 16px">
 {warning}{cards}
@@ -336,7 +317,7 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
         )
         for s in sections
     )
-    savings = _savings_line(sections, lang)
+    total = _total_line(sections, lang)
     return HTML_PAGE.format(
         title=htmllib.escape(title or L["html_title"]),
         kicker="" if title else KICKER,  # a custom title already names the sender
@@ -346,9 +327,9 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
         cards=cards,
         warning=WARNING_BANNER.format(htmllib.escape(warning)) if warning else "",
         footer=L["footer"],
-        savings=(f'<div style="display:inline-block;margin-top:12px;padding:6px 10px;border-radius:6px;'
-                 f'background:#0e7466;color:#ffffff;font-size:14px">⏱ {htmllib.escape(savings)}</div>'
-                 if savings else ""),
+        total=(f'<div style="display:inline-block;margin-top:12px;padding:6px 10px;border-radius:6px;'
+               f'background:#0e7466;color:#ffffff;font-size:14px">💬 {htmllib.escape(total)}</div>'
+               if total else ""),
     )
 
 
@@ -671,7 +652,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                 call_log.record(llm.last_exchange, jid, name, now, synthetic)
         else:
             summary = dummy_summary(msgs, tz, lang)
-        sections.append(Section(name, summary, len(msgs), sum(len(m.text.split()) for m in msgs)))
+        sections.append(Section(name, summary, len(msgs)))
 
     common = {"title": args.email_title, "lang": lang, "warning": warning}
     digest = build_digest(sections, args.hours, **common)

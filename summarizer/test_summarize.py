@@ -231,50 +231,41 @@ class BuildHtmlDigestTest(unittest.TestCase):
         self.assertNotIn("<3 &", html)
 
 
-class ReadingTimeTest(unittest.TestCase):
-    def test_minutes_round_up_at_200_words_per_minute(self):
-        self.assertEqual(
-            [summarize.reading_minutes(w) for w in (0, 1, 200, 201, 1000)],
-            [0, 1, 1, 2, 5],
-        )
-
-
 class MessageCountsTest(unittest.TestCase):
     SECTIONS = [
-        summarize.Section("Klasa 1a (test)", "Wycieczka 6.11.", messages=120, words=1500),
-        summarize.Section("Klasa 2b (test)", None),
+        summarize.Section("Klasa 1a (test)", "Wycieczka 6.11.", messages=120),
+        summarize.Section("Klasa 2b (test)", "Zebranie.", messages=2),
+        summarize.Section("Klasa 3c (test)", None),
     ]
 
-    def test_text_digest_shows_counts_and_reading_time_saved(self):
+    def test_text_digest_shows_total_on_top_and_count_per_group(self):
         got = summarize.build_digest(self.SECTIONS, hours=24)
-        # 1500 words -> 8 min; the digest itself is a few dozen words -> 1 min
-        self.assertTrue(got.startswith(
-            "📋 Digest (last 24h)\n"
-            "120 messages · ≈8 min of chat reading condensed into ≈1 min\n\n"
-        ), got)
+        self.assertTrue(got.startswith("📋 Digest (last 24h)\n122 messages\n\n"), got)
         self.assertIn("*Klasa 1a (test)* (120 messages)\nWycieczka 6.11.", got)
-        self.assertIn("*Klasa 2b (test)*\nNo messages.", got)  # no "(0 messages)"
+        self.assertIn("*Klasa 2b (test)* (2 messages)\nZebranie.", got)
+        self.assertIn("*Klasa 3c (test)*\nNo messages.", got)  # no "(0 messages)"
 
-    def test_html_shows_group_count_and_total_savings(self):
+    def test_html_shows_total_in_header_and_count_per_group(self):
         html = summarize.build_html_digest(self.SECTIONS, hours=24, day="23.10.2026")
 
-        self.assertIn("120 messages", html)
-        self.assertIn("≈8 min of chat reading condensed into ≈1 min", html)
-        self.assertLess(html.index("Klasa 1a (test)"), html.index("120 messages", html.index("Klasa 1a (test)")))
-        self.assertLess(html.index("120 messages", html.index("Klasa 1a (test)")), html.index("Wycieczka 6.11."))
+        self.assertLess(html.index("122 messages"), html.index("Klasa 1a (test)"))
+        after_name = html.index("Klasa 1a (test)")
+        self.assertLess(html.index("120 messages", after_name), html.index("Wycieczka 6.11."))
 
-    def test_no_savings_line_without_messages(self):
-        quiet = [summarize.Section("Klasa 2b (test)", None)]
-        self.assertNotIn("condensed", summarize.build_digest(quiet, hours=24))
-        self.assertNotIn("condensed", summarize.build_html_digest(quiet, hours=24, day="23.10.2026"))
+    def test_no_reading_time(self):
+        for lang in ("English", "Polish"):
+            text = summarize.build_digest(self.SECTIONS, hours=24, lang=lang)
+            html = summarize.build_html_digest(self.SECTIONS, hours=24, day="23.10.2026", lang=lang)
+            for out in (text, html):
+                self.assertNotIn("min", out.replace("Generated", "").replace("minut", ""))
 
-    def test_no_savings_claim_when_chat_is_as_short_as_summary(self):
-        got = summarize.build_digest([summarize.Section("A", "Krótko.", messages=4, words=20)], hours=24)
-        self.assertTrue(got.startswith("📋 Digest (last 24h)\n4 messages\n\n"), got)
-        self.assertNotIn("condensed", got)
+    def test_no_total_without_messages(self):
+        quiet = [summarize.Section("Klasa 3c (test)", None)]
+        self.assertTrue(summarize.build_digest(quiet, hours=24).startswith("📋 Digest (last 24h)\n\n*Klasa"))
 
     def test_singular_message(self):
-        got = summarize.build_digest([summarize.Section("A", "x", messages=1, words=3)], hours=24)
+        got = summarize.build_digest([summarize.Section("A", "x", messages=1)], hours=24)
+        self.assertTrue(got.startswith("📋 Digest (last 24h)\n1 message\n\n"), got)
         self.assertIn("*A* (1 message)", got)
 
 
@@ -289,20 +280,18 @@ class PolishLabelsTest(unittest.TestCase):
                          ["1 osoba", "3 osoby", "5 osób", "13 osób", "24 osoby"])
 
     def test_polish_text_digest(self):
-        sections = [summarize.Section("Klasa 1a (test)", "Wycieczka.", messages=120, words=1500),
+        sections = [summarize.Section("Klasa 1a (test)", "Wycieczka.", messages=120),
                     summarize.Section("Klasa 2b (test)", None),
-                    summarize.Section("Klasa 3c (test)", summarize.NOTHING_NOTABLE, messages=2, words=4)]
+                    summarize.Section("Klasa 3c (test)", summarize.NOTHING_NOTABLE, messages=2)]
         got = summarize.build_digest(sections, hours=24, lang="Polish")
-        self.assertTrue(got.startswith(
-            "📋 Podsumowanie (ostatnie 24 h)\n"
-            "122 wiadomości · ≈8 min czytania czatu skrócone do ≈1 min\n\n"), got)
+        self.assertTrue(got.startswith("📋 Podsumowanie (ostatnie 24 h)\n122 wiadomości\n\n"), got)
         self.assertIn("*Klasa 1a (test)* (120 wiadomości)\nWycieczka.", got)
         self.assertIn("*Klasa 2b (test)*\nBrak wiadomości.", got)
         self.assertIn("*Klasa 3c (test)* (2 wiadomości)\nNic istotnego.", got)
 
     def test_polish_html_digest(self):
         html = summarize.build_html_digest(
-            [summarize.Section("Klasa 1a (test)", None), summarize.Section("Klasa 2b (test)", "x", 1, 1)],
+            [summarize.Section("Klasa 1a (test)", None), summarize.Section("Klasa 2b (test)", "x", 1)],
             hours=24, day="23.10.2026", lang="Polish")
         self.assertIn("23.10.2026 &middot; ostatnie 24 h &middot; 2 grupy", html)
         self.assertIn("Brak wiadomości.", html)
@@ -1231,6 +1220,18 @@ class MainTest(unittest.TestCase):
             outputs.append(err.getvalue())
 
         self.assertIn("Tokens: 50 in + 10 out = 60 total", outputs[1])
+
+    def test_long_chat_shows_counts_but_no_reading_time(self):
+        db = sqlite3.connect(self.db_path)
+        add_msg(db, BIKES, "long", T0 + 120, "Celina", " ".join(["słowo"] * 1000))
+        db.commit()
+        db.close()
+
+        code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")
+
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("📋 Digest (last 2h)\n3 messages\n\n"), out)
+        self.assertIn("*Rowery* (3 messages)", out)
 
     def test_unknown_group_exits_with_error(self):
         code, _ = self.run_main("--group", "nonexistent", "--model", "dummy")

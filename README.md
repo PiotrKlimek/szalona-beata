@@ -17,8 +17,8 @@ Your WhatsApp account is linked only to your own machine. No third-party service
 
 The **bridge** links to WhatsApp as a companion device, the same mechanism as WhatsApp Web. It stores messages
 only from the groups you list. The **summarizer** turns the last 24 h of each group into topic threads and
-sends them as an HTML email. The email shows how many messages each group had and how much reading time the
-summary saves (e.g. "120 messages · ≈8 min of chat reading condensed into ≈1 min", at 200 words/minute).
+sends them as an HTML email. The email shows the total number of messages at the top and the count for each
+group next to its name.
 Before each digest the summarizer checks the bridge. If WhatsApp has logged the device out or the bridge is
 down, the email starts with a red warning instead of quietly reporting "no messages".
 
