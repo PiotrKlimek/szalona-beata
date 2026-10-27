@@ -25,6 +25,17 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages (chat_jid, ts);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages (sender_jid);
+-- Images waiting for OCR. image is the marshaled waE2E.ImageMessage (download
+-- URL and media key); a row is deleted once its text is added to the message.
+CREATE TABLE IF NOT EXISTS ocr_queue (
+	chat_jid TEXT NOT NULL,
+	id       TEXT NOT NULL,
+	ts       INTEGER NOT NULL,
+	image    BLOB NOT NULL,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	next_try INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (chat_jid, id)
+);
 `
 
 // Message is a group message as stored for the summarizer.
@@ -75,6 +86,75 @@ func (s *Store) SaveMessage(m Message) (bool, error) {
 	return n > 0, err
 }
 
+// queuedImage is an image message waiting for OCR.
+type queuedImage struct {
+	ChatJID, ID string
+	Image       []byte
+	Attempts    int
+}
+
+// QueueImage adds an image message to the OCR queue (once).
+func (s *Store) QueueImage(chatJID, id string, ts time.Time, image []byte) error {
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO ocr_queue (chat_jid, id, ts, image) VALUES (?, ?, ?, ?)`,
+		chatJID, id, ts.Unix(), image)
+	return err
+}
+
+// NextImage returns the newest queued image that is due at now: recent images
+// matter most for the next digest, and a history sync can queue hundreds.
+func (s *Store) NextImage(now time.Time) (queuedImage, bool, error) {
+	var q queuedImage
+	err := s.db.QueryRow(`SELECT chat_jid, id, image, attempts FROM ocr_queue
+		WHERE next_try <= ? ORDER BY ts DESC LIMIT 1`, now.Unix()).Scan(&q.ChatJID, &q.ID, &q.Image, &q.Attempts)
+	if err == sql.ErrNoRows {
+		return q, false, nil
+	}
+	return q, err == nil, err
+}
+
+// RetryImage postpones a queued image after a failed attempt.
+func (s *Store) RetryImage(chatJID, id string, next time.Time) error {
+	_, err := s.db.Exec(`UPDATE ocr_queue SET attempts = attempts + 1, next_try = ? WHERE chat_jid = ? AND id = ?`,
+		next.Unix(), chatJID, id)
+	return err
+}
+
+// FinishImage removes an image from the OCR queue and appends suffix (the
+// recognized text, "" if none) to its message.
+func (s *Store) FinishImage(chatJID, id, suffix string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if suffix != "" { // at most once: an image can be queued again when history re-sends it
+		if _, err := tx.Exec(`UPDATE messages SET text = text || ? WHERE chat_jid = ? AND id = ? AND instr(text, ?) = 0`,
+			suffix, chatJID, id, ocrTag); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM ocr_queue WHERE chat_jid = ? AND id = ?`, chatJID, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// HasOCRText reports whether a stored message already has recognized image text.
+func (s *Store) HasOCRText(chatJID, id string) bool {
+	var has bool
+	s.db.QueryRow(`SELECT instr(text, ?) > 0 FROM messages WHERE chat_jid = ? AND id = ?`, ocrTag, chatJID, id).Scan(&has)
+	return has
+}
+
+// ClearImageQueue empties the OCR queue (used when OCR is turned off).
+func (s *Store) ClearImageQueue() (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM ocr_queue`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ChatName returns the stored name of a group, or "" if unknown.
 func (s *Store) ChatName(jid string) string {
 	var name string
@@ -109,6 +189,9 @@ func (s *Store) PurgeDisallowed(f groupFilter) (int64, error) {
 	for _, jid := range disallowed {
 		res, err := s.db.Exec(`DELETE FROM messages WHERE chat_jid = ?`, jid)
 		if err != nil {
+			return deleted, err
+		}
+		if _, err := s.db.Exec(`DELETE FROM ocr_queue WHERE chat_jid = ?`, jid); err != nil {
 			return deleted, err
 		}
 		n, _ := res.RowsAffected()
@@ -155,8 +238,11 @@ func (s *Store) RefreshSenderNames(resolve func(senderJID string) string) (int64
 	return updated, nil
 }
 
-// PurgeOlderThan deletes messages sent before cutoff.
+// PurgeOlderThan deletes messages (and queued images) sent before cutoff.
 func (s *Store) PurgeOlderThan(cutoff time.Time) (int64, error) {
+	if _, err := s.db.Exec(`DELETE FROM ocr_queue WHERE ts < ?`, cutoff.Unix()); err != nil {
+		return 0, err
+	}
 	res, err := s.db.Exec(`DELETE FROM messages WHERE ts < ?`, cutoff.Unix())
 	if err != nil {
 		return 0, err

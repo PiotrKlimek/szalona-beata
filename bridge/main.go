@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,6 +29,7 @@ type bridge struct {
 	filter    groupFilter
 	retention time.Duration // 0 = keep messages forever
 	names     *debouncer    // refreshes stored sender names off the event path
+	ocr       *ocrWorker    // nil when OCR is off
 	log       waLog.Logger
 }
 
@@ -39,6 +41,17 @@ func envOr(key, fallback string) string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "ocr" {
+		langs := ocrLangs()
+		if langs == "" {
+			langs = "pol+eng" // OCR_LANGS=off only stops the bridge from OCR-ing incoming images
+		}
+		if err := runOCRCommand(os.Args[2:], langs); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	ctx := context.Background()
 	dataDir := envOr("DATA_DIR", "/data")
 	log := waLog.Stdout("Bridge", envOr("LOG_LEVEL", "INFO"), true)
@@ -87,6 +100,7 @@ func main() {
 		log:       log,
 	}
 	b.names = newDebouncer(5*time.Second, b.refreshNames)
+	b.ocr = b.newOCR() // before connecting: history sync images arrive right after linking
 	b.client.AddEventHandler(b.handleEvent)
 
 	if b.client.Store.ID == nil {
@@ -95,6 +109,9 @@ func main() {
 		}
 	} else if err := b.client.Connect(); err != nil {
 		fatal("Failed to connect", err)
+	}
+	if b.ocr != nil {
+		go b.ocr.run(ctx)
 	}
 
 	go func() {
@@ -109,6 +126,27 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	b.client.Disconnect()
+}
+
+// newOCR returns the OCR worker, or nil (and empties its queue) when OCR_LANGS=off.
+func (b *bridge) newOCR() *ocrWorker {
+	langs := ocrLangs()
+	if langs == "" {
+		if n, err := b.store.ClearImageQueue(); err != nil {
+			b.log.Warnf("Failed to clear the OCR queue: %v", err)
+		} else if n > 0 {
+			b.log.Infof("OCR is off: dropped %d queued images", n)
+		}
+		return nil
+	}
+	if err := checkTesseract(langs); err != nil {
+		b.log.Errorf("OCR disabled: %v", err)
+		return nil
+	}
+	download := func(ctx context.Context, img *waE2E.ImageMessage) ([]byte, error) { return b.client.Download(ctx, img) }
+	recognizeImage := func(ctx context.Context, data []byte) (ocrResult, error) { return recognize(ctx, data, langs) }
+	b.log.Infof("OCR of images enabled (%s)", langs)
+	return newOCRWorker(b.store, download, recognizeImage, b.log)
 }
 
 // purgeOldMessages deletes messages older than the retention period now and then once a day.
@@ -190,6 +228,10 @@ func (b *bridge) save(evt *events.Message, chatName string) bool {
 	isNew, err := b.store.SaveMessage(msg)
 	if err != nil {
 		b.log.Warnf("Failed to save message %s: %v", msg.ID, err)
+	}
+	// Also images stored before (e.g. by a bridge without OCR) when history sends them again after a re-link.
+	if img := evt.Message.GetImageMessage(); img != nil && b.ocr != nil && (isNew || !b.store.HasOCRText(msg.ChatJID, msg.ID)) {
+		b.ocr.Enqueue(msg.ChatJID, msg.ID, msg.Timestamp, img)
 	}
 	return isNew
 }

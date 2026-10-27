@@ -19,14 +19,17 @@ The **bridge** links to WhatsApp as a companion device, the same mechanism as Wh
 only from the groups you list. The **summarizer** turns the last 24 h of each group into topic threads and
 sends them as an HTML email. The email shows the total number of messages at the top and the count for each
 group next to its name.
+Photos count too: when a photo contains text (a timetable, a notice, a screenshot), the bridge reads it with
+OCR on your server and the summary includes it. See [Text in images](#text-in-images-ocr).
 Before each digest the summarizer checks the bridge. If WhatsApp has logged the device out or the bridge is
 down, the email starts with a red warning instead of quietly reporting "no messages".
 
 | Part | Where data goes |
 |---|---|
 | WhatsApp session keys, messages | only your server (Docker volume); messages deleted after `RETENTION_DAYS` |
+| Photos (for OCR) | downloaded by the bridge into memory, never written to disk; only the recognized text is stored, as part of the message |
 | Summaries with `--model dummy` / `ollama` | only your server |
-| Summaries with `--model openai` | the chat text of the selected groups is sent to the LLM provider (Groq by default) |
+| Summaries with `--model openai` | the chat text of the selected groups (including text read from photos) is sent to the LLM provider (Groq by default) |
 | LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
 | The email | the email provider (Resend) and your mailbox |
 
@@ -325,6 +328,49 @@ services:
       EMAIL_TO: me@example.com, partner@example.com
 ```
 
+## Text in images (OCR)
+
+The bridge downloads every photo posted in a watched group (like WhatsApp Web does) and adds the text it
+contains to the message, so the summary knows that "[image]" was the new lesson plan:
+
+```
+[image] Plan na przyszły tydzień
+[text in image]
+Poniedziałek 8:00 matematyka
+...
+```
+
+Groups often get dozens of photos a day (trips, school events), and OCR takes 1–3 seconds per photo, so a
+**fast check runs first** (pure Go, ~30 ms; up to ~200 ms when it looks again for small print). It looks for rows of
+letter-sized shapes that stand out from their background and sit side by side on a straight line. Only
+photos that pass are read with [Tesseract](https://github.com/tesseract-ocr/tesseract). Tested on 135
+photos from real class groups (October 2026): 3 in 4 photos without text were skipped, and every photo
+whose text Tesseract could read passed the check, including phone screenshots of long texts in small print.
+On very sharp photos (e.g. downscaled camera pictures from the web) the small-print pass lets more photos
+without text through: that costs OCR time, not missing text.
+Words Tesseract isn't sure about are dropped, and a photo with fewer than three real words adds nothing.
+The text of one photo is capped at 1,500 characters.
+
+- Photos are processed one at a time in the background, **newest first**. After linking, history photos
+  are worked through gradually; ones too old for WhatsApp's servers are skipped.
+- The queue is kept in the messages database (it survives restarts) and follows `RETENTION_DAYS`.
+- Photos received before OCR was enabled are read only if WhatsApp sends them again, i.e. after linking
+  again. To keep the stored messages, remove only the session instead of the whole volume:
+  `docker compose stop bridge && docker run --rm -v szalona-beata_wa-data:/data alpine sh -c 'mkdir -p /data/old-session && mv /data/session.db* /data/old-session/'`,
+  then link as in step 3. WhatsApp keeps media only for a limited time, so the oldest photos can't be downloaded any more.
+- Languages: `OCR_LANGS=pol+eng` (default). Other languages need their `tesseract-ocr-*` package added
+  to `bridge/Dockerfile`. `OCR_LANGS=off` turns OCR off.
+- Handwriting and photos taken at a steep angle are usually not readable.
+
+See what the check and OCR make of your own photos (they're only read, nothing is stored):
+
+```sh
+docker compose run --rm --no-deps -v "$PWD/photos":/photos:ro bridge bridge ocr /photos
+#   /photos/plan.jpg: text (141 letters in rows), 812ms
+#     Poniedziałek 8:00 matematyka
+#   /photos/trip.jpg: no text (4 letters in rows), 31ms
+```
+
 ## Local models (Ollama)
 
 `--model ollama` keeps everything on your server. Ollama starts only on demand (profile `llm`) and unloads the
@@ -367,6 +413,7 @@ To get history for a new group, unlink and link again (step 3).
 | Which name is shown for a sender | The name from your address book if you have one, otherwise the name they set in WhatsApp (the newest one). Stored messages are renamed when the name changes, so one person appears under one name, also in older messages. |
 | Red "bridge is logged out" warning in the email, `Logged out` in bridge logs | Device removed on the phone or phone offline for ~14 days: remove the `wa-data` volume and link again (step 3). |
 | Red "bridge is not responding" warning | The bridge container is down: `docker compose up -d bridge`, then check `docker compose logs bridge`. |
+| A photo's text missing from the summary | `docker compose logs bridge | grep -i ocr`. The text is added a few seconds after the photo arrives (later during a big history sync). Check the photo with `bridge ocr` (see [Text in images](#text-in-images-ocr)); "no text" means the fast check skipped it. |
 | No history after linking | `WATCH_GROUPS` was empty or wrong at link time; history comes only once. Unlink and relink (step 3). |
 | Groq `403 Forbidden`, `error code: 1010` | Cloudflare blocks the default Python User-Agent. Fixed in the code; if you fork the HTTP client, keep a custom `User-Agent`. |
 | "Long chat: … left out of the summary" (PL: "Długa rozmowa: w podsumowaniu pominięto najstarsze – …") under a group | That day's chat exceeded `MAX_TRANSCRIPT_CHARS`, so the oldest messages weren't sent to the model. Raise the limit if your model's context and rate limits allow it. |
@@ -380,6 +427,8 @@ To get history for a new group, unlink and link again (step 3).
 - The `wa-data` volume holds the **WhatsApp session keys**. Anyone with that file can read your WhatsApp as a
   linked device. Anyone with root or `docker` group access on the host can reach it. Revoke access anytime by
   deleting *szalona-beata* under **Linked devices** on the phone.
+- Until a photo is OCR'd, its download link and media key wait in the `ocr_queue` table of the messages
+  database (same volume as the session keys). The row is deleted once the photo is processed.
 - The bridge's HTTP API (`/send`, `/health`) has no published ports and is reachable only inside the Compose network.
 - **Retention:** with `RETENTION_DAYS` set, the bridge deletes older messages at start and then daily, and doesn't
   store expired messages that arrive again (e.g. history after a re-link). The summarizer deletes older LLM call log
@@ -400,6 +449,7 @@ docker volume rm szalona-beata_wa-data
 | Variable | Default | Purpose |
 |---|---|---|
 | `WATCH_GROUPS` | (empty: store nothing) | Groups whose messages the bridge stores (JIDs or exact names, comma-separated) |
+| `OCR_LANGS` | `pol+eng` | Tesseract languages for text in photos; `off` disables OCR |
 | `PAIR_PHONE` | | Link with a pairing code instead of QR (pass once on the command line) |
 | `RETENTION_DAYS` | `0` (keep forever) | Delete messages and LLM call log entries older than N days, max 36500 (`.env.example`: 720) |
 | `SUMMARY_MODEL` | `dummy` | `dummy`, `ollama` or `openai` |
@@ -435,7 +485,8 @@ Next steps:
 ## Development
 
 ```
-bridge/        Go: whatsmeow wiring (main.go) + tested logic (text, convert, filter, names, store, http)
+bridge/        Go: whatsmeow wiring (main.go) + tested logic (text, convert, filter, names, store, http,
+               textdetect: fast "has text?" check, ocr: Tesseract, ocrworker: OCR queue)
 summarizer/    Python stdlib only: summarize.py, sample_data.py, test_summarize.py
 test.sh        runs both test suites in Docker (no local toolchains needed)
 ```
@@ -466,4 +517,5 @@ Dependencies keep their own licenses:
   distributes only source code (the images are built locally by `docker compose`), and MIT is GPL-compatible.
 - The other Go dependencies are MIT, BSD-3-Clause, Apache-2.0 or ISC (e.g. go-sqlite3 and qrterminal: MIT,
   Go protobuf and golang.org/x: BSD-3-Clause).
+- The bridge image includes [Tesseract](https://github.com/tesseract-ocr/tesseract) (Apache-2.0) from Debian.
 - The summarizer uses only the Python standard library.
