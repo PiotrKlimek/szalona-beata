@@ -22,14 +22,21 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import NamedTuple
 
+# The bridge appends text read from a photo (OCR) after this tag; see bridge/ocr.go.
+OCR_NOTE = (
+    "Text after '[text in image]' was read from a photo by OCR: treat it as part of that message "
+    "(e.g. a timetable or a notice someone photographed) and ignore garbled fragments."
+)
+
 SYSTEM_PROMPT = (
     "You summarize WhatsApp group chats. Write a short summary in {language}: "
     "the main topics, decisions, dates and open questions, as 3-6 bullet points. "
-    "Do not invent anything that is not in the chat."
+    "Do not invent anything that is not in the chat. " + OCR_NOTE
 )
 
 
 # Media without a caption, e.g. "[image]" - noise for a language model.
+# Images with text recognized by the bridge are not bare: "[image]\n[text in image]\n...".
 BARE_PLACEHOLDER = re.compile(r"^\[[a-z ]+\]$")
 
 
@@ -43,6 +50,7 @@ THREADS_PROMPT = (
     "Write unanswered questions as questions, never as decisions or facts, "
     "always prefixed exactly like this: '{question}: ...'. "
     "Skip greetings and thanks-only chatter. Do not invent anything that is not in the chat. "
+    + OCR_NOTE + " "
     "Write titles and points in {language}. Respond with JSON only: "
     '{{"threads": [{{"title": "...", "points": ["...", "..."]}}]}}'
 )

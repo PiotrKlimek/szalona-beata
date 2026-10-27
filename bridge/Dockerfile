@@ -7,7 +7,7 @@ RUN go test ./... && CGO_ENABLED=1 go build -o /out/bridge .
 
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates tzdata \
+ && apt-get install -y --no-install-recommends ca-certificates tzdata tesseract-ocr tesseract-ocr-pol \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/bridge /usr/local/bin/bridge
 VOLUME /data

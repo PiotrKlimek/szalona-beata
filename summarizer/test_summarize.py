@@ -135,6 +135,18 @@ class FormatTranscriptPlaceholderTest(unittest.TestCase):
         got = summarize.format_transcript(msgs, max_chars=10_000, tz=timezone.utc)
         self.assertEqual(got, "[10:01] Ania: [image] Plan lekcji\n[10:04] Celina: Dzięki!")
 
+    def test_keeps_image_with_recognized_text(self):
+        msgs = [summarize.Msg(T0, "Ania", "[image]\n[text in image]\nZebranie wtorek 18:00")]
+        got = summarize.format_transcript(msgs, max_chars=10_000, tz=timezone.utc)
+        self.assertEqual(got, "[10:00] Ania: [image]\n[text in image]\nZebranie wtorek 18:00")
+
+
+class PromptOCRNoteTest(unittest.TestCase):
+    def test_prompts_explain_recognized_text(self):
+        for prompt in (summarize.SYSTEM_PROMPT, summarize.THREADS_PROMPT):
+            text = prompt.format(language="Polish", question="Pytanie")
+            self.assertIn("'[text in image]'", text)
+
 
 class TranscriptOmittedCountTest(unittest.TestCase):
     MSGS = [

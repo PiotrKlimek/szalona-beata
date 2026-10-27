@@ -35,7 +35,7 @@ CHATS = [
         (1248, "Kasia Nowak", "[sticker]"),
         (980, "Piotr Lis", "Czy ktoś wie, co było zadane z matematyki? Zuzia zapomniała zapisać."),
         (972, "Agnieszka Bąk", "Ćwiczenia str. 34, zadania 1-3."),
-        (970, "Agnieszka Bąk", "[image]"),
+        (970, "Agnieszka Bąk", "[image]\n[text in image]\nMatematyka - praca domowa\nĆwiczenia str. 34, zad. 1-3\nNa piątek: tabliczka mnożenia do 50"),
         (965, "Piotr Lis", "Super, dziękuję 🙏"),
         (640, "Marta Zielińska", "Ważne: zebranie z rodzicami przesunięte z wtorku na środę 12.11 o 17:30, sala 14."),
         (631, "Tomasz Wrona", "Czy będzie można dołączyć online?"),
