@@ -23,8 +23,9 @@ from email.message import EmailMessage
 from typing import NamedTuple
 
 # The bridge appends text read from a photo (OCR) after this tag; see bridge/ocr.go.
+OCR_TAG = "[text in image]"
 OCR_NOTE = (
-    "Text after '[text in image]' was read from a photo by OCR: treat it as part of that message "
+    f"Text after '{OCR_TAG}' was read from a photo by OCR: treat it as part of that message "
     "(e.g. a timetable or a notice someone photographed) and ignore garbled fragments."
 )
 
@@ -71,6 +72,7 @@ class Section(NamedTuple):
     summary: object  # str, [Thread] or None
     messages: int = 0
     omitted: int = 0  # messages left out of a too-long transcript
+    ocr_images: int = 0  # photos whose recognized text the model was given
 
 
 # Email/digest labels by SUMMARY_LANGUAGE; plural forms are (one, few, many).
@@ -83,6 +85,8 @@ LABELS = {
         "stats": "{messages} from {people} between {first} and {last}. Most active: {ranking}.",
         "model_unavailable": "model unavailable, showing statistics: {error}",
         "truncated": "⚠️ Long chat: {count} (the oldest) left out of the summary.",
+        "ocr": "📷 Includes text read from {count} (OCR, may contain recognition errors).",
+        "photo": ("photo", "photos", "photos"),
         "footer": "Generated locally by szalona-beata from your WhatsApp groups.",
         "bridge": {
             "logged_out": "⚠️ The WhatsApp bridge is logged out: new messages are not collected. "
@@ -100,6 +104,8 @@ LABELS = {
         "stats": "{messages} ({people}), {first}–{last}. Najaktywniejsi: {ranking}.",
         "model_unavailable": "model niedostępny, pokazuję statystyki: {error}",
         "truncated": "⚠️ Długa rozmowa: w podsumowaniu pominięto najstarsze – {count}.",
+        "ocr": "📷 Uwzględniono tekst odczytany ze zdjęć (OCR, możliwe błędy odczytu): {count}.",
+        "photo": ("zdjęcie", "zdjęcia", "zdjęć"),
         "footer": "Wygenerowane lokalnie przez szalona-beata z Twoich grup WhatsApp.",
         "bridge": {
             "logged_out": "⚠️ Mostek WhatsApp jest wylogowany: nowe wiadomości nie są zbierane. "
@@ -226,6 +232,23 @@ def _truncated_note(section, lang):
     return L["truncated"].format(count=plural(section.omitted, L["message"], lang))
 
 
+def _ocr_note(section, lang):
+    L = labels(lang)
+    return L["ocr"].format(count=plural(section.ocr_images, L["photo"], lang))
+
+
+def _section_notes(section, lang):
+    """Notes under a group's name: truncated chat, text read from photos."""
+    return ([_truncated_note(section, lang)] if section.omitted else []) + \
+        ([_ocr_note(section, lang)] if section.ocr_images else [])
+
+
+def ocr_images_sent(msgs, omitted):
+    """Photos with recognized text among the messages build_transcript kept."""
+    sent = [m for m in msgs if not BARE_PLACEHOLDER.match(m.text)][omitted:]
+    return sum(OCR_TAG in m.text for m in sent)
+
+
 def build_digest(sections, hours, title=None, lang="English", warning=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
@@ -235,7 +258,7 @@ def build_digest(sections, hours, title=None, lang="English", warning=None):
     parts = [header] + ([warning] if warning else [])
     for s in sections:
         count = f" ({plural(s.messages, L['message'], lang)})" if s.messages else ""
-        note = f"{_truncated_note(s, lang)}\n" if s.omitted else ""
+        note = "".join(f"{n}\n" for n in _section_notes(s, lang))
         parts.append(f"*{s.name}*{count}\n{note}{_summary_text(s.summary, lang)}")
     return "\n\n".join(parts)
 
@@ -326,7 +349,7 @@ def render_summary_html(summary, lang="English"):
 
 
 def _card_meta_html(section, lang):
-    """Message count and, for truncated chats, the left-out note under a group's name."""
+    """Message count and the notes (left-out messages, text from photos) under a group's name."""
     html = ""
     if section.messages:
         count = plural(section.messages, labels(lang)["message"], lang)
@@ -334,6 +357,9 @@ def _card_meta_html(section, lang):
     if section.omitted:
         note = htmllib.escape(_truncated_note(section, lang))
         html += f'<div style="font-size:13px;color:#8a5a00;margin:0 0 8px">{note}</div>'
+    if section.ocr_images:
+        note = htmllib.escape(_ocr_note(section, lang))
+        html += f'<div style="font-size:13px;color:#7a8783;margin:0 0 8px">{note}</div>'
     return html
 
 
@@ -693,13 +719,14 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
     sections = []
     for jid, name in groups:
         msgs = fetch_messages(db, jid, since)
-        omitted = 0
+        omitted = ocr = 0
         if not msgs:
             summary = None
         elif llm:
             transcript, omitted = build_transcript(msgs, args.max_chars, tz)
             try:
                 summary = llm.summarize(transcript, args.language)
+                ocr = ocr_images_sent(msgs, omitted)
             except (RuntimeError, OSError) as e:  # API error, timeout, network
                 print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
                 omitted = 0  # the fallback statistics cover every message
@@ -712,7 +739,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                     print(f"warning: could not log the LLM call: {e}", file=sys.stderr, flush=True)
         else:
             summary = dummy_summary(msgs, tz, lang)
-        sections.append(Section(name, summary, len(msgs), omitted))
+        sections.append(Section(name, summary, len(msgs), omitted, ocr))
 
     common = {"title": args.email_title, "lang": lang, "warning": warning}
     digest = build_digest(sections, args.hours, **common)

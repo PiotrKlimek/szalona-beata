@@ -205,6 +205,37 @@ class TruncationNoticeTest(unittest.TestCase):
         self.assertIn("pominięto najstarsze – 1 wiadomość.", got)
 
 
+class OCRNoticeTest(unittest.TestCase):
+    SECTIONS = [summarize.Section("Klasa 1a (test)", "Wycieczka.", messages=12, ocr_images=3),
+                summarize.Section("Klasa 2b (test)", "Zebranie.", messages=5)]
+
+    def test_text_digest_notes_photos_read_by_ocr(self):
+        got = summarize.build_digest(self.SECTIONS, hours=24, lang="Polish")
+        self.assertIn("*Klasa 1a (test)* (12 wiadomości)\n"
+                      "📷 Uwzględniono tekst odczytany ze zdjęć (OCR, możliwe błędy odczytu): 3 zdjęcia.\n"
+                      "Wycieczka.", got)
+        self.assertIn("*Klasa 2b (test)* (5 wiadomości)\nZebranie.", got)  # no note
+
+    def test_english_singular_and_both_notes(self):
+        got = summarize.build_digest([summarize.Section("A", "x", messages=9, omitted=2, ocr_images=1)], hours=24)
+        self.assertIn("*A* (9 messages)\n⚠️ Long chat: 2 messages (the oldest) left out of the summary.\n"
+                      "📷 Includes text read from 1 photo (OCR, may contain recognition errors).\nx", got)
+
+    def test_html_notice(self):
+        html = summarize.build_html_digest(self.SECTIONS, hours=24, day="23.10.2026", lang="Polish")
+        self.assertEqual(html.count("📷"), 1)
+        self.assertLess(html.index("Klasa 1a (test)"), html.index("3 zdjęcia"))
+        self.assertLess(html.index("3 zdjęcia"), html.index("Wycieczka."))
+
+    def test_counts_only_photos_sent_to_the_model(self):
+        msgs = [summarize.Msg(T0, "Ania", "[image]\n[text in image]\nstary plan"),
+                summarize.Msg(T0 + 60, "Ania", "[image]"),  # never sent
+                summarize.Msg(T0 + 120, "Bartek", "Dzięki"),
+                summarize.Msg(T0 + 180, "Celina", "[image] Plan\n[text in image]\nnowy plan")]
+        self.assertEqual(summarize.ocr_images_sent(msgs, omitted=0), 2)
+        self.assertEqual(summarize.ocr_images_sent(msgs, omitted=1), 1)  # the oldest was left out
+
+
 class DummySummaryTest(unittest.TestCase):
     def test_range_spanning_days_includes_dates(self):
         msgs = [
@@ -1209,7 +1240,8 @@ class MainTest(unittest.TestCase):
             code = summarize.main(["--db", sample, "--group", "Klasa 2c", "--model", "openai"], now=T0)
 
         self.assertEqual(code, 0)
-        self.assertIn("*Klasa 2c (test)* (16 messages)\nWycieczka 6.11.", out.getvalue())
+        self.assertIn("*Klasa 2c (test)* (16 messages)\n📷 Includes text read from 1 photo (OCR, may contain "
+                      "recognition errors).\nWycieczka 6.11.", out.getvalue())  # sample_data has one OCR'd photo
         self.assertNotIn("Tokens", out.getvalue())  # usage goes to stderr, not into the digest
         self.assertIn("Marta Zielińska: Dzień dobry!", srv.requests[0][2]["messages"][1]["content"])
         log = os.path.join(os.path.dirname(sample), "llm_log.db")
@@ -1355,6 +1387,23 @@ class MainTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("⚠️ Long chat: 1 message (the oldest) left out of the summary.", out)
+
+    def test_photos_read_by_ocr_are_noted_only_when_the_model_saw_them(self):
+        import os
+        from unittest import mock
+
+        db = sqlite3.connect(self.db_path)
+        add_msg(db, BIKES, "c", T0 + 120, "Celina", "[image]\n[text in image]\nSobota 9:00 parking")
+        db.commit()
+        db.close()
+        srv = self.llm_server()
+        env = {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": "off"}
+        with mock.patch.dict(os.environ, env):
+            _, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+        self.assertIn("*Rowery* (3 messages)\n📷 Includes text read from 1 photo", out)
+
+        _, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")  # statistics only
+        self.assertNotIn("📷", out)
 
     def test_no_truncation_note_when_model_failed_and_stats_are_shown(self):
         import os

@@ -351,6 +351,9 @@ without text through: that costs OCR time, not missing text.
 Words Tesseract isn't sure about are dropped, and a photo with fewer than three real words adds nothing.
 The text of one photo is capped at 1,500 characters.
 
+- When a summary used text from photos, the email says so under the group's name ("📷 Uwzględniono tekst
+  odczytany ze zdjęć (OCR, możliwe błędy odczytu): 3 zdjęcia."), so readers know some details come from OCR.
+  Photos in the part of a long chat that was left out, and statistics-only summaries, don't count.
 - Photos are processed one at a time in the background, **newest first**. After linking, history photos
   are worked through gradually; ones too old for WhatsApp's servers are skipped.
 - The queue is kept in the messages database (it survives restarts) and follows `RETENTION_DAYS`.
