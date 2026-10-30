@@ -146,6 +146,7 @@ class PromptOCRNoteTest(unittest.TestCase):
         for prompt in (summarize.SYSTEM_PROMPT, summarize.THREADS_PROMPT):
             text = prompt.format(language="Polish", question="Pytanie")
             self.assertIn("'[text in image]'", text)
+            self.assertIn("'[voice transcript]'", text)
 
 
 class TranscriptOmittedCountTest(unittest.TestCase):
@@ -232,8 +233,52 @@ class OCRNoticeTest(unittest.TestCase):
                 summarize.Msg(T0 + 60, "Ania", "[image]"),  # never sent
                 summarize.Msg(T0 + 120, "Bartek", "Dzięki"),
                 summarize.Msg(T0 + 180, "Celina", "[image] Plan\n[text in image]\nnowy plan")]
-        self.assertEqual(summarize.ocr_images_sent(msgs, omitted=0), 2)
-        self.assertEqual(summarize.ocr_images_sent(msgs, omitted=1), 1)  # the oldest was left out
+        self.assertEqual(summarize.tagged_sent(msgs, omitted=0, tag=summarize.OCR_TAG), 2)
+        self.assertEqual(summarize.tagged_sent(msgs, omitted=1, tag=summarize.OCR_TAG), 1)  # the oldest was left out
+
+
+class VoiceNoticeTest(unittest.TestCase):
+    SECTIONS = [summarize.Section("Klasa 1a (test)", "Wycieczka.", messages=12, voice_notes=2),
+                summarize.Section("Klasa 2b (test)", "Zebranie.", messages=5)]
+
+    def test_text_digest_notes_transcribed_voice_messages(self):
+        got = summarize.build_digest(self.SECTIONS, hours=24, lang="Polish")
+        self.assertIn("*Klasa 1a (test)* (12 wiadomości)\n"
+                      "🎤 Uwzględniono treść wiadomości głosowych (automatyczna transkrypcja, możliwe błędy): "
+                      "2 wiadomości głosowe.\nWycieczka.", got)
+        self.assertIn("*Klasa 2b (test)* (5 wiadomości)\nZebranie.", got)  # no note
+
+    def test_polish_plural_forms(self):
+        for n, form in ((1, "1 wiadomość głosowa"), (5, "5 wiadomości głosowych")):
+            got = summarize.build_digest([summarize.Section("A", "x", messages=9, voice_notes=n)], hours=24,
+                                         lang="Polish")
+            self.assertIn(f"możliwe błędy): {form}.", got)
+
+    def test_english_and_all_notes_in_order(self):
+        got = summarize.build_digest(
+            [summarize.Section("A", "x", messages=9, omitted=2, ocr_images=1, voice_notes=1)], hours=24)
+        self.assertIn("*A* (9 messages)\n⚠️ Long chat: 2 messages (the oldest) left out of the summary.\n"
+                      "📷 Includes text read from 1 photo (OCR, may contain recognition errors).\n"
+                      "🎤 Includes 1 voice message (automatic transcript, may contain errors).\nx", got)
+
+    def test_html_notice(self):
+        html = summarize.build_html_digest(self.SECTIONS, hours=24, day="23.10.2026", lang="Polish")
+        self.assertEqual(html.count("🎤"), 1)
+        self.assertLess(html.index("Klasa 1a (test)"), html.index("2 wiadomości głosowe"))
+        self.assertLess(html.index("2 wiadomości głosowe"), html.index("Wycieczka."))
+
+    def test_counts_only_voice_messages_sent_to_the_model(self):
+        msgs = [summarize.Msg(T0, "Ania", "[voice note]\n[voice transcript]\nJutro zbiórka o ósmej"),
+                summarize.Msg(T0 + 60, "Ania", "[voice note]"),  # not transcribed: never sent
+                summarize.Msg(T0 + 120, "Bartek", "[image]\n[text in image]\nplan"),
+                summarize.Msg(T0 + 180, "Celina", "[voice note]\n[voice transcript]\nDobrze, będę")]
+        self.assertEqual(summarize.tagged_sent(msgs, omitted=0, tag=summarize.VOICE_TAG), 2)
+        self.assertEqual(summarize.tagged_sent(msgs, omitted=1, tag=summarize.VOICE_TAG), 1)
+
+    def test_transcribed_voice_message_is_sent_to_the_model(self):
+        msgs = [summarize.Msg(T0, "Ania", "[voice note]\n[voice transcript]\nZbiórka o ósmej")]
+        got = summarize.format_transcript(msgs, max_chars=10_000, tz=timezone.utc)
+        self.assertEqual(got, "[10:00] Ania: [voice note]\n[voice transcript]\nZbiórka o ósmej")
 
 
 class DummySummaryTest(unittest.TestCase):
@@ -1404,6 +1449,23 @@ class MainTest(unittest.TestCase):
 
         _, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")  # statistics only
         self.assertNotIn("📷", out)
+
+    def test_voice_messages_are_noted_only_when_the_model_saw_them(self):
+        import os
+        from unittest import mock
+
+        db = sqlite3.connect(self.db_path)
+        add_msg(db, BIKES, "c", T0 + 120, "Celina", "[voice note]\n[voice transcript]\nBędę o dziewiątej")
+        db.commit()
+        db.close()
+        srv = self.llm_server()
+        env = {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": "off"}
+        with mock.patch.dict(os.environ, env):
+            _, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+        self.assertIn("*Rowery* (3 messages)\n🎤 Includes 1 voice message", out)
+
+        _, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "dummy")  # statistics only
+        self.assertNotIn("🎤", out)
 
     def test_no_truncation_note_when_model_failed_and_stats_are_shown(self):
         import os

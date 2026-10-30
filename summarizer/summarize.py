@@ -28,16 +28,23 @@ OCR_NOTE = (
     f"Text after '{OCR_TAG}' was read from a photo by OCR: treat it as part of that message "
     "(e.g. a timetable or a notice someone photographed) and ignore garbled fragments."
 )
+# The bridge appends the transcript of a voice message after this tag; see bridge/voice.go.
+VOICE_TAG = "[voice transcript]"
+VOICE_NOTE = (
+    f"Text after '{VOICE_TAG}' is an automatic transcript of a voice message: treat it as what "
+    "the sender said and ignore misheard fragments."
+)
 
 SYSTEM_PROMPT = (
     "You summarize WhatsApp group chats. Write a short summary in {language}: "
     "the main topics, decisions, dates and open questions, as 3-6 bullet points. "
-    "Do not invent anything that is not in the chat. " + OCR_NOTE
+    "Do not invent anything that is not in the chat. " + OCR_NOTE + " " + VOICE_NOTE
 )
 
 
 # Media without a caption, e.g. "[image]" - noise for a language model.
-# Images with text recognized by the bridge are not bare: "[image]\n[text in image]\n...".
+# Images with text recognized by the bridge are not bare: "[image]\n[text in image]\n...",
+# nor are transcribed voice messages: "[voice note]\n[voice transcript]\n...".
 BARE_PLACEHOLDER = re.compile(r"^\[[a-z ]+\]$")
 
 
@@ -51,7 +58,7 @@ THREADS_PROMPT = (
     "Write unanswered questions as questions, never as decisions or facts, "
     "always prefixed exactly like this: '{question}: ...'. "
     "Skip greetings and thanks-only chatter. Do not invent anything that is not in the chat. "
-    + OCR_NOTE + " "
+    + OCR_NOTE + " " + VOICE_NOTE + " "
     "Write titles and points in {language}. Respond with JSON only: "
     '{{"threads": [{{"title": "...", "points": ["...", "..."]}}]}}'
 )
@@ -73,6 +80,7 @@ class Section(NamedTuple):
     messages: int = 0
     omitted: int = 0  # messages left out of a too-long transcript
     ocr_images: int = 0  # photos whose recognized text the model was given
+    voice_notes: int = 0  # voice messages whose transcript the model was given
 
 
 # Email/digest labels by SUMMARY_LANGUAGE; plural forms are (one, few, many).
@@ -87,6 +95,8 @@ LABELS = {
         "truncated": "⚠️ Long chat: {count} (the oldest) left out of the summary.",
         "ocr": "📷 Includes text read from {count} (OCR, may contain recognition errors).",
         "photo": ("photo", "photos", "photos"),
+        "voice": "🎤 Includes {count} (automatic transcript, may contain errors).",
+        "voice_note": ("voice message", "voice messages", "voice messages"),
         "footer": "Generated locally by szalona-beata from your WhatsApp groups.",
         "bridge": {
             "logged_out": "⚠️ The WhatsApp bridge is logged out: new messages are not collected. "
@@ -106,6 +116,8 @@ LABELS = {
         "truncated": "⚠️ Długa rozmowa: w podsumowaniu pominięto najstarsze – {count}.",
         "ocr": "📷 Uwzględniono tekst odczytany ze zdjęć (OCR, możliwe błędy odczytu): {count}.",
         "photo": ("zdjęcie", "zdjęcia", "zdjęć"),
+        "voice": "🎤 Uwzględniono treść wiadomości głosowych (automatyczna transkrypcja, możliwe błędy): {count}.",
+        "voice_note": ("wiadomość głosowa", "wiadomości głosowe", "wiadomości głosowych"),
         "footer": "Wygenerowane lokalnie przez szalona-beata z Twoich grup WhatsApp.",
         "bridge": {
             "logged_out": "⚠️ Mostek WhatsApp jest wylogowany: nowe wiadomości nie są zbierane. "
@@ -237,16 +249,22 @@ def _ocr_note(section, lang):
     return L["ocr"].format(count=plural(section.ocr_images, L["photo"], lang))
 
 
+def _voice_note(section, lang):
+    L = labels(lang)
+    return L["voice"].format(count=plural(section.voice_notes, L["voice_note"], lang))
+
+
 def _section_notes(section, lang):
-    """Notes under a group's name: truncated chat, text read from photos."""
+    """Notes under a group's name: truncated chat, text read from photos, transcribed voice messages."""
     return ([_truncated_note(section, lang)] if section.omitted else []) + \
-        ([_ocr_note(section, lang)] if section.ocr_images else [])
+        ([_ocr_note(section, lang)] if section.ocr_images else []) + \
+        ([_voice_note(section, lang)] if section.voice_notes else [])
 
 
-def ocr_images_sent(msgs, omitted):
-    """Photos with recognized text among the messages build_transcript kept."""
+def tagged_sent(msgs, omitted, tag):
+    """Messages with text added by the bridge (tag: OCR_TAG, VOICE_TAG) among those build_transcript kept."""
     sent = [m for m in msgs if not BARE_PLACEHOLDER.match(m.text)][omitted:]
-    return sum(OCR_TAG in m.text for m in sent)
+    return sum(tag in m.text for m in sent)
 
 
 def build_digest(sections, hours, title=None, lang="English", warning=None):
@@ -349,7 +367,7 @@ def render_summary_html(summary, lang="English"):
 
 
 def _card_meta_html(section, lang):
-    """Message count and the notes (left-out messages, text from photos) under a group's name."""
+    """Message count and the notes (left-out messages, text from photos, voice messages) under a group's name."""
     html = ""
     if section.messages:
         count = plural(section.messages, labels(lang)["message"], lang)
@@ -359,6 +377,9 @@ def _card_meta_html(section, lang):
         html += f'<div style="font-size:13px;color:#8a5a00;margin:0 0 8px">{note}</div>'
     if section.ocr_images:
         note = htmllib.escape(_ocr_note(section, lang))
+        html += f'<div style="font-size:13px;color:#7a8783;margin:0 0 8px">{note}</div>'
+    if section.voice_notes:
+        note = htmllib.escape(_voice_note(section, lang))
         html += f'<div style="font-size:13px;color:#7a8783;margin:0 0 8px">{note}</div>'
     return html
 
@@ -719,14 +740,15 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
     sections = []
     for jid, name in groups:
         msgs = fetch_messages(db, jid, since)
-        omitted = ocr = 0
+        omitted = ocr = voice = 0
         if not msgs:
             summary = None
         elif llm:
             transcript, omitted = build_transcript(msgs, args.max_chars, tz)
             try:
                 summary = llm.summarize(transcript, args.language)
-                ocr = ocr_images_sent(msgs, omitted)
+                ocr = tagged_sent(msgs, omitted, OCR_TAG)
+                voice = tagged_sent(msgs, omitted, VOICE_TAG)
             except (RuntimeError, OSError) as e:  # API error, timeout, network
                 print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
                 omitted = 0  # the fallback statistics cover every message
@@ -739,7 +761,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                     print(f"warning: could not log the LLM call: {e}", file=sys.stderr, flush=True)
         else:
             summary = dummy_summary(msgs, tz, lang)
-        sections.append(Section(name, summary, len(msgs), omitted, ocr))
+        sections.append(Section(name, summary, len(msgs), omitted, ocr, voice))
 
     common = {"title": args.email_title, "lang": lang, "warning": warning}
     digest = build_digest(sections, args.hours, **common)

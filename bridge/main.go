@@ -29,7 +29,8 @@ type bridge struct {
 	filter    groupFilter
 	retention time.Duration // 0 = keep messages forever
 	names     *debouncer    // refreshes stored sender names off the event path
-	ocr       *ocrWorker    // nil when OCR is off
+	ocr       *mediaWorker  // nil when OCR is off
+	voice     *mediaWorker  // nil when voice transcription is off
 	log       waLog.Logger
 }
 
@@ -47,6 +48,13 @@ func main() {
 			langs = "pol+eng" // OCR_LANGS=off only stops the bridge from OCR-ing incoming images
 		}
 		if err := runOCRCommand(os.Args[2:], langs); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "transcribe" {
+		if err := runTranscribeCommand(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -100,7 +108,8 @@ func main() {
 		log:       log,
 	}
 	b.names = newDebouncer(5*time.Second, b.refreshNames)
-	b.ocr = b.newOCR() // before connecting: history sync images arrive right after linking
+	b.ocr = b.newOCR() // before connecting: history sync media arrives right after linking
+	b.voice = b.newVoice()
 	b.client.AddEventHandler(b.handleEvent)
 
 	if b.client.Store.ID == nil {
@@ -110,8 +119,10 @@ func main() {
 	} else if err := b.client.Connect(); err != nil {
 		fatal("Failed to connect", err)
 	}
-	if b.ocr != nil {
-		go b.ocr.run(ctx)
+	for _, w := range []*mediaWorker{b.ocr, b.voice} {
+		if w != nil {
+			go w.run(ctx)
+		}
 	}
 
 	go func() {
@@ -129,24 +140,47 @@ func main() {
 }
 
 // newOCR returns the OCR worker, or nil (and empties its queue) when OCR_LANGS=off.
-func (b *bridge) newOCR() *ocrWorker {
+func (b *bridge) newOCR() *mediaWorker {
 	langs := ocrLangs()
 	if langs == "" {
-		if n, err := b.store.ClearImageQueue(); err != nil {
-			b.log.Warnf("Failed to clear the OCR queue: %v", err)
-		} else if n > 0 {
-			b.log.Infof("OCR is off: dropped %d queued images", n)
-		}
+		b.clearQueue(imageQueue, "OCR is off")
 		return nil
 	}
 	if err := checkTesseract(langs); err != nil {
 		b.log.Errorf("OCR disabled: %v", err)
 		return nil
 	}
-	download := func(ctx context.Context, img *waE2E.ImageMessage) ([]byte, error) { return b.client.Download(ctx, img) }
-	recognizeImage := func(ctx context.Context, data []byte) (ocrResult, error) { return recognize(ctx, data, langs) }
 	b.log.Infof("OCR of images enabled (%s)", langs)
-	return newOCRWorker(b.store, download, recognizeImage, b.log)
+	newImage := func() mediaMessage { return &waE2E.ImageMessage{} }
+	return newMediaWorker(b.store, imageQueue, "image", newImage, b.download, ocrText(langs, b.log), b.log)
+}
+
+// newVoice returns the voice transcription worker, or nil (and empties its
+// queue) when TRANSCRIBE_VOICE is off or can't work.
+func (b *bridge) newVoice() *mediaWorker {
+	t, err := voiceTranscriber()
+	if err != nil {
+		b.log.Errorf("Voice transcription disabled: %v", err)
+	}
+	if t == nil {
+		b.clearQueue(voiceQueue, "Voice transcription is off")
+		return nil
+	}
+	b.log.Infof("Transcription of voice messages enabled (%s at %s)", t.model, t.baseURL)
+	newAudio := func() mediaMessage { return &waE2E.AudioMessage{} }
+	return newMediaWorker(b.store, voiceQueue, "voice message", newAudio, b.download, t.transcribe, b.log)
+}
+
+func (b *bridge) download(ctx context.Context, media mediaMessage) ([]byte, error) {
+	return b.client.Download(ctx, media)
+}
+
+func (b *bridge) clearQueue(q mediaQueue, why string) {
+	if n, err := b.store.ClearQueue(q); err != nil {
+		b.log.Warnf("Failed to clear %s: %v", q.table, err)
+	} else if n > 0 {
+		b.log.Infof("%s: dropped %d queued messages", why, n)
+	}
 }
 
 // purgeOldMessages deletes messages older than the retention period now and then once a day.
@@ -229,9 +263,15 @@ func (b *bridge) save(evt *events.Message, chatName string) bool {
 	if err != nil {
 		b.log.Warnf("Failed to save message %s: %v", msg.ID, err)
 	}
-	// Also images stored before (e.g. by a bridge without OCR) when history sends them again after a re-link.
-	if img := evt.Message.GetImageMessage(); img != nil && b.ocr != nil && (isNew || !b.store.HasOCRText(msg.ChatJID, msg.ID)) {
+	if img := evt.Message.GetImageMessage(); img != nil && b.ocr != nil {
 		b.ocr.Enqueue(msg.ChatJID, msg.ID, msg.Timestamp, img)
+	}
+	if audio := evt.Message.GetAudioMessage(); audio != nil && b.voice != nil {
+		if audio.GetSeconds() > voiceMaxSeconds {
+			b.log.Infof("Not transcribing voice message %s: %d s is too long", msg.ID, audio.GetSeconds())
+		} else {
+			b.voice.Enqueue(msg.ChatJID, msg.ID, msg.Timestamp, audio)
+		}
 	}
 	return isNew
 }

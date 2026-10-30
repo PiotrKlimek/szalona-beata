@@ -21,6 +21,8 @@ sends them as an HTML email. The email shows the total number of messages at the
 group next to its name.
 Photos count too: when a photo contains text (a timetable, a notice, a screenshot), the bridge reads it with
 OCR on your server and the summary includes it. See [Text in images](#text-in-images-ocr).
+Voice messages can count too: with `TRANSCRIBE_VOICE=on` the bridge has them transcribed (Groq's Whisper by
+default) and the summary includes what was said. See [Voice messages](#voice-messages).
 Before each digest the summarizer checks the bridge. If WhatsApp has logged the device out or the bridge is
 down, the email starts with a red warning instead of quietly reporting "no messages".
 
@@ -28,8 +30,9 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 |---|---|
 | WhatsApp session keys, messages | only your server (Docker volume); messages deleted after `RETENTION_DAYS` |
 | Photos (for OCR) | downloaded by the bridge into memory, never written to disk; only the recognized text is stored, as part of the message |
+| Voice messages (only with `TRANSCRIBE_VOICE=on`) | downloaded by the bridge into memory and **sent to the LLM provider** (Groq by default) for a transcript; only the transcript is stored, as part of the message |
 | Summaries with `--model dummy` / `ollama` | only your server |
-| Summaries with `--model openai` | the chat text of the selected groups (including text read from photos) is sent to the LLM provider (Groq by default) |
+| Summaries with `--model openai` | the chat text of the selected groups (including text read from photos and voice message transcripts) is sent to the LLM provider (Groq by default) |
 | LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
 | The email | the email provider (Resend) and your mailbox |
 
@@ -374,6 +377,43 @@ docker compose run --rm --no-deps -v "$PWD/photos":/photos:ro bridge bridge ocr 
 #   /photos/trip.jpg: no text (4 letters in rows), 31ms
 ```
 
+## Voice messages
+
+Off by default, because the recordings themselves leave your server: with `TRANSCRIBE_VOICE=on` (in `.env`,
+then `docker compose up -d bridge`) the bridge downloads every voice message posted in a watched group,
+sends the audio to the LLM provider's speech-to-text API (Groq's `whisper-large-v3-turbo` with the same
+`LLM_API_KEY`, see [section 5](#5-optional-better-summaries-with-groq)) and adds the transcript to the message:
+
+```
+[voice note]
+[voice transcript]
+Przypominam, że jutro wycieczka do Krakowa. Zbiórka o 8 rano pod szkołą.
+```
+
+Think about this before turning it on: the recordings are other people's voices, and unlike chat text they
+go to the provider **as soon as they arrive**, even when the digest runs with `--model dummy`.
+
+- When a summary used transcripts, the email says so under the group's name ("🎤 Uwzględniono treść wiadomości
+  głosowych (automatyczna transkrypcja, możliwe błędy): 2 wiadomości głosowe."). As with photos, voice
+  messages in the left-out part of a long chat and statistics-only summaries don't count.
+- Voice messages are processed one at a time in the background, newest first, in a queue kept in the
+  messages database (`voice_queue`, follows `RETENTION_DAYS`). Rate limits and network errors are retried
+  (after 5 and 10 minutes), then the message stays "[voice note]" in the summary.
+- Recordings longer than 15 minutes are skipped; a transcript is capped at 3,000 characters. Groq's free plan
+  allows 2 hours of audio per hour and 8 per day; a typical voice message takes under a second.
+- `TRANSCRIBE_LANGUAGE=pl` tells Whisper the language (empty: detected per recording, usually right for
+  Polish). `TRANSCRIBE_MODEL` picks another model, `LLM_BASE_URL` another OpenAI-compatible API.
+- Voice messages received before transcription was enabled are transcribed only if WhatsApp sends them again
+  (after linking again, see [Text in images](#text-in-images-ocr)).
+
+Check a recording (it is sent to the API, nothing is stored):
+
+```sh
+docker compose run --rm --no-deps -v "$PWD/audio":/audio:ro bridge bridge transcribe /audio/voice.ogg
+#   /audio/voice.ogg: 312ms
+#     Przypominam, że jutro wycieczka do Krakowa. ...
+```
+
 ## Local models (Ollama)
 
 `--model ollama` keeps everything on your server. Ollama starts only on demand (profile `llm`) and unloads the
@@ -417,6 +457,7 @@ To get history for a new group, unlink and link again (step 3).
 | Red "bridge is logged out" warning in the email, `Logged out` in bridge logs | Device removed on the phone or phone offline for ~14 days: remove the `wa-data` volume and link again (step 3). |
 | Red "bridge is not responding" warning | The bridge container is down: `docker compose up -d bridge`, then check `docker compose logs bridge`. |
 | A photo's text missing from the summary | `docker compose logs bridge | grep -i ocr`. The text is added a few seconds after the photo arrives (later during a big history sync). Check the photo with `bridge ocr` (see [Text in images](#text-in-images-ocr)); "no text" means the fast check skipped it. |
+| A voice message missing from the summary | `docker compose logs bridge | grep -i voice`. Is `TRANSCRIBE_VOICE=on` set and the bridge log saying "Transcription of voice messages enabled"? Without `LLM_API_KEY` it logs "Voice transcription disabled". Check a recording with `bridge transcribe` (see [Voice messages](#voice-messages)). |
 | No history after linking | `WATCH_GROUPS` was empty or wrong at link time; history comes only once. Unlink and relink (step 3). |
 | Groq `403 Forbidden`, `error code: 1010` | Cloudflare blocks the default Python User-Agent. Fixed in the code; if you fork the HTTP client, keep a custom `User-Agent`. |
 | "Long chat: … left out of the summary" (PL: "Długa rozmowa: w podsumowaniu pominięto najstarsze – …") under a group | That day's chat exceeded `MAX_TRANSCRIPT_CHARS`, so the oldest messages weren't sent to the model. Raise the limit if your model's context and rate limits allow it. |
@@ -430,8 +471,9 @@ To get history for a new group, unlink and link again (step 3).
 - The `wa-data` volume holds the **WhatsApp session keys**. Anyone with that file can read your WhatsApp as a
   linked device. Anyone with root or `docker` group access on the host can reach it. Revoke access anytime by
   deleting *szalona-beata* under **Linked devices** on the phone.
-- Until a photo is OCR'd, its download link and media key wait in the `ocr_queue` table of the messages
-  database (same volume as the session keys). The row is deleted once the photo is processed.
+- Until a photo is OCR'd (a voice message transcribed), its download link and media key wait in the `ocr_queue`
+  (`voice_queue`) table of the messages database (same volume as the session keys). The row is deleted once
+  it is processed.
 - The bridge's HTTP API (`/send`, `/health`) has no published ports and is reachable only inside the Compose network.
 - **Retention:** with `RETENTION_DAYS` set, the bridge deletes older messages at start and then daily, and doesn't
   store expired messages that arrive again (e.g. history after a re-link). The summarizer deletes older LLM call log
@@ -453,6 +495,8 @@ docker volume rm szalona-beata_wa-data
 |---|---|---|
 | `WATCH_GROUPS` | (empty: store nothing) | Groups whose messages the bridge stores (JIDs or exact names, comma-separated) |
 | `OCR_LANGS` | `pol+eng` | Tesseract languages for text in photos; `off` disables OCR |
+| `TRANSCRIBE_VOICE` | `off` | `on`: send voice messages to the LLM API (`LLM_API_KEY`, `LLM_BASE_URL`) for transcripts |
+| `TRANSCRIBE_MODEL`, `TRANSCRIBE_LANGUAGE` | `whisper-large-v3-turbo`, (detect) | Speech-to-text model and ISO 639-1 language (e.g. `pl`) |
 | `PAIR_PHONE` | | Link with a pairing code instead of QR (pass once on the command line) |
 | `RETENTION_DAYS` | `0` (keep forever) | Delete messages and LLM call log entries older than N days, max 36500 (`.env.example`: 720) |
 | `SUMMARY_MODEL` | `dummy` | `dummy`, `ollama` or `openai` |
@@ -462,7 +506,7 @@ docker volume rm szalona-beata_wa-data
 | `EMAIL_SUBJECT`, `EMAIL_TITLE` | `WhatsApp digest {date}: {groups}`, `WhatsApp digest` | Subject template and email heading |
 | `SMTP_PASSWORD` | | Resend API key (or your SMTP password) |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_SECURITY` | `smtp.resend.com`, `465`, `resend`, `ssl` | SMTP server |
-| `LLM_API_KEY` | | Groq (or other OpenAI-compatible) API key |
+| `LLM_API_KEY` | | Groq (or other OpenAI-compatible) API key; the bridge uses it only with `TRANSCRIBE_VOICE=on` |
 | `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
 | `MAX_TRANSCRIPT_CHARS` | `12000` | Max chat length sent to the model per group; on busier days the oldest messages are left out and the email says so under the group |
@@ -489,7 +533,8 @@ Next steps:
 
 ```
 bridge/        Go: whatsmeow wiring (main.go) + tested logic (text, convert, filter, names, store, http,
-               textdetect: fast "has text?" check, ocr: Tesseract, ocrworker: OCR queue)
+               textdetect: fast "has text?" check, ocr: Tesseract, voice: transcription API,
+               mediaworker: queue of photos to OCR and voice messages to transcribe)
 summarizer/    Python stdlib only: summarize.py, sample_data.py, test_summarize.py
 test.sh        runs both test suites in Docker (no local toolchains needed)
 ```

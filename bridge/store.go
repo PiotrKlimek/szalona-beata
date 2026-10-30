@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -36,7 +37,30 @@ CREATE TABLE IF NOT EXISTS ocr_queue (
 	next_try INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (chat_jid, id)
 );
+-- Voice messages waiting for transcription, like ocr_queue (audio is the
+-- marshaled waE2E.AudioMessage).
+CREATE TABLE IF NOT EXISTS voice_queue (
+	chat_jid TEXT NOT NULL,
+	id       TEXT NOT NULL,
+	ts       INTEGER NOT NULL,
+	audio    BLOB NOT NULL,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	next_try INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (chat_jid, id)
+);
 `
+
+// mediaQueue is a queue of media messages whose text (recognized in an image,
+// transcribed from a voice message) gets appended to the message after tag.
+type mediaQueue struct {
+	table, media, tag string // media: the column holding the marshaled media message
+}
+
+var (
+	imageQueue  = mediaQueue{"ocr_queue", "image", ocrTag}
+	voiceQueue  = mediaQueue{"voice_queue", "audio", voiceTag}
+	mediaQueues = []mediaQueue{imageQueue, voiceQueue}
+)
 
 // Message is a group message as stored for the summarizer.
 type Message struct {
@@ -86,69 +110,69 @@ func (s *Store) SaveMessage(m Message) (bool, error) {
 	return n > 0, err
 }
 
-// queuedImage is an image message waiting for OCR.
-type queuedImage struct {
+// queuedMedia is a media message waiting in a mediaQueue.
+type queuedMedia struct {
 	ChatJID, ID string
-	Image       []byte
+	Media       []byte
 	Attempts    int
 }
 
-// QueueImage adds an image message to the OCR queue (once).
-func (s *Store) QueueImage(chatJID, id string, ts time.Time, image []byte) error {
-	_, err := s.db.Exec(`INSERT OR IGNORE INTO ocr_queue (chat_jid, id, ts, image) VALUES (?, ?, ?, ?)`,
-		chatJID, id, ts.Unix(), image)
+// Queue adds a media message to a queue (once).
+func (s *Store) Queue(q mediaQueue, chatJID, id string, ts time.Time, media []byte) error {
+	_, err := s.db.Exec(fmt.Sprintf(`INSERT OR IGNORE INTO %s (chat_jid, id, ts, %s) VALUES (?, ?, ?, ?)`, q.table, q.media),
+		chatJID, id, ts.Unix(), media)
 	return err
 }
 
-// NextImage returns the newest queued image that is due at now: recent images
-// matter most for the next digest, and a history sync can queue hundreds.
-func (s *Store) NextImage(now time.Time) (queuedImage, bool, error) {
-	var q queuedImage
-	err := s.db.QueryRow(`SELECT chat_jid, id, image, attempts FROM ocr_queue
-		WHERE next_try <= ? ORDER BY ts DESC LIMIT 1`, now.Unix()).Scan(&q.ChatJID, &q.ID, &q.Image, &q.Attempts)
+// Next returns the newest queued media message that is due at now: recent
+// messages matter most for the next digest, and a history sync can queue hundreds.
+func (s *Store) Next(q mediaQueue, now time.Time) (queuedMedia, bool, error) {
+	var m queuedMedia
+	err := s.db.QueryRow(fmt.Sprintf(`SELECT chat_jid, id, %s, attempts FROM %s
+		WHERE next_try <= ? ORDER BY ts DESC LIMIT 1`, q.media, q.table), now.Unix()).Scan(&m.ChatJID, &m.ID, &m.Media, &m.Attempts)
 	if err == sql.ErrNoRows {
-		return q, false, nil
+		return m, false, nil
 	}
-	return q, err == nil, err
+	return m, err == nil, err
 }
 
-// RetryImage postpones a queued image after a failed attempt.
-func (s *Store) RetryImage(chatJID, id string, next time.Time) error {
-	_, err := s.db.Exec(`UPDATE ocr_queue SET attempts = attempts + 1, next_try = ? WHERE chat_jid = ? AND id = ?`,
+// Retry postpones a queued media message after a failed attempt.
+func (s *Store) Retry(q mediaQueue, chatJID, id string, next time.Time) error {
+	_, err := s.db.Exec(fmt.Sprintf(`UPDATE %s SET attempts = attempts + 1, next_try = ? WHERE chat_jid = ? AND id = ?`, q.table),
 		next.Unix(), chatJID, id)
 	return err
 }
 
-// FinishImage removes an image from the OCR queue and appends suffix (the
-// recognized text, "" if none) to its message.
-func (s *Store) FinishImage(chatJID, id, suffix string) error {
+// Finish removes a media message from its queue and appends suffix (the text
+// found in it, "" if none) to the message.
+func (s *Store) Finish(q mediaQueue, chatJID, id, suffix string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if suffix != "" { // at most once: an image can be queued again when history re-sends it
+	if suffix != "" { // at most once: a message can be queued again when history re-sends it
 		if _, err := tx.Exec(`UPDATE messages SET text = text || ? WHERE chat_jid = ? AND id = ? AND instr(text, ?) = 0`,
-			suffix, chatJID, id, ocrTag); err != nil {
+			suffix, chatJID, id, q.tag); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM ocr_queue WHERE chat_jid = ? AND id = ?`, chatJID, id); err != nil {
+	if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE chat_jid = ? AND id = ?`, q.table), chatJID, id); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// HasOCRText reports whether a stored message already has recognized image text.
-func (s *Store) HasOCRText(chatJID, id string) bool {
+// HasText reports whether a stored message already has the text of its media (q's tag).
+func (s *Store) HasText(q mediaQueue, chatJID, id string) bool {
 	var has bool
-	s.db.QueryRow(`SELECT instr(text, ?) > 0 FROM messages WHERE chat_jid = ? AND id = ?`, ocrTag, chatJID, id).Scan(&has)
+	s.db.QueryRow(`SELECT instr(text, ?) > 0 FROM messages WHERE chat_jid = ? AND id = ?`, q.tag, chatJID, id).Scan(&has)
 	return has
 }
 
-// ClearImageQueue empties the OCR queue (used when OCR is turned off).
-func (s *Store) ClearImageQueue() (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM ocr_queue`)
+// ClearQueue empties a queue (used when OCR or transcription is turned off).
+func (s *Store) ClearQueue(q mediaQueue) (int64, error) {
+	res, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s`, q.table))
 	if err != nil {
 		return 0, err
 	}
@@ -191,8 +215,10 @@ func (s *Store) PurgeDisallowed(f groupFilter) (int64, error) {
 		if err != nil {
 			return deleted, err
 		}
-		if _, err := s.db.Exec(`DELETE FROM ocr_queue WHERE chat_jid = ?`, jid); err != nil {
-			return deleted, err
+		for _, q := range mediaQueues {
+			if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE chat_jid = ?`, q.table), jid); err != nil {
+				return deleted, err
+			}
 		}
 		n, _ := res.RowsAffected()
 		deleted += n
@@ -238,10 +264,12 @@ func (s *Store) RefreshSenderNames(resolve func(senderJID string) string) (int64
 	return updated, nil
 }
 
-// PurgeOlderThan deletes messages (and queued images) sent before cutoff.
+// PurgeOlderThan deletes messages (and queued media) sent before cutoff.
 func (s *Store) PurgeOlderThan(cutoff time.Time) (int64, error) {
-	if _, err := s.db.Exec(`DELETE FROM ocr_queue WHERE ts < ?`, cutoff.Unix()); err != nil {
-		return 0, err
+	for _, q := range mediaQueues {
+		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE ts < ?`, q.table), cutoff.Unix()); err != nil {
+			return 0, err
+		}
 	}
 	res, err := s.db.Exec(`DELETE FROM messages WHERE ts < ?`, cutoff.Unix())
 	if err != nil {
