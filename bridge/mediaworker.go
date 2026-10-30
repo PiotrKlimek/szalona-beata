@@ -16,8 +16,18 @@ const (
 	mediaIdlePoll    = time.Minute     // how often an idle worker looks for retries that became due
 )
 
-// errTemporary marks extract errors worth retrying later (rate limits, network).
+// errTemporary marks extract errors that are not about the media (rate limits,
+// network, a revoked API key): the worker pauses instead of giving up on it.
 var errTemporary = errors.New("temporary failure")
+
+// temporaryError is an errTemporary with how long to wait, e.g. from Retry-After (0: mediaRetryDelay).
+type temporaryError struct {
+	msg        string
+	retryAfter time.Duration
+}
+
+func (e *temporaryError) Error() string { return e.msg }
+func (e *temporaryError) Unwrap() error { return errTemporary }
 
 // mediaMessage is a WhatsApp media message (image, audio) that can be queued and downloaded.
 type mediaMessage interface {
@@ -38,6 +48,7 @@ type mediaWorker struct {
 	wake     chan struct{}
 	log      waLog.Logger
 	now      func() time.Time
+	paused   time.Time // after a temporary extract error nothing is processed until then
 }
 
 func newMediaWorker(store *Store, queue mediaQueue, kind string, newMedia func() mediaMessage,
@@ -84,6 +95,9 @@ func (w *mediaWorker) run(ctx context.Context) {
 
 // processNext handles the next due media message and reports whether there was one.
 func (w *mediaWorker) processNext(ctx context.Context) bool {
+	if w.now().Before(w.paused) {
+		return false
+	}
 	q, ok, err := w.store.Next(w.queue, w.now())
 	if err != nil {
 		w.log.Warnf("Failed to read the %s queue: %v", w.kind, err)
@@ -107,13 +121,22 @@ func (w *mediaWorker) processNext(ctx context.Context) bool {
 	text, err := w.extract(ctx, data)
 	switch {
 	case errors.Is(err, errTemporary):
-		return w.retry(q, err.Error())
+		// Not this message's fault, and it would hit the next one too: pause the
+		// whole queue without using up the message's attempts.
+		delay := mediaRetryDelay
+		var te *temporaryError
+		if errors.As(err, &te) && te.retryAfter > 0 {
+			delay = te.retryAfter
+		}
+		w.paused = w.now().Add(delay)
+		w.log.Warnf("Pausing %s processing for %s: %v", w.kind, delay, err)
+		return false
 	case err != nil:
 		return w.finish(q, "", err.Error())
 	case text == "":
-		w.log.Debugf("%s %s: no text, took %s", w.kind, q.ID, w.now().Sub(start).Round(time.Millisecond))
+		w.log.Debugf("Read %s %s in %s: no text", w.kind, q.ID, w.now().Sub(start).Round(time.Millisecond))
 	default:
-		w.log.Infof("%s %s: took %s, %d characters of text", w.kind, q.ID, w.now().Sub(start).Round(time.Millisecond), len([]rune(text)))
+		w.log.Infof("Read %s %s in %s: %d characters of text", w.kind, q.ID, w.now().Sub(start).Round(time.Millisecond), len([]rune(text)))
 	}
 	return w.finish(q, textSuffix(w.queue.tag, text), "")
 }
@@ -123,10 +146,12 @@ func (w *mediaWorker) retry(q queuedMedia, failure string) bool {
 	if q.Attempts+1 >= mediaMaxAttempts {
 		return w.finish(q, "", failure)
 	}
-	if err := w.store.Retry(w.queue, q.ChatJID, q.ID, w.now().Add(mediaRetryDelay<<q.Attempts)); err != nil {
+	delay := mediaRetryDelay << q.Attempts
+	if err := w.store.Retry(w.queue, q.ChatJID, q.ID, w.now().Add(delay)); err != nil {
 		w.log.Warnf("Failed to postpone %s %s: %v", w.kind, q.ID, err)
 		return false
 	}
+	w.log.Infof("Retrying %s %s in %s: %s", w.kind, q.ID, delay, failure)
 	return true
 }
 

@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -25,7 +26,8 @@ const (
 )
 
 // transcriber turns voice messages into text with an OpenAI-compatible
-// /audio/transcriptions API (Groq by default, the same account as the summaries).
+// /audio/transcriptions API (Groq by default, the same account as the summaries
+// unless TRANSCRIBE_BASE_URL / TRANSCRIBE_API_KEY say otherwise).
 type transcriber struct {
 	baseURL, apiKey, model, language string
 	client                           *http.Client
@@ -45,12 +47,12 @@ func voiceTranscriber() (*transcriber, error) {
 }
 
 func newTranscriber() (*transcriber, error) {
-	key := os.Getenv("LLM_API_KEY")
+	key := envOr("TRANSCRIBE_API_KEY", os.Getenv("LLM_API_KEY"))
 	if key == "" {
-		return nil, errors.New("LLM_API_KEY is not set")
+		return nil, errors.New("LLM_API_KEY (or TRANSCRIBE_API_KEY) is not set")
 	}
 	return &transcriber{
-		baseURL:  strings.TrimRight(envOr("LLM_BASE_URL", defaultLLMBaseURL), "/"),
+		baseURL:  strings.TrimRight(envOr("TRANSCRIBE_BASE_URL", envOr("LLM_BASE_URL", defaultLLMBaseURL)), "/"),
 		apiKey:   key,
 		model:    envOr("TRANSCRIBE_MODEL", defaultTranscribeModel),
 		language: strings.TrimSpace(os.Getenv("TRANSCRIBE_LANGUAGE")),
@@ -58,8 +60,18 @@ func newTranscriber() (*transcriber, error) {
 	}, nil
 }
 
+// isVoiceNote reports whether an audio message should be transcribed: recorded
+// voice messages only (not forwarded audio files such as music), up to voiceMaxSeconds.
+func isVoiceNote(audio interface {
+	GetPTT() bool
+	GetSeconds() uint32
+}) bool {
+	return audio.GetPTT() && audio.GetSeconds() <= voiceMaxSeconds
+}
+
 // transcribe returns the text spoken in a recording, "" if nothing was said.
-// Rate limits, server and network errors wrap errTemporary.
+// Errors that would hit every recording (rate limits, a rejected API key,
+// server and network errors) wrap errTemporary.
 func (t *transcriber) transcribe(ctx context.Context, audio []byte) (string, error) {
 	var body bytes.Buffer
 	form := multipart.NewWriter(&body)
@@ -67,13 +79,17 @@ func (t *transcriber) transcribe(ctx context.Context, audio []byte) (string, err
 	if err != nil {
 		return "", err
 	}
-	file.Write(audio)
+	if _, err := file.Write(audio); err != nil {
+		return "", err
+	}
 	fields := map[string]string{"model": t.model, "response_format": "json", "temperature": "0"}
 	if t.language != "" {
 		fields["language"] = t.language
 	}
 	for k, v := range fields {
-		form.WriteField(k, v)
+		if err := form.WriteField(k, v); err != nil {
+			return "", err
+		}
 	}
 	if err := form.Close(); err != nil {
 		return "", err
@@ -84,19 +100,25 @@ func (t *transcriber) transcribe(ctx context.Context, audio []byte) (string, err
 	}
 	req.Header.Set("Authorization", "Bearer "+t.apiKey)
 	req.Header.Set("Content-Type", form.FormDataContentType())
+	req.Header.Set("User-Agent", "szalona-beata/0.1") // like the summarizer: Groq's Cloudflare blocks some default agents
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("%w: transcription request: %v", errTemporary, err)
+		return "", &temporaryError{msg: "transcription request: " + err.Error()}
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("transcription API: %s: %s", resp.Status, strings.TrimSpace(string(data)))
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			err = fmt.Errorf("%w: %v", errTemporary, err)
+		msg := fmt.Sprintf("transcription API: %s: %s", resp.Status, truncateRunes(strings.TrimSpace(string(data)), 200))
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout:
+		default:
+			if resp.StatusCode < 500 {
+				return "", errors.New(msg) // about this recording, e.g. 400 unsupported format, 413 too large
+			}
 		}
-		return "", err
+		secs, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
+		return "", &temporaryError{msg: msg, retryAfter: time.Duration(secs) * time.Second}
 	}
 	var out struct {
 		Text string `json:"text"`

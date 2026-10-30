@@ -267,10 +267,10 @@ func (b *bridge) save(evt *events.Message, chatName string) bool {
 		b.ocr.Enqueue(msg.ChatJID, msg.ID, msg.Timestamp, img)
 	}
 	if audio := evt.Message.GetAudioMessage(); audio != nil && b.voice != nil {
-		if audio.GetSeconds() > voiceMaxSeconds {
-			b.log.Infof("Not transcribing voice message %s: %d s is too long", msg.ID, audio.GetSeconds())
-		} else {
+		if isVoiceNote(audio) {
 			b.voice.Enqueue(msg.ChatJID, msg.ID, msg.Timestamp, audio)
+		} else {
+			b.log.Debugf("Not transcribing audio %s (voice note: %v, %d s)", msg.ID, audio.GetPTT(), audio.GetSeconds())
 		}
 	}
 	return isNew

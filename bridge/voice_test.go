@@ -8,6 +8,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"google.golang.org/protobuf/proto"
 )
 
 // fakeTranscriptionAPI answers /audio/transcriptions with status and body, recording the request.
@@ -50,7 +54,8 @@ func TestTranscribeSendsAudioAndReturnsText(t *testing.T) {
 	if err != nil || got != "Jutro zbiórka o ósmej." {
 		t.Errorf("transcribe() = %q, %v", got, err)
 	}
-	if req.URL.Path != "/audio/transcriptions" || req.Header.Get("Authorization") != "Bearer gsk_test" {
+	if req.URL.Path != "/audio/transcriptions" || req.Header.Get("Authorization") != "Bearer gsk_test" ||
+		req.Header.Get("User-Agent") != "szalona-beata/0.1" {
 		t.Errorf("request %s %s, auth %q", req.Method, req.URL.Path, req.Header.Get("Authorization"))
 	}
 	want := map[string]string{"file": "audio.ogg:OggS voice", "model": defaultTranscribeModel, "language": "pl",
@@ -76,7 +81,7 @@ func TestTranscribeErrors(t *testing.T) {
 	for _, tc := range []struct {
 		status    int
 		temporary bool
-	}{{429, true}, {503, true}, {400, false}, {401, false}, {413, false}} {
+	}{{429, true}, {503, true}, {401, true}, {403, true}, {408, true}, {400, false}, {404, false}, {413, false}} {
 		tr, _, _ := fakeTranscriptionAPI(t, tc.status, `{"error": {"message": "nope"}}`)
 
 		_, err := tr.transcribe(context.Background(), []byte("OggS"))
@@ -86,6 +91,53 @@ func TestTranscribeErrors(t *testing.T) {
 		}
 		if errors.Is(err, errTemporary) != tc.temporary {
 			t.Errorf("%d: temporary = %v; want %v", tc.status, !tc.temporary, tc.temporary)
+		}
+	}
+}
+
+func TestTranscribeHonorsRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(429)
+		io.WriteString(w, strings.Repeat("x", 5000))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("LLM_API_KEY", "k")
+	t.Setenv("LLM_BASE_URL", srv.URL)
+	tr, _ := newTranscriber()
+
+	_, err := tr.transcribe(context.Background(), []byte("OggS"))
+
+	var te *temporaryError
+	if !errors.As(err, &te) || te.retryAfter != 42*time.Second {
+		t.Errorf("err = %v; want temporary with Retry-After 42s", err)
+	}
+	if len(err.Error()) > 300 {
+		t.Errorf("error is %d bytes long; want the response body truncated", len(err.Error()))
+	}
+}
+
+func TestTranscriberOwnEndpointAndKey(t *testing.T) {
+	t.Setenv("LLM_API_KEY", "llm")
+	t.Setenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+	t.Setenv("TRANSCRIBE_API_KEY", "stt")
+	t.Setenv("TRANSCRIBE_BASE_URL", "https://api.groq.com/openai/v1/")
+	tr, _ := newTranscriber()
+
+	if tr.apiKey != "stt" || tr.baseURL != "https://api.groq.com/openai/v1" {
+		t.Errorf("transcriber = %+v", tr)
+	}
+}
+
+func TestIsVoiceNote(t *testing.T) {
+	for _, tc := range []struct {
+		ptt     bool
+		seconds uint32
+		want    bool
+	}{{true, 12, true}, {true, voiceMaxSeconds, true}, {true, voiceMaxSeconds + 1, false}, {false, 12, false}} {
+		audio := &waE2E.AudioMessage{PTT: proto.Bool(tc.ptt), Seconds: proto.Uint32(tc.seconds)}
+		if got := isVoiceNote(audio); got != tc.want {
+			t.Errorf("isVoiceNote(ptt %v, %d s) = %v; want %v", tc.ptt, tc.seconds, got, tc.want)
 		}
 	}
 }
@@ -128,6 +180,7 @@ func TestVoiceTranscriberDefaultsToGroq(t *testing.T) {
 	t.Setenv("LLM_BASE_URL", "")
 	t.Setenv("TRANSCRIBE_MODEL", "")
 	t.Setenv("TRANSCRIBE_LANGUAGE", "")
+	t.Setenv("TRANSCRIBE_BASE_URL", "")
 	tr, _ := voiceTranscriber()
 
 	if tr.baseURL != "https://api.groq.com/openai/v1" || tr.model != "whisper-large-v3-turbo" || tr.language != "" {

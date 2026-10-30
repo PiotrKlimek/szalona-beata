@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,23 +111,51 @@ func TestOCRWorkerLeavesMessageAloneWithoutText(t *testing.T) {
 	}
 }
 
-func TestWorkerRetriesTemporaryExtractErrors(t *testing.T) {
-	f := &fakeOCR{extractErr: fmt.Errorf("%w: 429 Too Many Requests", errTemporary)}
+func TestWorkerPausesOnTemporaryExtractErrors(t *testing.T) {
+	f := &fakeOCR{extractErr: &temporaryError{msg: "429 Too Many Requests", retryAfter: 30 * time.Second}}
 	w, s := newTestWorker(t, f)
+	newer := imageMessage
+	newer.ID, newer.Timestamp = "IMG2", newer.Timestamp.Add(time.Hour)
+	s.SaveMessage(newer)
+	w.Enqueue(newer.ChatJID, newer.ID, newer.Timestamp, &waE2E.ImageMessage{Caption: proto.String("newer")})
+	now := time.Unix(1761300000, 0)
+	w.now = func() time.Time { return now }
+
+	// A rate limit that lasts longer than all attempts: nothing may be dropped,
+	// and the paused worker must not hit the API for the other queued image.
+	for range mediaMaxAttempts + 2 {
+		if w.processNext(context.Background()) {
+			t.Fatal("processNext() = true after a rate limit; want a pause")
+		}
+		if w.processNext(context.Background()) {
+			t.Fatal("processed an image while paused")
+		}
+		now = now.Add(30 * time.Second)
+	}
+	if n := queueLen(s); n != 2 || len(f.recognized) != mediaMaxAttempts+2 {
+		t.Fatalf("queue = %d, API calls = %d; want 2, %d", n, len(f.recognized), mediaMaxAttempts+2)
+	}
+
+	f.extractErr, f.text = nil, "Zbiórka o 8"
+	w.processNext(context.Background())
+	w.processNext(context.Background())
+
+	for _, id := range []string{"IMG1", "IMG2"} {
+		if got := messageText(t, s, id); !strings.HasSuffix(got, "\n[text in image]\nZbiórka o 8") {
+			t.Errorf("%s: message text = %q", id, got)
+		}
+	}
+}
+
+func TestWorkerPauseDefaultsToRetryDelay(t *testing.T) {
+	w, _ := newTestWorker(t, &fakeOCR{extractErr: fmt.Errorf("%w: network down", errTemporary)})
 	now := time.Unix(1761300000, 0)
 	w.now = func() time.Time { return now }
 
 	w.processNext(context.Background())
-	if n := queueLen(s); n != 1 {
-		t.Fatalf("queue has %d entries after a rate limit; want 1 (retry later)", n)
-	}
 
-	f.extractErr, f.text = nil, "Zbiórka o 8"
-	now = now.Add(mediaRetryDelay)
-	w.processNext(context.Background())
-
-	if got := messageText(t, s, "IMG1"); got != "[image] Plan lekcji\n[text in image]\nZbiórka o 8" {
-		t.Errorf("message text = %q", got)
+	if want := now.Add(mediaRetryDelay); !w.paused.Equal(want) {
+		t.Errorf("paused until %v; want %v", w.paused, want)
 	}
 }
 
