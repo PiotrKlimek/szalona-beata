@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 const (
@@ -125,12 +127,15 @@ func truncateRunes(s string, n int) string {
 	return s
 }
 
-// ocrSuffix is what gets appended to an image message's text for recognized text.
-func ocrSuffix(ocr string) string {
-	if ocr == "" {
-		return ""
+// ocrText returns the mediaWorker extract function for images: the text OCR finds in them.
+func ocrText(langs string, log waLog.Logger) func(context.Context, []byte) (string, error) {
+	return func(ctx context.Context, data []byte) (string, error) {
+		res, err := recognize(ctx, data, langs)
+		if err == nil && res.Skipped {
+			log.Debugf("Image without text by the fast check (%d letters in rows)", res.Chars)
+		}
+		return res.Text, err
 	}
-	return "\n" + ocrTag + "\n" + ocr
 }
 
 // runOCRCommand implements "bridge ocr FILE|DIR...": shows what the fast check

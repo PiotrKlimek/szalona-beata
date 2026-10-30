@@ -247,46 +247,65 @@ func TestPurgeOlderThanDeletesOnlyOldMessages(t *testing.T) {
 	}
 }
 
-func TestImageQueueFollowsMessageRetention(t *testing.T) {
-	s := newTestStore(t)
-	s.QueueImage("120363000000000001@g.us", "OLD", time.Unix(1000, 0), []byte("a"))
-	s.QueueImage("120363000000000001@g.us", "NEW", time.Unix(3000, 0), []byte("b"))
-	s.QueueImage("120363000000000003@g.us", "GONE", time.Unix(3000, 0), []byte("c"))
-	s.SaveMessage(Message{ChatJID: "120363000000000003@g.us", ID: "GONE", Timestamp: time.Unix(3000, 0), Text: "[image]"})
+func TestMediaQueuesFollowMessageRetention(t *testing.T) {
+	for _, q := range mediaQueues {
+		s := newTestStore(t)
+		s.Queue(q, "120363000000000001@g.us", "OLD", time.Unix(1000, 0), []byte("a"))
+		s.Queue(q, "120363000000000001@g.us", "NEW", time.Unix(3000, 0), []byte("b"))
+		s.Queue(q, "120363000000000003@g.us", "GONE", time.Unix(3000, 0), []byte("c"))
+		s.SaveMessage(Message{ChatJID: "120363000000000003@g.us", ID: "GONE", Timestamp: time.Unix(3000, 0), Text: "[image]"})
 
-	if _, err := s.PurgeOlderThan(time.Unix(2000, 0)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.PurgeDisallowed(parseGroupFilter("120363000000000001@g.us")); err != nil {
-		t.Fatal(err)
-	}
+		if _, err := s.PurgeOlderThan(time.Unix(2000, 0)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.PurgeDisallowed(parseGroupFilter("120363000000000001@g.us")); err != nil {
+			t.Fatal(err)
+		}
 
-	var ids []string
-	rows, _ := s.db.Query(`SELECT id FROM ocr_queue`)
-	for rows.Next() {
-		var id string
-		rows.Scan(&id)
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if len(ids) != 1 || ids[0] != "NEW" {
-		t.Errorf("queued images left = %v; want [NEW]", ids)
+		var ids []string
+		rows, _ := s.db.Query(`SELECT id FROM ` + q.table)
+		for rows.Next() {
+			var id string
+			rows.Scan(&id)
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if len(ids) != 1 || ids[0] != "NEW" {
+			t.Errorf("%s: queued media left = %v; want [NEW]", q.table, ids)
+		}
 	}
 }
 
-func TestQueueImageIgnoresDuplicates(t *testing.T) {
-	s := newTestStore(t)
-	s.QueueImage("120363000000000001@g.us", "IMG", time.Unix(1000, 0), []byte("a"))
-	s.RetryImage("120363000000000001@g.us", "IMG", time.Unix(5000, 0))
+func TestQueueIgnoresDuplicates(t *testing.T) {
+	for _, q := range mediaQueues {
+		s := newTestStore(t)
+		s.Queue(q, "120363000000000001@g.us", "IMG", time.Unix(1000, 0), []byte("a"))
+		s.Retry(q, "120363000000000001@g.us", "IMG", time.Unix(5000, 0))
 
-	// The same image arrives again via history sync: it must not reset the retry state.
-	if err := s.QueueImage("120363000000000001@g.us", "IMG", time.Unix(1000, 0), []byte("a")); err != nil {
-		t.Fatal(err)
+		// The same message arrives again via history sync: it must not reset the retry state.
+		if err := s.Queue(q, "120363000000000001@g.us", "IMG", time.Unix(1000, 0), []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+
+		var n, attempts int
+		s.db.QueryRow(`SELECT COUNT(*), MAX(attempts) FROM `+q.table).Scan(&n, &attempts)
+		if n != 1 || attempts != 1 {
+			t.Errorf("%s: queue rows = %d, attempts = %d; want 1, 1", q.table, n, attempts)
+		}
 	}
+}
 
-	var n, attempts int
-	s.db.QueryRow(`SELECT COUNT(*), MAX(attempts) FROM ocr_queue`).Scan(&n, &attempts)
-	if n != 1 || attempts != 1 {
-		t.Errorf("queue rows = %d, attempts = %d; want 1, 1", n, attempts)
+func TestQueuesAreSeparate(t *testing.T) {
+	s := newTestStore(t)
+	s.Queue(voiceQueue, "120363000000000001@g.us", "PTT", time.Unix(1000, 0), []byte("a"))
+
+	if _, ok, _ := s.Next(imageQueue, time.Unix(2000, 0)); ok {
+		t.Error("a queued voice message showed up in the image queue")
+	}
+	if n, _ := s.ClearQueue(imageQueue); n != 0 {
+		t.Errorf("clearing the image queue removed %d voice messages", n)
+	}
+	if m, ok, _ := s.Next(voiceQueue, time.Unix(2000, 0)); !ok || m.ID != "PTT" || string(m.Media) != "a" {
+		t.Errorf("Next(voiceQueue) = %+v, %v; want PTT", m, ok)
 	}
 }

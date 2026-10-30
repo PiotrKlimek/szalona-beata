@@ -65,15 +65,6 @@ func TestParseTesseractTSVCapsLength(t *testing.T) {
 	}
 }
 
-func TestOCRSuffix(t *testing.T) {
-	if got := ocrSuffix(""); got != "" {
-		t.Errorf("ocrSuffix(\"\") = %q; want \"\"", got)
-	}
-	if got := "[image] Plan" + ocrSuffix("Pon 8:00"); got != "[image] Plan\n[text in image]\nPon 8:00" {
-		t.Errorf("message text = %q", got)
-	}
-}
-
 // Runs only where tesseract is installed (the bridge image, not its Go build stage).
 func TestRecognizeWithTesseract(t *testing.T) {
 	if err := checkTesseract("pol+eng"); err != nil {
