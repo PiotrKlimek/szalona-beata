@@ -104,21 +104,23 @@ func (t *transcriber) transcribe(ctx context.Context, audio []byte) (string, err
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return "", &temporaryError{msg: "transcription request: " + err.Error()}
+		return "", &temporaryError{msg: "transcription request: " + err.Error(), countAttempt: true}
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
 		msg := fmt.Sprintf("transcription API: %s: %s", resp.Status, truncateRunes(strings.TrimSpace(string(data)), 200))
-		switch resp.StatusCode {
-		case http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout:
-		default:
-			if resp.StatusCode < 500 {
-				return "", errors.New(msg) // about this recording, e.g. 400 unsupported format, 413 too large
-			}
-		}
 		secs, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
-		return "", &temporaryError{msg: msg, retryAfter: time.Duration(secs) * time.Second}
+		te := &temporaryError{msg: msg, retryAfter: time.Duration(secs) * time.Second}
+		switch {
+		case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode == http.StatusUnauthorized,
+			resp.StatusCode == http.StatusForbidden:
+			return "", te // not about this recording
+		case resp.StatusCode == http.StatusRequestTimeout, resp.StatusCode >= 500:
+			te.countAttempt = true // maybe about this recording (too long to process)
+			return "", te
+		}
+		return "", errors.New(msg) // about this recording, e.g. 400 unsupported format, 413 too large
 	}
 	var out struct {
 		Text string `json:"text"`

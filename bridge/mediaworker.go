@@ -21,9 +21,12 @@ const (
 var errTemporary = errors.New("temporary failure")
 
 // temporaryError is an errTemporary with how long to wait, e.g. from Retry-After (0: mediaRetryDelay).
+// countAttempt: the media itself may be the cause (a timeout, a server error),
+// so the failure counts against its attempts and it can't block the queue forever.
 type temporaryError struct {
-	msg        string
-	retryAfter time.Duration
+	msg          string
+	retryAfter   time.Duration
+	countAttempt bool
 }
 
 func (e *temporaryError) Error() string { return e.msg }
@@ -121,8 +124,8 @@ func (w *mediaWorker) processNext(ctx context.Context) bool {
 	text, err := w.extract(ctx, data)
 	switch {
 	case errors.Is(err, errTemporary):
-		// Not this message's fault, and it would hit the next one too: pause the
-		// whole queue without using up the message's attempts.
+		// It would most likely hit the next message too: pause the whole queue.
+		// Rate limits and a rejected key don't use up the message's attempts.
 		delay := mediaRetryDelay
 		var te *temporaryError
 		if errors.As(err, &te) && te.retryAfter > 0 {
@@ -130,6 +133,9 @@ func (w *mediaWorker) processNext(ctx context.Context) bool {
 		}
 		w.paused = w.now().Add(delay)
 		w.log.Warnf("Pausing %s processing for %s: %v", w.kind, delay, err)
+		if te != nil && te.countAttempt {
+			return w.retry(q, err.Error())
+		}
 		return false
 	case err != nil:
 		return w.finish(q, "", err.Error())

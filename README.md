@@ -399,8 +399,9 @@ go to the provider **as soon as they arrive**, even when the digest runs with `-
 - Voice messages are processed one at a time in the background, newest first, in a queue kept in the
   messages database (`voice_queue`, follows `RETENTION_DAYS`). When the API refuses for a reason that would
   hit every recording (rate limit or daily quota, rejected API key, server or network error), the whole
-  queue pauses (for `Retry-After`, otherwise 5 minutes) and nothing is dropped. A recording the API rejects
-  (e.g. an unsupported format) is skipped and isn't in the summary.
+  queue pauses (for `Retry-After`, otherwise 5 minutes). Rate limits and a rejected key drop nothing; after
+  timeouts and server errors a recording is tried 3 times, so one that always fails can't block the queue.
+  A recording the API rejects (e.g. an unsupported format) is skipped and isn't in the summary.
 - Only recorded voice messages are sent, not forwarded audio files (music etc.). Recordings longer than
   15 minutes are skipped; a transcript is capped at 3,000 characters. Groq's free plan allows 20 requests per
   minute and 2 hours of audio per hour (8 per day); a typical voice message takes under a second.

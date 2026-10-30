@@ -147,6 +147,41 @@ func TestWorkerPausesOnTemporaryExtractErrors(t *testing.T) {
 	}
 }
 
+func TestWorkerGivesUpOnMediaThatFailsTemporarilyEveryTime(t *testing.T) {
+	f := &fakeOCR{extractErr: &temporaryError{msg: "500 Internal Server Error", countAttempt: true}}
+	w, s := newTestWorker(t, f) // IMG1, older
+	newer := imageMessage
+	newer.ID, newer.Timestamp = "IMG2", newer.Timestamp.Add(time.Hour)
+	s.SaveMessage(newer)
+	w.Enqueue(newer.ChatJID, newer.ID, newer.Timestamp, &waE2E.ImageMessage{Caption: proto.String("newer")})
+	now := time.Unix(1761300000, 0)
+	w.now = func() time.Time { return now }
+
+	w.processNext(context.Background()) // IMG2 fails: queue paused, IMG2 postponed
+	if w.processNext(context.Background()) {
+		t.Fatal("processed an image while paused")
+	}
+	for range 20 {
+		now = now.Add(mediaRetryDelay)
+		w.processNext(context.Background())
+	}
+	// The backoff (5, then 10 minutes) lets the older image in before the newer one is given up.
+	newerFirst := 0
+	for _, data := range f.recognized {
+		if string(data) != "jpeg of newer" {
+			break
+		}
+		newerFirst++
+	}
+	if newerFirst >= mediaMaxAttempts {
+		t.Errorf("the newer image used all %d attempts before the older one got a turn", newerFirst)
+	}
+	if n := queueLen(s); n != 0 || len(f.recognized) != 2*mediaMaxAttempts {
+		t.Errorf("queue = %d, API calls = %d; want 0, %d (each image given up after %d attempts)",
+			n, len(f.recognized), 2*mediaMaxAttempts, mediaMaxAttempts)
+	}
+}
+
 func TestWorkerPauseDefaultsToRetryDelay(t *testing.T) {
 	w, _ := newTestWorker(t, &fakeOCR{extractErr: fmt.Errorf("%w: network down", errTemporary)})
 	now := time.Unix(1761300000, 0)

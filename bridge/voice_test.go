@@ -79,9 +79,10 @@ func TestTranscribeCapsLongTranscripts(t *testing.T) {
 
 func TestTranscribeErrors(t *testing.T) {
 	for _, tc := range []struct {
-		status    int
-		temporary bool
-	}{{429, true}, {503, true}, {401, true}, {403, true}, {408, true}, {400, false}, {404, false}, {413, false}} {
+		status              int
+		temporary, attempts bool
+	}{{429, true, false}, {401, true, false}, {403, true, false}, {503, true, true}, {408, true, true},
+		{400, false, false}, {404, false, false}, {413, false, false}} {
 		tr, _, _ := fakeTranscriptionAPI(t, tc.status, `{"error": {"message": "nope"}}`)
 
 		_, err := tr.transcribe(context.Background(), []byte("OggS"))
@@ -91,6 +92,10 @@ func TestTranscribeErrors(t *testing.T) {
 		}
 		if errors.Is(err, errTemporary) != tc.temporary {
 			t.Errorf("%d: temporary = %v; want %v", tc.status, !tc.temporary, tc.temporary)
+		}
+		var te *temporaryError
+		if errors.As(err, &te) && te.countAttempt != tc.attempts {
+			t.Errorf("%d: countAttempt = %v; want %v", tc.status, te.countAttempt, tc.attempts)
 		}
 	}
 }
@@ -147,8 +152,10 @@ func TestTranscribeNetworkErrorIsTemporary(t *testing.T) {
 	t.Setenv("LLM_BASE_URL", "http://127.0.0.1:1")
 	tr, _ := newTranscriber()
 
-	if _, err := tr.transcribe(context.Background(), []byte("OggS")); !errors.Is(err, errTemporary) {
-		t.Errorf("err = %v; want temporary", err)
+	_, err := tr.transcribe(context.Background(), []byte("OggS"))
+	var te *temporaryError
+	if !errors.As(err, &te) || !te.countAttempt {
+		t.Errorf("err = %v; want temporary, counting an attempt", err)
 	}
 }
 
