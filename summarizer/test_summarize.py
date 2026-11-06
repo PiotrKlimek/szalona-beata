@@ -631,6 +631,144 @@ class FakeServer:
         self.server.server_close()
 
 
+# Shape of Edupage's substitution day report (getSubstViewerDayDataHtml), names made up.
+SUBST_PATH = "/substitution/server/viewer.js?__func=getSubstViewerDayDataHtml"
+SUBST_HTML = (
+    '<div class="_RSS1"><style type="text/css">._RSS1 .row {display:flex}</style>'
+    '<div data-date="2025-10-24">'
+    '<div class="subst_note"><span class="print-font-resizable">klasy 2C wycieczka, sala 1C zamknięta</span></div>'
+    '<div style="text-align:center"><span class="print-font-resizable">Klasy nieobecne: 2A (0 - 4)</span></div>'
+    '<div class="section print-nobreak"><div class="header"><span class="print-font-resizable">1B</span></div>'
+    '<div class="rows"><div class="row change"><div class="period"><span class="print-font-resizable">4</span></div>'
+    '<div class="info"><span class="print-font-resizable">niem: język niemiecki - (Jan Nowak)</span></div></div></div></div>'
+    '<div class="section print-nobreak"><div class="header"><span class="print-font-resizable">1C</span></div>'
+    '<div class="rows"><div class="row remove"><div class="period"><span class="print-font-resizable">(1)</span></div>'
+    '<div class="info"><span class="print-font-resizable">Chłopcy: wychowanie fizyczne - Anna Kowalska, Anulowano</span></div></div>'
+    '<div class="row change"><div class="period"><span class="print-font-resizable">4</span></div>'
+    '<div class="info"><span class="print-font-resizable">1. Grupa: (język angielski) ➔ plastyka - Zastępstwa: '
+    '(Ewa Lis) ➔ Ola &amp; Kot</span></div></div>'
+    '<div class="row absent"><div class="period"><span class="print-font-resizable">5 - 6</span></div>'
+    '<div class="info"><span class="print-font-resizable"><img src="/global/pics/ui/absent_32.svg"/>Nieobecność</span>'
+    '</div></div></div></div>'
+    '<div class="section print-nobreak"><div class="header"><span class="print-font-resizable">1CD</span></div>'
+    '<div class="rows"><div class="row change"><div class="period"><span class="print-font-resizable">2</span></div>'
+    '<div class="info"><span class="print-font-resizable">fizyka - inna klasa</span></div></div></div></div>'
+    '</div></div>'
+)
+
+
+class SubstitutionsTest(unittest.TestCase):
+    def test_parse_keeps_only_rows_of_the_given_class(self):
+        rows = summarize.parse_substitutions(SUBST_HTML, "1c")
+        self.assertEqual(rows, [
+            ("1", "Chłopcy: wychowanie fizyczne - Anna Kowalska, Anulowano"),
+            ("4", "1. Grupa: (język angielski) ➔ plastyka - Zastępstwa: (Ewa Lis) ➔ Ola & Kot"),
+            ("5 - 6", "Nieobecność"),
+        ])
+
+    def test_parse_class_without_changes(self):
+        self.assertEqual(summarize.parse_substitutions(SUBST_HTML, "3A"), [])
+        self.assertEqual(summarize.parse_substitutions("", "1C"), [])
+
+    def test_next_school_day_skips_the_weekend(self):
+        tz = timezone.utc
+        thu, fri, sat, sun = 1761213600, 1761300000, 1761386400, 1761472800  # 2025-10-23..26 10:00 UTC
+        self.assertEqual(str(summarize.next_school_day(thu, tz)), "2025-10-24")
+        self.assertEqual(str(summarize.next_school_day(fri, tz)), "2025-10-27")
+        self.assertEqual(str(summarize.next_school_day(sat, tz)), "2025-10-27")
+        self.assertEqual(str(summarize.next_school_day(sun, tz)), "2025-10-27")
+
+    def test_edupage_base_url_from_any_school_page(self):
+        for url in ("https://lo2gdy.edupage.org", "https://lo2gdy.edupage.org/substitution/",
+                    "https://lo2gdy.edupage.org/substitution/?&lang=pl"):
+            self.assertEqual(summarize.edupage_base(url), "https://lo2gdy.edupage.org")
+
+    def test_fetch_asks_edupage_for_the_day_in_class_mode(self):
+        from datetime import date
+
+        srv = FakeServer({("POST", SUBST_PATH): (200, {"r": SUBST_HTML})})
+        self.addCleanup(srv.close)
+
+        subs = summarize.fetch_substitutions(srv.url + "/substitution/", "1C", date(2025, 10, 24))
+
+        self.assertEqual(subs.cls, "1C")
+        self.assertEqual(str(subs.day), "2025-10-24")
+        self.assertEqual(len(subs.rows), 3)
+        self.assertIsNone(subs.error)
+        self.assertEqual(subs.url, srv.url + "/substitution/")
+        method, path, body = srv.requests[0]
+        self.assertEqual((method, path), ("POST", SUBST_PATH))
+        self.assertEqual(body["__args"], [None, {"date": "2025-10-24", "mode": "classes"}])
+
+    def test_fetch_error_is_reported_not_raised(self):
+        from datetime import date
+
+        srv = FakeServer({})  # 404 for everything
+        self.addCleanup(srv.close)
+
+        subs = summarize.fetch_substitutions(srv.url, "1C", date(2025, 10, 24))
+
+        self.assertEqual(subs.rows, [])
+        self.assertIn("404", subs.error)
+
+    def test_unexpected_reply_is_an_error(self):
+        from datetime import date
+
+        srv = FakeServer({("POST", SUBST_PATH): (200, {"something": "else"})})
+        self.addCleanup(srv.close)
+
+        subs = summarize.fetch_substitutions(srv.url, "1C", date(2025, 10, 24))
+
+        self.assertIsNotNone(subs.error)
+
+    def subs(self, rows, error=None):
+        from datetime import date
+
+        return summarize.Substitutions("1C", date(2025, 10, 27), rows, error, "https://x.edupage.org/substitution/")
+
+    def test_text_digest_has_a_separate_paragraph_after_the_groups(self):
+        sections = [summarize.Section("Klasa 1C", "- ok", 2)]
+        text = summarize.build_digest(sections, 24, lang="Polish",
+                                      substitutions=self.subs([("(1)", "wf, Anulowano"), ("5 - 6", "Nieobecność")]))
+        self.assertTrue(text.endswith(
+            "\n\n*Zastępstwa – klasa 1C, poniedziałek 27.10.2025*\n"
+            "- lekcja 1: wf, Anulowano\n"
+            "- lekcje 5–6: Nieobecność"
+        ), text)
+
+    def test_text_digest_without_changes_or_with_error(self):
+        none = summarize.build_digest([], 24, lang="Polish", substitutions=self.subs([]))
+        self.assertIn("*Zastępstwa – klasa 1C, poniedziałek 27.10.2025*\nBrak zastępstw.", none)
+        failed = summarize.build_digest([], 24, lang="Polish", substitutions=self.subs([], error="timeout"))
+        self.assertIn("Nie udało się pobrać zastępstw (timeout).", failed)
+        english = summarize.build_digest([], 24, lang="English", substitutions=self.subs([("3", "maths")]))
+        self.assertIn("*Substitutions – class 1C, Monday 27.10.2025*\n- period 3: maths", english)
+
+    def test_text_digest_without_substitutions_is_unchanged(self):
+        sections = [summarize.Section("Klasa 1C", "- ok", 2)]
+        self.assertEqual(summarize.build_digest(sections, 24, lang="Polish", substitutions=None),
+                         summarize.build_digest(sections, 24, lang="Polish"))
+
+    def test_html_block_after_the_cards_escaped_with_link(self):
+        sections = [summarize.Section("Klasa 1C", "- ok", 2)]
+        html = summarize.build_html_digest(sections, 24, "27.10.2025", lang="Polish",
+                                           substitutions=self.subs([("4", "<b>plastyka</b> & wf")]))
+        block = html[html.index('data-substitutions="1"'):]
+        self.assertGreater(html.index('data-substitutions="1"'), html.index("Klasa 1C"))
+        self.assertIn("Zastępstwa – klasa 1C, poniedziałek 27.10.2025", block)
+        self.assertIn("lekcja 4", block)
+        self.assertIn("&lt;b&gt;plastyka&lt;/b&gt; &amp; wf", block)
+        self.assertIn('href="https://x.edupage.org/substitution/"', block)
+        self.assertNotIn("data-substitutions", summarize.build_html_digest(sections, 24, "27.10.2025"))
+
+    def test_html_block_without_changes_and_with_error(self):
+        html = summarize.build_html_digest([], 24, "27.10.2025", lang="Polish", substitutions=self.subs([]))
+        self.assertIn("Brak zastępstw.", html)
+        html = summarize.build_html_digest([], 24, "27.10.2025", lang="Polish",
+                                           substitutions=self.subs([], error="<oops>"))
+        self.assertIn("Nie udało się pobrać zastępstw (&lt;oops&gt;).", html)
+
+
 class OllamaTest(unittest.TestCase):
     def serve(self, responses):
         srv = FakeServer(responses)
@@ -1554,6 +1692,51 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(out.startswith("📋 Digest (last 2h)\n3 messages\n\n"), out)
         self.assertIn("*Rowery* (3 messages)", out)
+
+    def test_substitutions_for_the_next_school_day_are_emailed(self):
+        import email
+        import os
+        from unittest import mock
+
+        edupage = FakeServer({("POST", SUBST_PATH): (200, {"r": SUBST_HTML})})
+        self.addCleanup(edupage.close)
+        smtp = FakeSMTPServer()
+        self.addCleanup(smtp.close)
+        env = {"SUMMARY_LANGUAGE": "Polish", "SUBSTITUTIONS_URL": edupage.url + "/substitution/",
+               "SUBSTITUTIONS_CLASS": "1C",
+               "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(smtp.port), "SMTP_SECURITY": "none",
+               "SMTP_PASSWORD": "x", "EMAIL_FROM": "a@example.com"}
+        with mock.patch.dict(os.environ, env):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+
+        self.assertEqual(code, 0)
+        # now = Thursday 2025-10-23 -> Friday
+        self.assertEqual(edupage.requests[0][2]["__args"][1]["date"], "2025-10-24")
+        self.assertIn("*Zastępstwa – klasa 1C, piątek 24.10.2025*\n- lekcja 1:", out)
+        msg = email.message_from_string(smtp.envelopes[0][2], policy=email.policy.default)
+        self.assertIn("Zastępstwa – klasa 1C", msg.get_body(("plain",)).get_content())
+        self.assertIn("Zastępstwa – klasa 1C", msg.get_body(("html",)).get_content())
+
+    def test_unreachable_substitutions_do_not_block_the_digest(self):
+        import os
+        from unittest import mock
+
+        env = {"SUMMARY_LANGUAGE": "Polish", "SUBSTITUTIONS_URL": "http://127.0.0.1:9", "SUBSTITUTIONS_CLASS": "1C"}
+        with mock.patch.dict(os.environ, env), redirect_stderr(io.StringIO()):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")
+
+        self.assertEqual(code, 0)
+        self.assertIn("*Rowery*", out)
+        self.assertIn("Nie udało się pobrać zastępstw", out)
+
+    def test_no_substitutions_without_configuration(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"SUBSTITUTIONS_URL": "https://x.edupage.org"}):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")  # no class: off
+        self.assertEqual(code, 0)
+        self.assertNotIn("Substitutions", out)
 
     def test_unknown_group_exits_with_error(self):
         code, _ = self.run_main("--group", "nonexistent", "--model", "dummy")
