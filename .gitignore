@@ -17,3 +17,4 @@ docker-compose.override.yml
 
 # Local deployment notes
 *.local.md
+__pycache__/
