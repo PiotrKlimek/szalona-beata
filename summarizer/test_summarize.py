@@ -736,6 +736,21 @@ class SubstitutionsTest(unittest.TestCase):
             "- lekcje 5–6: Nieobecność"
         ), text)
 
+    def test_whole_day_rows_have_no_period_label(self):
+        text = summarize.build_digest([], 24, lang="Polish",
+                                      substitutions=self.subs([("Cały dzień", "Wycieczka"), ("0 - 10", "Nieobecność")]))
+        self.assertIn("- Cały dzień: Wycieczka\n- lekcje 0–10: Nieobecność", text)
+
+    def test_any_failure_while_fetching_is_reported_not_raised(self):
+        import http.client
+        from datetime import date
+        from unittest import mock
+
+        with mock.patch.object(summarize, "_request", side_effect=http.client.IncompleteRead(b"")):
+            subs = summarize.fetch_substitutions("https://x.edupage.org", "1C", date(2025, 10, 24))
+        self.assertEqual(subs.rows, [])
+        self.assertTrue(subs.error)
+
     def test_text_digest_without_changes_or_with_error(self):
         none = summarize.build_digest([], 24, lang="Polish", substitutions=self.subs([]))
         self.assertIn("*Zastępstwa – klasa 1C, poniedziałek 27.10.2025*\nBrak zastępstw.", none)
@@ -1737,6 +1752,16 @@ class MainTest(unittest.TestCase):
             code, out = self.run_main("--group", "rowery", "--hours", "2")  # no class: off
         self.assertEqual(code, 0)
         self.assertNotIn("Substitutions", out)
+
+    def test_half_configured_substitutions_warn(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"SUBSTITUTIONS_CLASS": "1C"}), redirect_stderr(err):
+            code, _ = self.run_main("--group", "rowery", "--hours", "2")
+        self.assertEqual(code, 0)
+        self.assertIn("SUBSTITUTIONS_URL", err.getvalue())
 
     def test_unknown_group_exits_with_error(self):
         code, _ = self.run_main("--group", "nonexistent", "--model", "dummy")

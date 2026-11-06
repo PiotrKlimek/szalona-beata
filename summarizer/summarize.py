@@ -360,7 +360,7 @@ def fetch_substitutions(url, cls, day):
         if not isinstance(report, str):
             raise ValueError("unexpected reply from Edupage")
         return Substitutions(cls, day, parse_substitutions(report, cls), None, url)
-    except (RuntimeError, OSError, ValueError) as e:
+    except Exception as e:  # best-effort section: a broken reply (e.g. IncompleteRead) must not cost the digest
         return Substitutions(cls, day, [], str(e) or type(e).__name__, url)
 
 
@@ -381,10 +381,12 @@ def _subst_lines(subs, lang):
     lines = []
     for period, text in subs.rows:
         period = period.strip("() ")  # Edupage puts cancelled periods in parentheses
-        if "-" in period:
-            label = f"{many} " + "–".join(p.strip() for p in period.split("-"))
+        if m := re.fullmatch(r"(\d+)\s*-\s*(\d+)", period):
+            label = f"{many} {m[1]}–{m[2]}"
+        elif period.isdigit():
+            label = f"{one} {period}"
         else:
-            label = f"{one} {period}" if period else ""
+            label = period  # e.g. "Cały dzień"
         lines.append(f"{label}: {text}" if label else text)
     return lines, True
 
@@ -922,7 +924,10 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         sections.append(Section(name, summary, len(msgs), omitted, ocr, voice))
 
     substitutions = None
-    if args.substitutions_url and args.substitutions_class:
+    if bool(args.substitutions_url) != bool(args.substitutions_class):
+        print("warning: substitutions need both SUBSTITUTIONS_URL and SUBSTITUTIONS_CLASS; skipped",
+              file=sys.stderr, flush=True)
+    elif args.substitutions_url:
         substitutions = fetch_substitutions(args.substitutions_url, args.substitutions_class,
                                             next_school_day(now, tz))
         if substitutions.error:

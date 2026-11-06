@@ -442,6 +442,7 @@ SUBSTITUTIONS_CLASS=1C
   the school-wide notes at the top of the page are left out.
 - The page is public and only read (the same request the page itself makes); no chat data is sent there.
   If it can't be fetched, the section says so and the rest of the digest is sent as usual.
+- Both settings are needed; with only one of them the section is skipped and the log says so.
 - Check without emailing: `docker compose run --rm -e EMAIL_TO= summarizer --hours 1`.
 
 ## Local models (Ollama)
