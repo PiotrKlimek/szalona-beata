@@ -20,7 +20,9 @@ import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from html.parser import HTMLParser
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 # The bridge appends text read from a photo (OCR) after this tag; see bridge/ocr.go.
 OCR_TAG = "[text in image]"
@@ -98,6 +100,12 @@ LABELS = {
         "voice": "🎤 Includes {count} (automatic transcript, may contain errors).",
         "voice_note": ("voice message", "voice messages", "voice messages"),
         "footer": "Generated locally by szalona-beata from your WhatsApp groups.",
+        "subst_title": "Substitutions – class {cls}, {day}",
+        "subst_none": "No substitutions.",
+        "subst_error": "Could not fetch the substitutions ({error}).",
+        "subst_link": "Substitutions page",
+        "lesson": ("period", "periods"),
+        "weekdays": ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
         "bridge": {
             "logged_out": "⚠️ The WhatsApp bridge is logged out: new messages are not collected. "
                           "Link the device again (README, step 3).",
@@ -119,6 +127,12 @@ LABELS = {
         "voice": "🎤 Uwzględniono treść wiadomości głosowych (automatyczna transkrypcja, możliwe błędy): {count}.",
         "voice_note": ("wiadomość głosowa", "wiadomości głosowe", "wiadomości głosowych"),
         "footer": "Wygenerowane lokalnie przez szalona-beata z Twoich grup WhatsApp.",
+        "subst_title": "Zastępstwa – klasa {cls}, {day}",
+        "subst_none": "Brak zastępstw.",
+        "subst_error": "Nie udało się pobrać zastępstw ({error}).",
+        "subst_link": "Strona zastępstw",
+        "lesson": ("lekcja", "lekcje"),
+        "weekdays": ("poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"),
         "bridge": {
             "logged_out": "⚠️ Mostek WhatsApp jest wylogowany: nowe wiadomości nie są zbierane. "
                           "Połącz urządzenie ponownie (README, krok 3).",
@@ -267,7 +281,123 @@ def tagged_sent(msgs, omitted, tag):
     return sum(tag in m.text for m in sent)
 
 
-def build_digest(sections, hours, title=None, lang="English", warning=None):
+class Substitutions(NamedTuple):
+    cls: str      # class name as configured, e.g. "1C"
+    day: object   # datetime.date the substitutions are for
+    rows: list    # [(period, text)]; empty = no changes for the class
+    error: object = None  # str if they could not be fetched
+    url: str = ""  # page to link to
+
+
+def next_school_day(now, tz):
+    """The day after `now`, skipping Saturday and Sunday (holidays are not known)."""
+    day = datetime.fromtimestamp(now, tz).date() + timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
+def edupage_base(url):
+    """'https://school.edupage.org' from any page of the school's Edupage site."""
+    parts = urlsplit(url.strip())
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+class _SubstParser(HTMLParser):
+    """Collects (header, period, text) rows from Edupage's substitution report."""
+
+    ROLES = ("header", "period", "info", "row", "section")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []  # role (or None) of each open <div>
+        self.header = ""
+        self.rows = []  # [header, period, text]
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "div":
+            return
+        classes = (dict(attrs).get("class") or "").split()
+        role = next((r for r in self.ROLES if r in classes), None)
+        if role == "section":
+            self.header = ""
+        elif role == "row":
+            self.rows.append([self.header, "", ""])
+        self.stack.append(role)
+
+    def handle_endtag(self, tag):
+        if tag == "div" and self.stack:
+            self.stack.pop()
+
+    def handle_data(self, data):
+        role = next((r for r in reversed(self.stack) if r), None)
+        if role == "header":
+            self.header += data
+        elif role in ("period", "info") and self.rows and "row" in self.stack:
+            self.rows[-1][1 if role == "period" else 2] += data
+
+
+def parse_substitutions(report_html, cls):
+    """[(period, text)] for one class (exact name, case-insensitive) from the report HTML."""
+    parser = _SubstParser()
+    parser.feed(report_html)
+    parser.close()
+    want = cls.strip().lower()
+    return [(" ".join(period.split()).strip("() "), " ".join(text.split()))
+            for header, period, text in parser.rows if header.strip().lower() == want]
+
+
+SUBST_FUNC = "/substitution/server/viewer.js?__func=getSubstViewerDayDataHtml"
+
+
+def fetch_substitutions(url, cls, day):
+    """Substitutions for `cls` on `day` from a public Edupage site; errors end up in .error, never raised."""
+    try:
+        reply = _request("POST", edupage_base(url) + SUBST_FUNC,
+                         {"__args": [None, {"date": day.isoformat(), "mode": "classes"}], "__gsh": "00000000"},
+                         timeout=30)
+        report = reply.get("r") if isinstance(reply, dict) else None
+        if not isinstance(report, str):
+            raise ValueError("unexpected reply from Edupage")
+        return Substitutions(cls, day, parse_substitutions(report, cls), None, url)
+    except Exception as e:  # best-effort section: a broken reply (e.g. IncompleteRead) must not cost the digest
+        return Substitutions(cls, day, [], str(e) or type(e).__name__, url)
+
+
+def _subst_title(subs, lang):
+    L = labels(lang)
+    day = f"{L['weekdays'][subs.day.weekday()]} {subs.day.strftime('%d.%m.%Y')}"
+    return L["subst_title"].format(cls=subs.cls, day=day)
+
+
+def _subst_lines(subs, lang):
+    """'lekcja 4: ...' per row, or the 'none' / 'error' message as a single line (second item False)."""
+    L = labels(lang)
+    if subs.error:
+        return [L["subst_error"].format(error=subs.error)], False
+    if not subs.rows:
+        return [L["subst_none"]], False
+    one, many = L["lesson"]
+    lines = []
+    for period, text in subs.rows:
+        period = period.strip("() ")  # Edupage puts cancelled periods in parentheses
+        if m := re.fullmatch(r"(\d+)\s*-\s*(\d+)", period):
+            label = f"{many} {m[1]}–{m[2]}"
+        elif period.isdigit():
+            label = f"{one} {period}"
+        else:
+            label = period  # e.g. "Cały dzień"
+        lines.append(f"{label}: {text}" if label else text)
+    return lines, True
+
+
+def _subst_text(subs, lang):
+    lines, is_list = _subst_lines(subs, lang)
+    body = "\n".join(f"- {line}" for line in lines) if is_list else lines[0]
+    return f"*{_subst_title(subs, lang)}*\n{body}"
+
+
+def build_digest(sections, hours, title=None, lang="English", warning=None, substitutions=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     header = f"📋 {title or L['digest']} ({L['last'].format(hours=hours)})"
@@ -278,6 +408,8 @@ def build_digest(sections, hours, title=None, lang="English", warning=None):
         count = f" ({plural(s.messages, L['message'], lang)})" if s.messages else ""
         note = "".join(f"{n}\n" for n in _section_notes(s, lang))
         parts.append(f"*{s.name}*{count}\n{note}{_summary_text(s.summary, lang)}")
+    if substitutions:
+        parts.append(_subst_text(substitutions, lang))
     return "\n\n".join(parts)
 
 
@@ -384,13 +516,35 @@ def _card_meta_html(section, lang):
     return html
 
 
+SUBST_BLOCK = """<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px" data-substitutions="1">
+<tr><td style="background:#fff8e6;border-left:4px solid #e0a100;border-radius:0 8px 8px 0;padding:10px 14px">
+<div style="font-size:17px;font-weight:700;color:#6b4a00;margin:0 0 8px">📅 {title}</div>
+<div style="font-size:15px;line-height:1.5">{body}</div>
+{link}
+</td></tr></table>"""
+
+
+def render_substitutions_html(subs, lang):
+    lines, is_list = _subst_lines(subs, lang)
+    if is_list:
+        lis = "".join(f'<li style="{LI_STYLE}">{htmllib.escape(line)}</li>' for line in lines)
+        body = f'<ul style="{UL_STYLE};margin-bottom:0">{lis}</ul>'
+    else:
+        body = f'<p style="margin:0;color:#7a8783;font-style:italic">{htmllib.escape(lines[0])}</p>'
+    link = ""
+    if subs.url:
+        link = (f'<div style="font-size:13px;margin-top:8px"><a href="{htmllib.escape(subs.url, quote=True)}" '
+                f'style="color:#0b5f53">{htmllib.escape(labels(lang)["subst_link"])}</a></div>')
+    return SUBST_BLOCK.format(title=htmllib.escape(_subst_title(subs, lang)), body=body, link=link)
+
+
 KICKER = ('<div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a8dcd1">'
           'Szalona Beata</div>\n')
 WARNING_BANNER = ('<div data-warning="1" style="background:#fdecea;color:#8a1c12;border-radius:8px;'
                   'padding:10px 12px;margin:16px 0 0;font-weight:600">{}</div>\n')
 
 
-def build_html_digest(sections, hours, day, title=None, lang="English", warning=None):
+def build_html_digest(sections, hours, day, title=None, lang="English", warning=None, substitutions=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     cards = "\n".join(
@@ -401,6 +555,8 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
         )
         for s in sections
     )
+    if substitutions:
+        cards += "\n" + render_substitutions_html(substitutions, lang)
     total = _total_line(sections, lang)
     return HTML_PAGE.format(
         title=htmllib.escape(title or L["html_title"]),
@@ -700,6 +856,10 @@ def parse_args(argv):
     p.add_argument("--max-chars", type=int, default=int(env("MAX_TRANSCRIPT_CHARS", "12000")))
     p.add_argument("--tz", default=env("TZ", "Europe/Warsaw"))
     p.add_argument("--daily-at", default=env("DAILY_AT"), help="keep running and send a digest every day at HH:MM")
+    p.add_argument("--substitutions-url", default=env("SUBSTITUTIONS_URL", ""),
+                   help="school's Edupage site (e.g. https://school.edupage.org/substitution/)")
+    p.add_argument("--substitutions-class", default=env("SUBSTITUTIONS_CLASS", ""),
+                   help="class whose substitutions for the next school day are added to the digest, e.g. 1C")
     args = p.parse_args(argv)
     if args.max_chars < 1:
         p.error(f"--max-chars / MAX_TRANSCRIPT_CHARS must be at least 1, got {args.max_chars}")
@@ -763,7 +923,16 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
             summary = dummy_summary(msgs, tz, lang)
         sections.append(Section(name, summary, len(msgs), omitted, ocr, voice))
 
-    common = {"title": args.email_title, "lang": lang, "warning": warning}
+    substitutions = None
+    if bool(args.substitutions_url) != bool(args.substitutions_class):
+        print("warning: substitutions need both SUBSTITUTIONS_URL and SUBSTITUTIONS_CLASS; skipped",
+              file=sys.stderr, flush=True)
+    elif args.substitutions_url:
+        substitutions = fetch_substitutions(args.substitutions_url, args.substitutions_class,
+                                            next_school_day(now, tz))
+        if substitutions.error:
+            print(f"warning: substitutions: {substitutions.error}", file=sys.stderr, flush=True)
+    common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions}
     digest = build_digest(sections, args.hours, **common)
     print(digest, flush=True)
     if usage := getattr(llm, "usage", None):

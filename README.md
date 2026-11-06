@@ -420,6 +420,31 @@ docker compose run --rm --no-deps -v "$PWD/audio":/audio:ro bridge bridge transc
 #     Przypominam, że jutro wycieczka do Krakowa. ...
 ```
 
+## School substitutions (Edupage)
+
+If the school publishes substitutions on Edupage (`https://yourschool.edupage.org/substitution/`), the digest can
+end with a separate section for one class:
+
+```
+*Zastępstwa – klasa 1C, poniedziałek 09.11.2026*
+- lekcja 3: Dziewczęta: wychowanie fizyczne - Zastępstwa: (…) ➔ …
+```
+
+```sh
+# .env
+SUBSTITUTIONS_URL=https://yourschool.edupage.org/substitution/
+SUBSTITUTIONS_CLASS=1C
+```
+
+- The day shown is the **next school day** after the digest: tomorrow, or Monday when the digest runs on Friday,
+  Saturday or Sunday. Holidays are not known: on a day off the section just says there are no substitutions.
+- Only the rows under the class's own heading are shown (exact name, case-insensitive: `1C` doesn't match `1CD`);
+  the school-wide notes at the top of the page are left out.
+- The page is public and only read (the same request the page itself makes); no chat data is sent there.
+  If it can't be fetched, the section says so and the rest of the digest is sent as usual.
+- Both settings are needed; with only one of them the section is skipped and the log says so.
+- Check without emailing: `docker compose run --rm -e EMAIL_TO= summarizer --hours 1`.
+
 ## Local models (Ollama)
 
 `--model ollama` keeps everything on your server. Ollama starts only on demand (profile `llm`) and unloads the
@@ -516,6 +541,7 @@ docker volume rm szalona-beata_wa-data
 | `LLM_API_KEY` | | Groq (or other OpenAI-compatible) API key; the bridge uses it only with `TRANSCRIBE_VOICE=on` |
 | `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
+| `SUBSTITUTIONS_URL`, `SUBSTITUTIONS_CLASS` | (off) | School's Edupage site and class: adds that class's substitutions for the next school day to the digest ([section](#school-substitutions-edupage)) |
 | `MAX_TRANSCRIPT_CHARS` | `12000` | Max chat length sent to the model per group; on busier days the oldest messages are left out and the email says so under the group |
 | `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
 | `OLLAMA_MODEL` | `qwen2.5:3b` | Local model for `--model ollama` (needs ~2.5 GB free RAM) |
