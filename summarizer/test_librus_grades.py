@@ -20,16 +20,39 @@ def grade(id, value="5", subject_id=1, category_id=10, add_date="2026-11-06 10:1
     return SimpleNamespace(**fields)
 
 
+def point(id, points=90.0, max_points=100.0, value=None, category="kartkówka", weight=3.0, **kw):
+    fields = dict(id=id, subject_id=1, value=value if value is not None else f"{points:.2f}", points=points,
+                  max_points=max_points, category_id=1, category=category, weight=weight, counts_to_average=True,
+                  semester=1, add_date="2026-11-06 10:00:00", teacher_id=100)
+    fields.update(kw)
+    return SimpleNamespace(**fields)
+
+
+def text(id, value, category="aktywność", date="2026-11-06", **kw):
+    fields = dict(id=id, value=value, subject_id=2, lesson_id=1, category_id=1, category=category, teacher_id=100,
+                  date=date, add_date="2026-11-06 10:00:00", semester=1, counts_to_average=True)
+    fields.update(kw)
+    return SimpleNamespace(**fields)
+
+
+def behaviour(id, value, short_name="", text="", comments=(), **kw):
+    fields = dict(id=id, value=value, short_name=short_name, semester=1, category_id=1, teacher_id=100,
+                  add_date="2026-11-06 10:00:00", text=text, comments=list(comments), grade_id=None)
+    fields.update(kw)
+    return SimpleNamespace(**fields)
+
+
 class FakeLibrus:
     """Same calls the module makes on librus_synergia.Librus (through open_account)."""
 
     instances = []
 
-    def __init__(self, login, password, session, grades=(), first_name="Ania", fail=None):
+    def __init__(self, login, password, session, grades=(), first_name="Ania", fail=None, extra=None):
         self.login, self.password, self.session = login, password, session
         self._grades = list(grades)
         self.first_name = first_name
         self.fail = fail
+        self.extra = extra or {}  # kind -> items for point_grades / text_grades / behaviour_grades
         self.calls = []
         FakeLibrus.instances.append(self)
 
@@ -44,6 +67,18 @@ class FakeLibrus:
         if self.fail:
             raise self.fail
         return self._grades
+
+    async def point_grades(self):
+        self.calls.append("point_grades")
+        return self.extra.get("point", [])
+
+    async def text_grades(self):
+        self.calls.append("text_grades")
+        return self.extra.get("text", [])
+
+    async def behaviour_grades(self):
+        self.calls.append("behaviour_grades")
+        return self.extra.get("behaviour", [])
 
     async def subjects(self):
         self.calls.append("subjects")
@@ -124,6 +159,11 @@ class StateFileTest(unittest.TestCase):
         self.assertEqual(lg.load_state(self.path), {
             "a": {}, "b": {}, "c": {"seen": ["1", "2"], "session": {"cookies": [{"n": "v"}], "logged_in_at": 3}}})
 
+    def test_kinds_are_kept(self):
+        with open(self.path, "w") as f:
+            json.dump({"a": {"seen": [], "kinds": ["grades", 3]}, "b": {"kinds": "grades"}}, f)
+        self.assertEqual(lg.load_state(self.path), {"a": {"seen": [], "kinds": ["grades", "3"]}, "b": {}})
+
 
 class CheckGradesTest(unittest.TestCase):
     def setUp(self):
@@ -131,10 +171,11 @@ class CheckGradesTest(unittest.TestCase):
         self.grades = {}  # login -> grades the fake account has
         self.failures = {}
         self.names = {}
+        self.extra = {}
 
         def opener(login, password, session):
             return FakeLibrus(login, password, session, self.grades.get(login, ()),
-                              self.names.get(login, "Ania"), self.failures.get(login))
+                              self.names.get(login, "Ania"), self.failures.get(login), self.extra.get(login))
 
         patcher = mock.patch.object(lg, "open_account", opener)
         patcher.start()
@@ -149,9 +190,10 @@ class CheckGradesTest(unittest.TestCase):
         children, seen = self.check([lg.Account("Ania", "1234567u", "p")], state)
 
         self.assertEqual(children, [lg.ChildGrades("Ania", [], None, 2)])
-        self.assertEqual(seen, {"1234567u": ["1", "2"]})
+        self.assertEqual(seen, {"1234567u": {"seen": ["1", "2"], "kinds": ["behaviour", "grades", "point", "text"]}})
         self.assertNotIn("seen", state.get("1234567u", {}))  # committed only after delivery
-        self.assertEqual(FakeLibrus.instances[0].calls, ["grades"])  # no lookups when nothing is new
+        # no lookups when nothing is new
+        self.assertEqual(FakeLibrus.instances[0].calls, ["grades", "point_grades", "text_grades", "behaviour_grades"])
 
     def test_reports_only_new_grades_with_details(self):
         self.grades["1234567u"] = [
@@ -169,7 +211,7 @@ class CheckGradesTest(unittest.TestCase):
             lg.Grade("Matematyka", "5", "sprawdzian", 3, "Jan Kowalski", date(2026, 11, 6), "", True, ""),
             lg.Grade("Język polski", "4+", "aktywność", None, "Jan Kowalski", date(2026, 11, 7), "", False, "Brawo"),
         ])
-        self.assertEqual(seen, {"1234567u": ["1", "2", "3"]})
+        self.assertEqual(seen["1234567u"]["seen"], ["1", "2", "3"])
 
     def test_semester_and_final_grades_are_marked(self):
         self.grades["1234567u"] = [grade(5, is_semester_proposition=True), grade(6, is_final=True),
@@ -196,7 +238,7 @@ class CheckGradesTest(unittest.TestCase):
         children, seen = self.check(accounts, state)
 
         self.assertEqual([(c.name, len(c.grades)) for c in children], [("Ania", 1), ("Jaś", 1)])
-        self.assertEqual(seen, {"1111111u": ["1"], "2222222u": ["1", "2"]})
+        self.assertEqual({k: v["seen"] for k, v in seen.items()}, {"1111111u": ["1"], "2222222u": ["1", "2"]})
         first, second = FakeLibrus.instances
         self.assertEqual((first.login, first.password, first.session), ("1111111u", "a", {"cookies": ["old"]}))
         self.assertEqual((second.login, second.password, second.session), ("2222222u", "b", None))
@@ -225,10 +267,60 @@ class CheckGradesTest(unittest.TestCase):
         self.assertEqual(children[0].name, "1234567u")
         self.assertEqual(children[0].error, "TimeoutError")
 
-    def test_commit_stores_seen_ids(self):
+    def test_commit_stores_seen_ids_and_kinds(self):
         state = {"1234567u": {"session": {"cookies": []}}}
-        lg.commit(state, {"1234567u": ["1", "2"]})
-        self.assertEqual(state, {"1234567u": {"session": {"cookies": []}, "seen": ["1", "2"]}})
+        lg.commit(state, {"1234567u": {"seen": ["1", "2"], "kinds": ["grades"]}})
+        self.assertEqual(state, {"1234567u": {"session": {"cookies": []}, "seen": ["1", "2"], "kinds": ["grades"]}})
+
+    def test_point_text_and_behaviour_grades(self):
+        self.extra["1234567u"] = {
+            "point": [point(50, points=90.0, max_points=100.0, category="kartkówka", weight=3.0),
+                      point(51, value="0.00", points=None, max_points=100.0, category="praca", weight=2.0,
+                            counts_to_average=False),
+                      point(52, points=54.5, max_points=None, category=None, weight=None)],
+            "text": [text(60, "Praca w grupach -  plakat", category="Praca na lekcji", date="2026-10-06"),
+                     text(61, "x" * 400, category=None, date=None)],
+            "behaviour": [behaviour(70, 10.0, comments=["   Dzień w krawacie  "]),
+                          behaviour(71, -5.0, comments=[]),
+                          behaviour(72, None, short_name="bdb", text="")],
+        }
+        children, seen = self.check([lg.Account("Ania", "1234567u", "p")], {"1234567u": {
+            "seen": [], "kinds": ["grades", "point", "text", "behaviour"]}})
+        got = children[0].grades
+        day = date(2026, 11, 6)
+        self.assertIn(lg.Grade("Matematyka", "90/100", "kartkówka", 3.0, "Jan Kowalski", day, "", False, ""), got)
+        self.assertIn(lg.Grade("Matematyka", "0/100", "praca", None, "Jan Kowalski", day, "", False, ""), got)
+        self.assertIn(lg.Grade("Matematyka", "54.5", "", None, "Jan Kowalski", day, "", False, ""), got)
+        self.assertIn(lg.Grade("Język polski", "Praca w grupach - plakat", "Praca na lekcji", None, "Jan Kowalski",
+                               date(2026, 10, 6), "", False, ""), got)
+        long = next(g for g in got if g.value.startswith("xxx"))
+        self.assertLessEqual(len(long.value), 301)
+        self.assertTrue(long.value.endswith("…"))
+        self.assertEqual(long.day, day)  # no lesson date: the day it was added
+        self.assertIn(lg.Grade("", "+10", "", None, "Jan Kowalski", day, "behaviour", False, "Dzień w krawacie"), got)
+        self.assertIn(lg.Grade("", "-5", "", None, "Jan Kowalski", day, "behaviour", False, ""), got)
+        self.assertIn(lg.Grade("", "bdb", "", None, "Jan Kowalski", day, "behaviour", False, ""), got)
+        self.assertEqual(len(got), 8)
+        self.assertEqual(seen["1234567u"]["seen"], ["behaviour:70", "behaviour:71", "behaviour:72", "point:50",
+                                                    "point:51", "point:52", "text:60", "text:61"])
+
+    def test_ids_of_different_kinds_do_not_collide(self):
+        self.grades["1234567u"] = [grade(5)]
+        self.extra["1234567u"] = {"point": [point(5)]}
+        children, _ = self.check([lg.Account("Ania", "1234567u", "p")], {"1234567u": {
+            "seen": ["5"], "kinds": ["grades", "point", "text", "behaviour"]}})
+        self.assertEqual([g.value for g in children[0].grades], ["90/100"])
+
+    def test_new_kinds_are_seeded_on_their_own_for_an_existing_account(self):
+        # state from the first version: only ordinary grades, no "kinds"
+        self.grades["1234567u"] = [grade(1), grade(2)]
+        self.extra["1234567u"] = {"point": [point(50), point(51)], "text": [text(60, "+++")],
+                                  "behaviour": [behaviour(70, 5.0)]}
+        children, seen = self.check([lg.Account("Ania", "1234567u", "p")], {"1234567u": {"seen": ["1"]}})
+        self.assertEqual([g.value for g in children[0].grades], ["5"])  # the new ordinary one is still shown
+        self.assertEqual(children[0].seeded, 4)  # the other kinds were only remembered
+        self.assertEqual(seen["1234567u"], {"seen": ["1", "2", "behaviour:70", "point:50", "point:51", "text:60"],
+                                            "kinds": ["behaviour", "grades", "point", "text"]})
 
 
 class OpenAccountTest(unittest.TestCase):

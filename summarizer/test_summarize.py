@@ -826,6 +826,23 @@ class LibrusGradesRenderTest(unittest.TestCase):
         self.assertIn("- Matematyka: 5 (ocena roczna, sprawdzian, waga 0,5) – Jan Kowalski, 06.11", text)
         self.assertIn("- (przedmiot nieznany): 5\n", text + "\n")
 
+    def test_behaviour_points_and_a_first_check_note_next_to_new_grades(self):
+        text = summarize.build_digest([], 24, lang="Polish", grades=[self.child([
+            self.grade(subject="", value="+10", category="", weight=None, kind="behaviour", comment="Dzień w krawacie"),
+            self.grade(value="90/100", category="kartkówka"),
+        ], seeded=4)])
+        self.assertIn("*Nowe oceny – Ania*\n"
+                      "- Zachowanie: +10 – Jan Kowalski, 06.11 – „Dzień w krawacie”\n"
+                      "- Matematyka: 90/100 (kartkówka, waga 3) – Jan Kowalski, 06.11\n"
+                      "Pierwsze sprawdzenie: pominięto dotychczasowe oceny (4)", text)
+        html = summarize.build_html_digest([], 24, "07.11.2026", lang="Polish", grades=[self.child(
+            [self.grade(kind="behaviour", subject="", value="-5")], seeded=2)])
+        self.assertIn("Zachowanie: -5", html)
+        self.assertIn("pominięto dotychczasowe oceny (2)", html)
+        english = summarize.build_digest([], 24, lang="English", grades=[self.child(
+            [self.grade(kind="behaviour", subject="", value="+5", weight=None, category="")])])
+        self.assertIn("- Behaviour: +5 – Jan Kowalski", english)
+
     def test_english_labels(self):
         text = summarize.build_digest([], 24, lang="English", grades=[self.child([self.grade(weight=1.5)])])
         self.assertIn("*New grades – Ania*\n- Matematyka: 5 (sprawdzian, weight 1.5) – Jan Kowalski, 06.11", text)
@@ -1877,7 +1894,7 @@ class MainTest(unittest.TestCase):
         with open(self.state_path) as f:
             state = json.load(f)
         self.assertEqual(state["1111111u"]["seen"], ["1", "2"])
-        self.assertEqual(set(state["1111111u"]), {"seen", "session"})  # no password stored
+        self.assertEqual(set(state["1111111u"]), {"seen", "kinds", "session"})  # no password stored
 
     def test_printed_only_run_does_not_use_up_new_grades(self):
         import os
