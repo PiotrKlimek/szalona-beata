@@ -1987,5 +1987,191 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+class PromptRulesTest(unittest.TestCase):
+    """Rules added after reviewing real digests (invented questions, garbled OCR, changed meaning)."""
+
+    def prompt(self):
+        return summarize.THREADS_PROMPT.format(language="Polish", question="Pytanie")
+
+    def test_only_questions_asked_in_the_chat_and_left_unanswered(self):
+        text = self.prompt()
+        self.assertIn("Never add questions of your own", text)
+        self.assertIn("if anyone replied, write the answer as a fact instead", text)
+        self.assertIn("A reply that is only a guess stays hedged", text)
+        self.assertIn("'Pytanie:' point must repeat a question that a message in the chat actually asks", text)
+
+    def test_points_are_optional_not_a_quota(self):
+        self.assertIn("up to 4 concise points", self.prompt())
+        self.assertNotIn("1-4", self.prompt())
+
+    def test_keeps_who_did_what_and_tense(self):
+        self.assertIn("who did what to whom", self.prompt())
+
+    def test_no_added_years_or_expanded_abbreviations(self):
+        self.assertIn("don't add a year nobody wrote and don't expand abbreviations", self.prompt())
+
+    def test_one_message_is_not_a_thread_per_sentence(self):
+        self.assertIn("don't make a thread for every sentence of one message", self.prompt())
+
+    def test_unreadable_ocr_text_is_skipped(self):
+        for prompt in (summarize.SYSTEM_PROMPT, summarize.THREADS_PROMPT):
+            self.assertIn("skip it entirely", prompt.format(language="Polish", question="Pytanie"))
+
+
+class ParseIdsTest(unittest.TestCase):
+    def test_single_ids_and_ranges(self):
+        self.assertEqual(summarize.parse_ids("25, 30-32,7"), [25, 30, 31, 32, 7])
+
+    def test_rejects_more_than_the_limit(self):
+        self.assertEqual(len(summarize.parse_ids("1-1000")), 1000)
+        for bad in ("1-1001", "1-1000000000", "1-999,2000-2001"):
+            with self.assertRaises(ValueError, msg=bad):
+                summarize.parse_ids(bad)
+
+    def test_rejects_garbage(self):
+        for bad in ("", "a", "3-1", "1-", "1,,2"):
+            with self.assertRaises(ValueError, msg=bad):
+                summarize.parse_ids(bad)
+
+
+class ReplayTest(unittest.TestCase):
+    """--replay: stored transcripts with the current prompt, old vs new response, nothing emailed or logged."""
+
+    def setUp(self):
+        import os
+        import shutil
+        import tempfile
+        from unittest import mock
+
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.log_path = os.path.join(self.dir, "llm_log.db")
+        log = summarize.CallLog(self.log_path)
+        old = {"provider": "openai", "model": "m", "language": "Polish", "system_prompt": "old prompt",
+               "parsed": 1, "total_tokens": 900}
+        log.record({**old, "transcript": "[10:00] Ania: Wycieczka 6.11, koszt 5 zł",
+                    "response": '{"threads": [{"title": "Wycieczka", "points": ["Pytanie: Czy trzeba płacić?"]}]}'},
+                   SCHOOL, "Klasa 3B", T0, synthetic=False)
+        log.record({**old, "transcript": "[11:00] Bartek: Jedziemy?",
+                    "response": '{"threads": []}'}, BIKES, "Rowery", T0 + 60, synthetic=True)
+        log.db.close()
+        self.llm = FakeServer({("POST", "/chat/completions"): (200, {
+            "choices": [{"message": {"content": '{"threads": [{"title": "Wycieczka", "points": ["Koszt 5 zł"]}]}'}}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
+        })})
+        self.addCleanup(self.llm.close)
+        env = mock.patch.dict(os.environ, {"LLM_API_KEY": "k", "LLM_BASE_URL": self.llm.url, "LLM_LOG_DB": "",
+                                           "SUMMARY_LANGUAGE": "English", "EMAIL_TO": "piko@example.com"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def run_main(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        # --db does not exist: replay only needs the call log (llm_log.db next to it)
+        db = self.dir + "/messages.db"
+        with redirect_stdout(out), redirect_stderr(err):
+            code = summarize.main(["--db", db, "--tz", "UTC", *args], now=T0 + 3600)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_prints_old_and_new_response_for_each_id(self):
+        code, out, _ = self.run_main("--model", "openai", "--allow-real-data", "--replay", "1-2")
+
+        self.assertEqual(code, 0)
+        self.assertIn("#1 2025-10-23 10:00 Klasa 3B", out)
+        self.assertIn("before (900 tokens)", out)
+        self.assertIn("- Pytanie: Czy trzeba płacić?", out)
+        self.assertIn("after (60 tokens)", out)
+        self.assertIn("- Koszt 5 zł", out)
+        self.assertIn("#2 2025-10-23 10:01 Rowery", out)
+        self.assertIn("Replayed 2 calls: 1800 tokens before, 120 after.", out)
+
+    def test_sends_stored_transcript_with_current_prompt_in_stored_language(self):
+        self.run_main("--model", "openai", "--allow-real-data", "--replay", "1")
+
+        (_, _, body), = self.llm.requests
+        self.assertEqual(body["messages"][1]["content"], "[10:00] Ania: Wycieczka 6.11, koszt 5 zł")
+        system = body["messages"][0]["content"]
+        self.assertIn("Polish", system)
+        self.assertEqual(system, summarize.THREADS_PROMPT.format(language="Polish", question="Pytanie"))
+
+    def test_nothing_is_logged_or_emailed(self):
+        self.run_main("--model", "openai", "--allow-real-data", "--replay", "1-2")
+
+        count, = sqlite3.connect(self.log_path).execute("SELECT COUNT(*) FROM llm_calls").fetchone()
+        self.assertEqual(count, 2)  # SMTP is not configured: an email attempt would have failed the run
+
+    def test_unknown_id_is_reported_and_the_rest_replayed(self):
+        code, out, err = self.run_main("--model", "openai", "--allow-real-data", "--replay", "1,99")
+
+        self.assertEqual(code, 0)
+        self.assertIn("#1 ", out)
+        self.assertIn("no call #99", err)
+
+    def test_unexpected_reply_fails_one_call_and_the_rest_continue(self):
+        self.llm.responses[("POST", "/chat/completions")] = [
+            (200, {"unexpected": True}),
+            (200, {"choices": [{"message": {"content": '{"threads": []}'}}],
+                   "usage": {"total_tokens": 7}}),
+        ]
+        code, out, _ = self.run_main("--model", "openai", "--allow-real-data", "--replay", "1-2")
+
+        self.assertEqual(code, 0)
+        self.assertIn("--- after: failed:", out)
+        self.assertIn("#2 ", out)
+        self.assertIn("Replayed 1 calls", out)
+
+    def test_failed_original_call_is_shown_as_failed(self):
+        log = summarize.CallLog(self.log_path)
+        log.record({"language": "Polish", "transcript": "x", "response": None, "error": "429 rate limited"},
+                   SCHOOL, "Klasa 3B", T0, synthetic=True)
+        log.db.close()
+
+        _, out, _ = self.run_main("--model", "openai", "--replay", "3")
+
+        self.assertIn("--- before: failed: 429 rate limited", out)
+
+    def test_broken_log_file_is_a_clean_error(self):
+        with open(self.log_path, "w") as f:
+            f.write("not a database")
+
+        code, _, err = self.run_main("--model", "openai", "--allow-real-data", "--replay", "1")
+
+        self.assertEqual(code, 2)
+        self.assertIn("error: cannot read", err)
+
+    def test_disabled_log_is_a_clear_error(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"LLM_LOG_DB": "off"}):
+            code, _, err = self.run_main("--model", "openai", "--allow-real-data", "--replay", "1")
+
+        self.assertEqual(code, 2)
+        self.assertIn("LLM_LOG_DB=off", err)
+
+    def test_real_chats_need_allow_real_data(self):
+        code, out, err = self.run_main("--model", "openai", "--replay", "1-2")
+
+        self.assertEqual(code, 2)
+        self.assertIn("--allow-real-data", err)
+        self.assertEqual(self.llm.requests, [])
+
+    def test_synthetic_rows_replay_without_consent(self):
+        code, out, _ = self.run_main("--model", "openai", "--replay", "2")
+
+        self.assertEqual(code, 0)
+        self.assertIn("#2 ", out)
+
+    def test_needs_openai_model(self):
+        code, _, err = self.run_main("--replay", "1", "--model", "dummy")
+
+        self.assertEqual(code, 2)
+        self.assertIn("--model openai", err)
+
+    def test_bad_ids_are_an_error(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.run_main("--model", "openai", "--replay", "x")
+
+
 if __name__ == "__main__":
     unittest.main()

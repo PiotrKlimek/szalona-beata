@@ -32,7 +32,9 @@ import librus_grades  # noqa: E402
 OCR_TAG = "[text in image]"
 OCR_NOTE = (
     f"Text after '{OCR_TAG}' was read from a photo by OCR: treat it as part of that message "
-    "(e.g. a timetable or a notice someone photographed) and ignore garbled fragments."
+    "(e.g. a timetable or a notice someone photographed) and ignore garbled fragments; "
+    "if the recognized text is not a readable notice or sentence (e.g. scattered words from a photo of "
+    "a notebook or a poster), skip it entirely: never quote it and never guess what it means."
 )
 # The bridge appends the transcript of a voice message after this tag; see bridge/voice.go.
 VOICE_TAG = "[voice transcript]"
@@ -58,12 +60,21 @@ THREADS_PROMPT = (
     "You summarize WhatsApp group chats. Messages about different topics are often interleaved; "
     "split the chat into separate threads, one per topic (e.g. homework, a lost item, a trip), "
     "and put every message on that topic into its thread. For each thread write a short title "
-    "(max 6 words) and 1-4 concise points with decisions, dates, amounts and open questions. "
+    "(max 6 words) and up to 4 concise points with decisions, dates, amounts and open questions; "
+    "fewer points are fine when there is little to say. "
     "Messages about the same thing (e.g. a link and the text it points to) form one thread - "
-    "never split one topic into several threads. "
-    "Write unanswered questions as questions, never as decisions or facts, "
-    "always prefixed exactly like this: '{question}: ...'. "
-    "Skip greetings and thanks-only chatter. Do not invent anything that is not in the chat. "
+    "never split one topic into several threads, and don't make a thread for every sentence of one message. "
+    "A question someone asked in the chat that nobody answered is written as a question, "
+    "never as a decision or fact, always prefixed exactly like this: '{question}: ...'; "
+    "if anyone replied, write the answer as a fact instead. A reply that is only a guess stays "
+    "hedged (e.g. 'probably ...'). "
+    "Never add questions of your own: a '{question}:' point must repeat a question that a message "
+    "in the chat actually asks; an announcement, request or reminder is not a question. "
+    "Skip greetings and thanks-only chatter. Do not invent anything that is not in the chat, "
+    "and keep who did what to whom and when as written (e.g. 'X paid' is not 'X was paid', "
+    "'will send details' is not 'sent details'); when it is unclear, keep the chat's wording. "
+    "Copy dates, names and abbreviations as written: don't add a year nobody wrote and don't expand "
+    "abbreviations. "
     + OCR_NOTE + " " + VOICE_NOTE + " "
     "Write titles and points in {language}. Respond with JSON only: "
     '{{"threads": [{{"title": "...", "points": ["...", "..."]}}]}}'
@@ -845,6 +856,70 @@ class CallLog:
         self.db.commit()
 
 
+MAX_REPLAY_IDS = 1000
+
+
+def parse_ids(spec):
+    """'25,30-32' -> [25, 30, 31, 32]; ValueError on anything else or more than MAX_REPLAY_IDS ids."""
+    ids = []
+    for part in spec.split(","):
+        m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", part)
+        if not m:
+            raise ValueError(f"bad call id {part.strip()!r} (use e.g. 25,30-32)")
+        first, last = int(m.group(1)), int(m.group(2) or m.group(1))
+        if last < first:
+            raise ValueError(f"bad range {part.strip()!r}")
+        if len(ids) + last - first + 1 > MAX_REPLAY_IDS:
+            raise ValueError(f"at most {MAX_REPLAY_IDS} calls per replay")
+        ids.extend(range(first, last + 1))
+    return ids
+
+
+def replay(log_path, ids, llm, tz, allow_real_data, out=None):
+    """Run stored transcripts through the current prompt; print the stored and the new response.
+
+    Nothing is logged or sent. Returns an exit code."""
+    out = out or sys.stdout
+    try:
+        db = sqlite3.connect(f"file:{log_path}?mode=ro", uri=True)
+        rows = {r[0]: r for r in db.execute(
+            f"SELECT id, ts, group_name, language, transcript, response, total_tokens, synthetic, error "
+            f"FROM llm_calls WHERE id IN ({', '.join('?' * len(ids))})", ids)}
+    except sqlite3.Error as e:
+        print(f"error: cannot read {log_path}: {e}", file=sys.stderr)
+        return 2
+    for missing in (i for i in ids if i not in rows):
+        print(f"warning: no call #{missing} in {log_path}", file=sys.stderr)
+    if not allow_real_data and any(not r[7] for r in rows.values()):
+        print("error: refusing to send real chats to an external API; pass --allow-real-data", file=sys.stderr)
+        return 2
+    before = done = 0
+    for i in ids:
+        if i not in rows:
+            continue
+        _, ts, group, language, transcript, response, tokens, _, error = rows[i]
+        when = datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
+        print(f"=== #{i} {when} {group}", file=out)
+        if response is None:
+            print(f"--- before: failed: {error}", file=out)
+        else:
+            print(f"--- before ({tokens or 0} tokens)", file=out)
+            print(_summary_text(parse_threads(response), language), file=out)
+        used = llm.usage["total_tokens"]
+        try:
+            new = llm.summarize(transcript, language)
+        except Exception as e:  # one bad reply must not end the whole replay
+            print(f"--- after: failed: {e!r}", file=out, flush=True)
+            continue
+        print(f"--- after ({llm.usage['total_tokens'] - used} tokens)", file=out)
+        print(_summary_text(new, language) + "\n", file=out, flush=True)
+        before += tokens or 0
+        done += 1
+    after = llm.usage["total_tokens"]
+    print(f"Replayed {done} calls: {before} tokens before, {after} after.", file=out)
+    return 0
+
+
 def check_bridge(bridge_url):
     """None if the bridge is linked and connected, else 'logged_out', 'disconnected' or 'unreachable'."""
     try:
@@ -911,6 +986,13 @@ def _local_tz(name):
         return timezone.utc
 
 
+def _ids_arg(spec):
+    try:
+        return parse_ids(spec)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def parse_args(argv):
     def env(key, default=None):
         return os.environ.get(key) or default  # empty counts as unset
@@ -932,6 +1014,9 @@ def parse_args(argv):
     p.add_argument("--email-title", default=env("EMAIL_TITLE"), help="heading at the top of the email")
     p.add_argument("--email-subject", default=env("EMAIL_SUBJECT", "WhatsApp digest {date}: {groups}"),
                    help="subject template with {date}, {hours} and {groups}")
+    p.add_argument("--replay", type=_ids_arg, metavar="IDS",
+                   help="re-run logged LLM calls (ids from llm_log.db, e.g. 25,30-32) with the current prompt "
+                        "and print old vs new; nothing is emailed or logged")
     p.add_argument("--html-out", help="also write the HTML email to this file (preview without sending)")
     p.add_argument("--ollama-url", default=env("OLLAMA_URL", "http://ollama:11434"))
     # 0.5B models make things up; 3B is the smallest that gives usable summaries (~2.5 GB RAM)
@@ -1068,6 +1153,18 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
 def main(argv=None, now=None):
     args = parse_args(argv)
     tz = _local_tz(args.tz)
+    if args.replay:
+        if args.model != "openai" or not args.llm_api_key:
+            print("error: --replay needs --model openai and LLM_API_KEY", file=sys.stderr)
+            return 2
+        if not args.llm_log:
+            print("error: --replay reads the LLM call log, which is disabled (LLM_LOG_DB=off)", file=sys.stderr)
+            return 2
+        if not os.path.exists(args.llm_log):
+            print(f"error: no LLM call log at {args.llm_log} (LLM_LOG_DB)", file=sys.stderr)
+            return 2
+        llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)
+        return replay(args.llm_log, args.replay, llm, tz, args.allow_real_data)
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
 
     if args.list_groups:
