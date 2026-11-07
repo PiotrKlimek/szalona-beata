@@ -294,12 +294,35 @@ Set `LLM_LOG_DB=off` to disable it, or a path to move it. `--model ollama` is no
 docker compose run --rm --entrypoint python summarizer -c "
 import sqlite3
 db = sqlite3.connect('/data/llm_log.db')
-for row in db.execute('SELECT datetime(ts, \'unixepoch\'), group_name, model, reasoning_effort, parsed, total_tokens, error FROM llm_calls ORDER BY id DESC LIMIT 10'):
+for row in db.execute('SELECT id, datetime(ts, \'unixepoch\'), group_name, model, reasoning_effort, parsed, total_tokens, error FROM llm_calls ORDER BY id DESC LIMIT 10'):
     print(row)"
 ```
 
-To compare prompt versions, take stored transcripts (`SELECT transcript FROM llm_calls WHERE id = ?`), run
-them with the changed prompt, and compare the outputs with the stored `response`.
+To compare prompt versions, change the prompt, rebuild the image and replay stored calls by `id` (from the
+query above). Each transcript is sent again with the current prompt,
+model and `LLM_REASONING_EFFORT`, in the language it was logged with, and the stored response is printed next
+to the new one. Nothing is emailed or posted and the replay is not logged. Real chats need
+`--allow-real-data`, as in a normal run:
+
+```sh
+docker compose build summarizer
+docker compose run --rm summarizer --model openai --allow-real-data --replay 25,30-35
+```
+
+```
+=== #25 2026-10-27 19:00 Klasa 3B
+--- before (1926 tokens)
+▸ Wyjście do muzeum
+- Pytanie: Czy rodzice mają przynieść 5 zł?
+--- after (1852 tokens)
+▸ Wyjście do muzeum
+- Koszt: 5 zł od ucznia
+...
+Replayed 6 calls: 9800 tokens before, 10400 after.
+```
+
+Each call takes about 1-3k tokens; on Groq's free plan (8k tokens/min) a longer replay waits for the rate
+limit now and then and carries on.
 
 ## 6. Daily schedule
 
@@ -608,9 +631,11 @@ school class groups since October 2026.
 
 Next steps:
 
-- [ ] **Prompt quality.** The model occasionally adds details that aren't in the chat (e.g. a year nobody
-      wrote) or labels a plan as a "decision". Tighten the prompt and compare on the same transcripts
-      using the [call log](#55-call-log-for-prompt-tuning). A `--replay` command for this would help.
+- [x] **Prompt quality.** Reviewed two weeks of real digests (November 2026): the model added questions
+      nobody asked, kept answered questions as open, quoted garbled OCR and occasionally changed who did
+      what. The prompt now forbids each of these; checked with `--replay` on the same transcripts.
+      Known leftovers: OCR text from photos of notebooks can still become a vague point, and roles in
+      very short messages (e.g. "X paid") are sometimes misread.
 
 ## Development
 
