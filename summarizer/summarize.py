@@ -82,6 +82,22 @@ THREADS_PROMPT = (
 
 NOTHING_NOTABLE = "No notable topics."
 
+
+def important_senders_note(names):
+    """Prompt rule for IMPORTANT_SENDERS (e.g. a teacher): nothing they send is skipped."""
+    if not names:
+        return ""
+    quoted = ", ".join(f"'{n}'" for n in names)
+    return (
+        f"Messages from these senders are always important (e.g. a teacher's homework or notices): {quoted}. "
+        "Never skip any of their messages, even an attachment without any text (e.g. '[document] file.pdf' "
+        "or a photo): give it a thread or a point saying who sent what, with the file name as written."
+    )
+
+
+def _with_note(prompt, note):
+    return f"{prompt} {note}" if note else prompt
+
 # Label for unanswered questions; models copy an English example word, so give it in the target language.
 QUESTION_LABEL = {"polish": "Pytanie", "english": "Question", "german": "Frage"}
 
@@ -711,9 +727,10 @@ def _raise_http_error(method, url, e):
 
 
 class Ollama:
-    def __init__(self, base_url, model):
+    def __init__(self, base_url, model, important_senders=()):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.note = important_senders_note(important_senders)
 
     def ensure_model(self):
         tags = _request("GET", f"{self.base_url}/api/tags")
@@ -728,7 +745,7 @@ class Ollama:
             "stream": False,
             "options": {"temperature": 0.2, "num_ctx": 8192},
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT.format(language=language)},
+                {"role": "system", "content": _with_note(SYSTEM_PROMPT.format(language=language), self.note)},
                 {"role": "user", "content": transcript},
             ],
         })
@@ -754,16 +771,17 @@ def parse_threads(content):
 class OpenAICompat:
     """Any OpenAI-compatible chat completions API (Groq, Mistral, OpenRouter, Ollama's /v1...)."""
 
-    def __init__(self, base_url, api_key, model, reasoning_effort=None):
+    def __init__(self, base_url, api_key, model, reasoning_effort=None, important_senders=()):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self.note = important_senders_note(important_senders)
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     def summarize(self, transcript, language):
-        system_prompt = THREADS_PROMPT.format(
-            language=language, question=QUESTION_LABEL.get(language.lower(), "Question"))
+        system_prompt = _with_note(THREADS_PROMPT.format(
+            language=language, question=QUESTION_LABEL.get(language.lower(), "Question")), self.note)
         payload = {
             "model": self.model,
             "temperature": 0.2,
@@ -1048,6 +1066,8 @@ def parse_args(argv):
     effort = env("LLM_REASONING_EFFORT", "low")
     args.llm_reasoning_effort = None if effort == "off" else effort
     args.email_to = [a.strip() for a in args.email_to.split(",") if a.strip()]
+    # sender names exactly as the digest shows them, e.g. a teacher whose bare attachments must not be skipped
+    args.important_senders = [n.strip() for n in env("IMPORTANT_SENDERS", "").split(",") if n.strip()]
     if not args.group:
         groups_env = env("DIGEST_GROUPS") or env("WATCH_GROUPS", "")
         args.group = [g.strip() for g in groups_env.split(",") if g.strip()]
@@ -1163,7 +1183,8 @@ def main(argv=None, now=None):
         if not os.path.exists(args.llm_log):
             print(f"error: no LLM call log at {args.llm_log} (LLM_LOG_DB)", file=sys.stderr)
             return 2
-        llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)
+        llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort,
+                           args.important_senders)
         return replay(args.llm_log, args.replay, llm, tz, args.allow_real_data)
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
 
@@ -1209,10 +1230,11 @@ def main(argv=None, now=None):
 
     llm = None
     if args.model == "ollama":
-        llm = Ollama(args.ollama_url, args.ollama_model)
+        llm = Ollama(args.ollama_url, args.ollama_model, args.important_senders)
         llm.ensure_model()
     elif args.model == "openai":
-        llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)
+        llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort,
+                           args.important_senders)
     call_log = CallLog(args.llm_log, args.retention_days, now) if llm and args.llm_log else None
 
     def purge_unused_log(at):

@@ -19,6 +19,7 @@ x-summarizer-env: &summarizer-env
   LLM_MODEL: ${LLM_MODEL:-}
   LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
   LLM_LOG_DB: ${LLM_LOG_DB:-}
+  IMPORTANT_SENDERS: ${IMPORTANT_SENDERS:-}  # names whose every message (even a bare attachment) is kept
   RETENTION_DAYS: ${RETENTION_DAYS:-}
   SUBSTITUTIONS_URL: ${SUBSTITUTIONS_URL:-}
   SUBSTITUTIONS_CLASS: ${SUBSTITUTIONS_CLASS:-}
