@@ -1,6 +1,10 @@
 package main
 
-import "go.mau.fi/whatsmeow/proto/waE2E"
+import (
+	"strings"
+
+	"go.mau.fi/whatsmeow/proto/waE2E"
+)
 
 // extractText returns the message text, or a short placeholder for media.
 // Messages without summarizable content (reactions, protocol messages) yield "".
@@ -19,7 +23,12 @@ func extractText(m *waE2E.Message) string {
 	case m.GetAudioMessage() != nil:
 		return "[voice note]"
 	case m.GetDocumentMessage() != nil:
-		return withCaption("[document]", m.GetDocumentMessage().GetFileName())
+		d := m.GetDocumentMessage()
+		name := d.GetFileName()
+		if c := d.GetCaption(); c != "" {
+			name = strings.TrimPrefix(name+": "+c, ": ")
+		}
+		return withCaption("[document]", name)
 	case m.GetStickerMessage() != nil:
 		return "[sticker]"
 	case m.GetLocationMessage() != nil:

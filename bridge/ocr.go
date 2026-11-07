@@ -160,7 +160,7 @@ func runOCRCommand(paths []string, langs string) error {
 			return err
 		}
 		start := time.Now()
-		if bytes.HasPrefix(data, []byte("%PDF")) {
+		if looksLikePDF(data) {
 			printPDFResult(f, data, langs)
 			continue
 		}

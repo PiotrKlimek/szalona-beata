@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"image/color"
 	"image/jpeg"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -142,6 +144,92 @@ func TestReadPDFTruncatesLongText(t *testing.T) {
 	}
 }
 
+func TestReadPDFScannerWatermarkIsNotText(t *testing.T) {
+	needPoppler(t)
+	// A phone scanner app's footer is the only text layer of a scan: OCR must still run (off here: no text).
+	res, err := readPDF(context.Background(), textPDF("Scanned with CamScanner"), "")
+	if err != nil || res.Text != "" {
+		t.Errorf("readPDF() = %+v, %v; want no text", res, err)
+	}
+}
+
+func TestReadPDFHugePageIsRenderedSmall(t *testing.T) {
+	needPoppler(t)
+	if err := checkTesseract("pol+eng"); err != nil {
+		t.Skip(err)
+	}
+	// 200 inches square: at 200 dpi that would be 40000x40000 pixels (GBs of memory).
+	data := buildPDF(
+		pdfObject{dict: "<< /Type /Catalog /Pages 2 0 R >>"},
+		pdfObject{dict: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"},
+		pdfObject{dict: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 14400 14400] >>"},
+	)
+	start := time.Now()
+	res, err := readPDF(context.Background(), data, "pol+eng")
+	if err != nil || !res.OCR || res.Text != "" || time.Since(start) > 30*time.Second {
+		t.Errorf("readPDF() = %+v, %v in %s; want a quick empty OCR result", res, err, time.Since(start))
+	}
+}
+
+func TestReadPDFShortTextLayerBeatsOCR(t *testing.T) {
+	needPoppler(t)
+	if err := checkTesseract("pol+eng"); err != nil {
+		t.Skip(err)
+	}
+	// Short for one page, so OCR runs, but OCR can only misread what the text layer has exactly.
+	res, err := readPDF(context.Background(), textPDF("Zadanie domowe na piatek:", "podrecznik str. 45, cw. 3 i 4"), "pol+eng")
+	if err != nil || res.OCR || res.Text != "Zadanie domowe na piatek:\npodrecznik str. 45, cw. 3 i 4" {
+		t.Errorf("readPDF() = %+v, %v; want the exact text layer", res, err)
+	}
+}
+
+func TestReadPDFScannerWatermarkReadByOCRIsDropped(t *testing.T) {
+	needPoppler(t)
+	if err := checkTesseract("pol+eng"); err != nil {
+		t.Skip(err)
+	}
+	res, err := readPDF(context.Background(), scanPDF(t, []string{"Scanned with CamScanner"}), "pol+eng")
+	if err != nil || res.Text != "" {
+		t.Errorf("readPDF() = %+v, %v; want no text", res, err)
+	}
+}
+
+func TestLooksLikePDF(t *testing.T) {
+	for in, want := range map[string]bool{
+		"%PDF-1.4\n":                           true,
+		strings.Repeat("x", 500) + "%PDF-1.7":  true, // junk before the header is allowed
+		strings.Repeat("x", 1100) + "%PDF-1.7": false,
+		"<html>":                               false,
+	} {
+		if got := looksLikePDF([]byte(in)); got != want {
+			t.Errorf("looksLikePDF(%.20q...) = %v; want %v", in, got, want)
+		}
+	}
+}
+
+func TestRunToolCapsOutput(t *testing.T) {
+	out, err := runTool(context.Background(), "sh", "-c", "head -c 3000000 /dev/zero | tr '\\0' a")
+	if err != nil || len(out) != pdfMaxToolOutput {
+		t.Errorf("runTool() = %d bytes, %v; want %d", len(out), err, pdfMaxToolOutput)
+	}
+	_, err = runTool(context.Background(), "sh", "-c", "head -c 100000 /dev/zero | tr '\\0' e >&2; exit 1")
+	if err == nil || len(err.Error()) > 600 {
+		t.Errorf("runTool() error = %d bytes; want a short error", len(fmt.Sprint(err)))
+	}
+}
+
+func TestRemoveStalePDFDirs(t *testing.T) {
+	base := t.TempDir()
+	os.Mkdir(filepath.Join(base, pdfTempPrefix+"123"), 0o700)
+	os.Mkdir(filepath.Join(base, "other"), 0o700)
+
+	removeStalePDFDirs(base)
+
+	if entries, _ := os.ReadDir(base); len(entries) != 1 || entries[0].Name() != "other" {
+		t.Errorf("left %v; want only other", entries)
+	}
+}
+
 func TestReadPDFRejectsNonPDFs(t *testing.T) {
 	// No poppler needed: checked before anything runs.
 	if _, err := readPDF(context.Background(), []byte("<html>not a pdf</html>"), ""); err == nil {
@@ -163,7 +251,8 @@ func TestQueuesPDFDocumentsOnly(t *testing.T) {
 		want bool
 	}{
 		{"pdf by mimetype", &waE2E.DocumentMessage{Mimetype: proto.String("application/pdf"), FileLength: proto.Uint64(200_000)}, true},
-		{"pdf by name", &waE2E.DocumentMessage{FileName: proto.String("Zadanie.PDF")}, true},
+		{"pdf by name", &waE2E.DocumentMessage{FileName: proto.String("Zadanie.PDF"), FileLength: proto.Uint64(1000)}, true},
+		{"size unknown", &waE2E.DocumentMessage{Mimetype: proto.String("application/pdf")}, false},
 		{"word document", &waE2E.DocumentMessage{Mimetype: proto.String("application/msword"), FileName: proto.String("a.doc")}, false},
 		{"too big", &waE2E.DocumentMessage{Mimetype: proto.String("application/pdf"), FileLength: proto.Uint64(pdfMaxBytes + 1)}, false},
 	}
@@ -196,10 +285,14 @@ func TestPDFWorkerAppendsDocumentText(t *testing.T) {
 }
 
 func TestPopplerToolsAreChecked(t *testing.T) {
-	_, err1 := exec.LookPath("pdftotext")
-	_, err2 := exec.LookPath("pdftoppm")
-	if (err1 == nil && err2 == nil) != (checkPoppler() == nil) {
-		t.Errorf("checkPoppler() = %v; tools found: pdftotext %v, pdftoppm %v", checkPoppler(), err1 == nil, err2 == nil)
+	all := true
+	for _, tool := range []string{"pdftotext", "pdftoppm", "pdfinfo"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			all = false
+		}
+	}
+	if all != (checkPoppler() == nil) {
+		t.Errorf("checkPoppler() = %v; all tools found: %v", checkPoppler(), all)
 	}
 }
 
@@ -213,5 +306,21 @@ func TestPDFEnabled(t *testing.T) {
 	t.Setenv("PDF_TEXT", "yes")
 	if _, err := pdfEnabled(); err == nil {
 		t.Error("PDF_TEXT=yes accepted; want an error")
+	}
+}
+
+func TestPDFRenderDPI(t *testing.T) {
+	needPoppler(t)
+	dir := t.TempDir()
+	for size, want := range map[string]int{"595 842": 200, "14400 14400": 12} {
+		file := filepath.Join(dir, "p.pdf")
+		os.WriteFile(file, buildPDF(
+			pdfObject{dict: "<< /Type /Catalog /Pages 2 0 R >>"},
+			pdfObject{dict: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"},
+			pdfObject{dict: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + size + "] >>"},
+		), 0o600)
+		if got, err := pdfRenderDPI(context.Background(), file); err != nil || got != want {
+			t.Errorf("page %s pt: pdfRenderDPI() = %d, %v; want %d", size, got, err, want)
+		}
 	}
 }

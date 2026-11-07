@@ -415,10 +415,14 @@ posted in a watched group (up to 20 MB) and adds its text to the message, so the
 Zadanie domowe na piątek: podręcznik str. 45, ćw. 3 i 4
 ```
 
-- The text layer of the first 10 pages is read with `pdftotext` (poppler). A PDF with no text layer (a scan
-  from a phone scanner app) has its first 3 pages rendered and read by Tesseract, like photos (`OCR_LANGS`;
-  with `OCR_LANGS=off` scans add nothing). OCR takes ~10–30 s per page on a small server.
+- The text layer of the first 10 pages is read with `pdftotext` (poppler). A PDF with little or no text layer
+  (a scan from a phone scanner app) has its first 3 pages rendered and read by Tesseract, like photos
+  (`OCR_LANGS`; with `OCR_LANGS=off` scans add nothing); the text layer is kept unless OCR finds at least
+  twice as much. Scanner app footers ("Scanned with CamScanner") are dropped. OCR takes ~1–30 s per page.
+- Safeguards against crafted files: the declared size must be known and at most 20 MB, pages are rendered at
+  most 2,500 px on the long side, poppler runs with a 1 GB memory limit and 5-minute timeout.
 - The text of one document is capped at 3,000 characters. Other documents (Word, Excel...) are not read.
+  A caption sent with the file is shown after its name: `[document] Zadanie.pdf: Na piątek`.
 - Everything happens on your server; nothing is sent anywhere. `PDF_TEXT=off` turns it off.
 - The email says so under the group's name ("📄 Uwzględniono tekst z dokumentów PDF (możliwe błędy odczytu):
   1 dokument.").

@@ -29,6 +29,9 @@ func TestExtractText(t *testing.T) {
 		{"document uses file name", &waE2E.Message{
 			DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String("invoice.pdf")},
 		}, "[document] invoice.pdf"},
+		{"document with a caption", &waE2E.Message{
+			DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String("zadanie.pdf"), Caption: proto.String("Na piątek")},
+		}, "[document] zadanie.pdf: Na piątek"},
 		{"sticker", &waE2E.Message{StickerMessage: &waE2E.StickerMessage{}}, "[sticker]"},
 		{"location", &waE2E.Message{LocationMessage: &waE2E.LocationMessage{}}, "[location]"},
 		{"poll", &waE2E.Message{

@@ -188,9 +188,11 @@ func (b *bridge) newPDF() *mediaWorker {
 		b.clearQueue(pdfQueue, "Reading PDFs is off")
 		return nil
 	}
+	removeStalePDFDirs(os.TempDir())
 	langs := ocrLangs()
 	if langs != "" {
 		if err := checkTesseract(langs); err != nil {
+			b.log.Errorf("Scanned PDFs can't be read: %v", err)
 			langs = ""
 		}
 	}
