@@ -480,13 +480,17 @@ LIBRUS_ACCOUNTS=Ania:1234567u:password;Jaś:7654321u:password
   it is valid. If the file is damaged, the log says so and every account starts over with a first check.
 - Shown: ordinary grades with semester/final grades and their proposals, point grades (`90/100`), free-text grades
   (shortened to 300 characters) and behaviour points (`Zachowanie: +10`, with the teacher's comment). Descriptive
-  grades are not. Each kind gets its own first check, so a kind added in a later version doesn't report a year of
-  old grades either.
+  grades are not; classic-scale behaviour grades show as `bdb`. Each kind gets its own first check, so a kind
+  added in a later version doesn't report a year of old grades either. A kind that has nothing yet (or that Librus
+  refuses for the school) is only remembered once it has grades, so its first grade may go into that note instead
+  of the list.
 - It uses [librus-synergia](https://pypi.org/project/librus-synergia/), an **unofficial** client of Librus's
   private API: it can stop working when Librus changes something, and it may be against Librus's terms of service.
   It makes a few requests per child once a day. Grades go only to your email; no chat data is sent to Librus.
 - If an account can't be checked (wrong password, Librus down), its section says so, the grades stay new for the
   next digest, and the rest of the digest is sent as usual.
+  If only point, text or behaviour grades can't be fetched, the ordinary ones are still shown, the log has a
+  warning, and that kind is tried again next time.
 - Check without emailing: `docker compose run --rm -e EMAIL_TO= summarizer --hours 1`.
 
 ## Local models (Ollama)

@@ -41,6 +41,8 @@ class ChildGrades(NamedTuple):
     grades: list        # [Grade] new since the last delivered digest
     error: object = None  # str if they could not be fetched
     seeded: int = 0     # > 0 on the first check: how many existing grades were only remembered
+    first: bool = True  # False: `seeded` are only new kinds of grades of a child checked before
+    skipped: tuple = ()  # "kind: error" for kinds that could not be fetched this time (retried next time)
 
 
 def parse_accounts(value):
@@ -203,9 +205,15 @@ def _grade(kind, g, subjects, categories, teachers):
     if kind == "text":
         return Grade(subject, _shorten(g.value), g.category or "", None, teacher, _day(g.date) or day, "", False, "")
     if kind == "behaviour":
-        if g.value is not None:
-            value, comment = f"{g.value:+g}", _comments([*(g.comments or []), g.text])
-        else:  # a formal behaviour grade ("bdb")
+        if getattr(g, "grade_id", None) is not None:  # classic scale ("bdb"), may come with no short name
+            value, comment = getattr(g, "display", "") or g.short_name or g.text, _comments(g.comments)
+        elif g.value is not None:  # points; the library passes Value through unconverted
+            try:
+                value = f"{float(g.value):+g}"
+            except (TypeError, ValueError):
+                value = str(g.value)
+            comment = _comments([*(g.comments or []), g.text])
+        else:
             value, comment = g.short_name or g.text, _comments(g.comments)
         return Grade("", value, "", None, teacher, day, "behaviour", False, comment)
     cat = _lookup(categories, g.category_id)
@@ -224,15 +232,27 @@ async def _check(account, entry):
                 known = set(entry.get("seen") or ())
                 # a file from the first version has "seen" for ordinary grades only
                 kinds = set(entry.get("kinds") or (["grades"] if "seen" in entry else []))
-                seen, new, seeded = set(known), [], 0
+                first = "seen" not in entry
+                seen, new, seeded, skipped, done = set(known), [], 0, [], set()
                 for kind, method, prefix in KINDS:
-                    ids = {}
-                    for g in await getattr(librus, method)():
-                        ids[prefix + str(g.id)] = g
+                    try:
+                        ids = {prefix + str(g.id): g for g in await getattr(librus, method)()}
+                    except Exception as e:
+                        if kind == "grades":  # without the ordinary grades there is no section
+                            raise
+                        # the other kinds are extras: skip this one for now, keep its state, retry next time
+                        skipped.append(f"{kind}: {e or type(e).__name__}")
+                        done |= kinds & {kind}
+                        continue
                     if kind in kinds:
                         new += [(kind, g) for key, g in ids.items() if key not in known]
+                        done.add(kind)
                     else:  # first check of this kind: report nothing, remember everything
                         seeded += len(set(ids) - known)
+                        # Librus answers a refused module (or disabled point grades) with []: an empty kind
+                        # stays unseeded, or its whole history would come as "new" once the module answers
+                        if ids or kind == "grades":
+                            done.add(kind)
                     seen |= set(ids)
                 result = []
                 if new:  # the lookups only when there is something to show
@@ -241,8 +261,8 @@ async def _check(account, entry):
                     categories = await librus.grade_categories() if any(k == "grades" for k, _ in new) else {}
                     result = [_grade(kind, g, subjects, categories, teachers) for kind, g in new]
                     result.sort(key=lambda r: (r.day or date.max, r.kind == "behaviour", r.subject))
-                commit_ = {"seen": sorted(seen, key=_id_order), "kinds": sorted(k for k, _, _ in KINDS)}
-                return ChildGrades(name, result, None, seeded), commit_
+                commit_ = {"seen": sorted(seen, key=_id_order), "kinds": sorted(done)}
+                return ChildGrades(name, result, None, seeded, first, tuple(skipped)), commit_
             finally:
                 entry["session"] = librus.session_dict()
     except Exception as e:  # one child's failure must not cost the digest or the other children

@@ -114,6 +114,7 @@ LABELS = {
         "grades_none": "No new grades.",
         "grades_error": "Could not fetch the grades ({error}).",
         "grades_first": "First check: the existing grades ({count}) are skipped, from the next digest on only new ones are shown here.",
+        "grades_first_kind": "Point grades, text grades and behaviour points are now checked too: the existing ones ({count}) are skipped, from the next digest on only new ones are shown here.",
         "weight": "weight {weight}", "improvement": "improvement", "no_subject": "(unknown subject)",
         "behaviour": "Behaviour",
         "grade_kinds": {"semester": "semester grade", "semester_proposition": "proposed semester grade",
@@ -149,6 +150,7 @@ LABELS = {
         "grades_none": "Brak nowych ocen.",
         "grades_error": "Nie udało się pobrać ocen ({error}).",
         "grades_first": "Pierwsze sprawdzenie: pominięto dotychczasowe oceny ({count}), od następnego podsumowania pojawią się tu tylko nowe.",
+        "grades_first_kind": "Sprawdzane są teraz także oceny punktowe, tekstowe i punkty z zachowania: pominięto dotychczasowe ({count}), od następnego podsumowania pojawią się tu tylko nowe.",
         "weight": "waga {weight}", "improvement": "poprawa", "no_subject": "(przedmiot nieznany)",
         "behaviour": "Zachowanie",
         "grade_kinds": {"semester": "ocena śródroczna", "semester_proposition": "propozycja oceny śródrocznej",
@@ -447,7 +449,7 @@ def _grades_lines(child, lang):
         return [], L["grades_error"].format(error=child.error)
     lines = [_grade_line(g, lang) for g in child.grades]
     if child.seeded:
-        return lines, L["grades_first"].format(count=child.seeded)
+        return lines, L["grades_first" if child.first else "grades_first_kind"].format(count=child.seeded)
     return lines, None if lines else L["grades_none"]
 
 
@@ -1027,6 +1029,8 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         for child in grades:
             if child.error:
                 print(f"warning: librus: {child.name}: {child.error}", file=sys.stderr, flush=True)
+            for skipped in child.skipped:
+                print(f"warning: librus: {child.name}: {skipped}", file=sys.stderr, flush=True)
     common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions,
               "grades": grades}
     digest = build_digest(sections, args.hours, **common)

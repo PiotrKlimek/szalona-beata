@@ -787,8 +787,13 @@ class SubstitutionsTest(unittest.TestCase):
 
 
 class LibrusGradesRenderTest(unittest.TestCase):
-    def child(self, grades=(), error=None, seeded=0, name="Ania"):
-        return librus_grades.ChildGrades(name, list(grades), error, seeded)
+    def child(self, grades=(), error=None, seeded=0, name="Ania", first=True):
+        return librus_grades.ChildGrades(name, list(grades), error, seeded, first)
+
+    def test_note_for_new_kinds_of_an_existing_child_is_not_first_check(self):
+        text = summarize.build_digest([], 24, lang="Polish", grades=[self.child(seeded=4, first=False)])
+        self.assertNotIn("Pierwsze sprawdzenie", text)
+        self.assertIn("(4)", text)
 
     def grade(self, **kw):
         fields = dict(subject="Matematyka", value="5", category="sprawdzian", weight=3, teacher="Jan Kowalski",

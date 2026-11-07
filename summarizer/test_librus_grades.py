@@ -68,17 +68,23 @@ class FakeLibrus:
             raise self.fail
         return self._grades
 
+    def _extra(self, kind):
+        got = self.extra.get(kind, [])
+        if isinstance(got, Exception):
+            raise got
+        return got
+
     async def point_grades(self):
         self.calls.append("point_grades")
-        return self.extra.get("point", [])
+        return self._extra("point")
 
     async def text_grades(self):
         self.calls.append("text_grades")
-        return self.extra.get("text", [])
+        return self._extra("text")
 
     async def behaviour_grades(self):
         self.calls.append("behaviour_grades")
-        return self.extra.get("behaviour", [])
+        return self._extra("behaviour")
 
     async def subjects(self):
         self.calls.append("subjects")
@@ -190,7 +196,8 @@ class CheckGradesTest(unittest.TestCase):
         children, seen = self.check([lg.Account("Ania", "1234567u", "p")], state)
 
         self.assertEqual(children, [lg.ChildGrades("Ania", [], None, 2)])
-        self.assertEqual(seen, {"1234567u": {"seen": ["1", "2"], "kinds": ["behaviour", "grades", "point", "text"]}})
+        # the other kinds had nothing: not marked seeded (an empty answer may be a refused module)
+        self.assertEqual(seen, {"1234567u": {"seen": ["1", "2"], "kinds": ["grades"]}})
         self.assertNotIn("seen", state.get("1234567u", {}))  # committed only after delivery
         # no lookups when nothing is new
         self.assertEqual(FakeLibrus.instances[0].calls, ["grades", "point_grades", "text_grades", "behaviour_grades"])
@@ -321,6 +328,52 @@ class CheckGradesTest(unittest.TestCase):
         self.assertEqual(children[0].seeded, 4)  # the other kinds were only remembered
         self.assertEqual(seen["1234567u"], {"seen": ["1", "2", "behaviour:70", "point:50", "point:51", "text:60"],
                                             "kinds": ["behaviour", "grades", "point", "text"]})
+
+        self.assertFalse(children[0].first)  # not the first check of this child: the note says so
+
+    def test_classic_scale_and_odd_behaviour_values(self):
+        # a real "bdb" came with empty short_name/text: only grade_id (the library's `display` names it)
+        self.extra["1234567u"] = {"behaviour": [
+            behaviour(80, None, grade_id=2, display="bdb"),
+            behaviour(81, 0.0, grade_id=3, display="db"),
+            behaviour(82, "10"),                      # the parser passes Value through unconverted
+            behaviour(83, "abc"),
+        ]}
+        children, _ = self.check([lg.Account("Ania", "1234567u", "p")], {"1234567u": {
+            "seen": [], "kinds": ["grades", "point", "text", "behaviour"]}})
+        self.assertIsNone(children[0].error)
+        self.assertEqual(sorted(g.value for g in children[0].grades), ["+10", "abc", "bdb", "db"])
+
+    def test_failure_of_one_kind_keeps_the_others(self):
+        self.grades["1234567u"] = [grade(1), grade(2)]
+        self.extra["1234567u"] = {"point": [point(50)], "text": RuntimeError("500 from Librus")}
+        children, seen = self.check([lg.Account("Ania", "1234567u", "p")], {"1234567u": {
+            "seen": ["1", "text:9"], "kinds": ["grades", "point", "text", "behaviour"]}})
+        child = children[0]
+        self.assertIsNone(child.error)
+        self.assertEqual(sorted(g.value for g in child.grades), ["5", "90/100"])
+        self.assertEqual(child.skipped, ("text: 500 from Librus",))
+        # the text grades already known stay known, the kind stays seeded: next time it is retried
+        self.assertEqual(seen["1234567u"], {"seen": ["1", "2", "point:50", "text:9"],
+                                            "kinds": ["behaviour", "grades", "point", "text"]})
+
+    def test_failing_kind_is_not_seeded(self):
+        self.grades["1234567u"] = [grade(1)]
+        self.extra["1234567u"] = {"behaviour": RuntimeError("timeout")}
+        _, seen = self.check([lg.Account("Ania", "1234567u", "p")], {})
+        self.assertNotIn("behaviour", seen["1234567u"]["kinds"])
+
+    def test_kind_empty_when_seeding_is_seeded_later_not_flooded(self):
+        # Librus answers a refused module with [] (remembered for a day): an empty kind isn't marked seeded,
+        # so when the module answers, the old grades are only remembered, not reported as new
+        self.grades["1234567u"] = [grade(1)]
+        _, seen = self.check([lg.Account("Ania", "1234567u", "p")], {})
+        self.assertEqual(seen["1234567u"]["kinds"], ["grades"])
+        self.extra["1234567u"] = {"behaviour": [behaviour(70, 5.0), behaviour(71, 3.0)]}
+        children, seen = self.check([lg.Account("Ania", "1234567u", "p")], {"1234567u": seen["1234567u"]})
+        self.assertEqual(children[0].grades, [])
+        self.assertEqual(children[0].seeded, 2)
+        self.assertEqual(seen["1234567u"]["kinds"], ["behaviour", "grades"])
 
 
 class OpenAccountTest(unittest.TestCase):
