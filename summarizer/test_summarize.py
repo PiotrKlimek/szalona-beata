@@ -283,6 +283,39 @@ class VoiceNoticeTest(unittest.TestCase):
         self.assertEqual(got, "[10:00] Ania: [voice note]\n[voice transcript]\nZbiórka o ósmej")
 
 
+class DocumentNoticeTest(unittest.TestCase):
+    """Text the bridge read from PDFs ([text in document]): explained to the model, noted in the email."""
+
+    SECTIONS = [summarize.Section("Klasa 1a (test)", "Zadanie.", messages=3, documents=1)]
+
+    def test_prompts_explain_document_text(self):
+        for prompt in (summarize.SYSTEM_PROMPT, summarize.THREADS_PROMPT):
+            text = prompt.format(language="Polish", question="Pytanie")
+            self.assertIn("'[text in document]' was read from a PDF", text)
+
+    def test_text_digest_notes_documents(self):
+        got = summarize.build_digest(self.SECTIONS, hours=24, lang="Polish")
+        self.assertIn("*Klasa 1a (test)* (3 wiadomości)\n"
+                      "📄 Uwzględniono tekst z dokumentów PDF (możliwe błędy odczytu): 1 dokument.\nZadanie.", got)
+
+    def test_english_note_after_voice(self):
+        got = summarize.build_digest(
+            [summarize.Section("A", "x", messages=9, voice_notes=1, documents=2)], hours=24)
+        self.assertIn("🎤 Includes 1 voice message (automatic transcript, may contain errors).\n"
+                      "📄 Includes text from 2 PDF documents (may contain recognition errors).\nx", got)
+
+    def test_html_notice(self):
+        html = summarize.build_html_digest(self.SECTIONS, hours=24, day="23.10.2026", lang="Polish")
+        self.assertEqual(html.count("📄"), 1)
+        self.assertLess(html.index("1 dokument"), html.index("Zadanie."))
+
+    def test_document_text_counted_and_sent(self):
+        msgs = [summarize.Msg(T0, "Ania", "[document] Zadanie.pdf\n[text in document]\nStr. 45, ćw. 3"),
+                summarize.Msg(T0 + 60, "Bartek", "Dzięki")]
+        self.assertEqual(summarize.tagged_sent(msgs, omitted=0, tag=summarize.DOC_TAG), 1)
+        self.assertIn("[text in document]\nStr. 45, ćw. 3", summarize.format_transcript(msgs, 10_000, timezone.utc))
+
+
 class DummySummaryTest(unittest.TestCase):
     def test_range_spanning_days_includes_dates(self):
         msgs = [

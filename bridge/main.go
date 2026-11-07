@@ -31,6 +31,7 @@ type bridge struct {
 	names     *debouncer    // refreshes stored sender names off the event path
 	ocr       *mediaWorker  // nil when OCR is off
 	voice     *mediaWorker  // nil when voice transcription is off
+	pdf       *mediaWorker  // nil when reading PDFs is off
 	log       waLog.Logger
 }
 
@@ -110,6 +111,7 @@ func main() {
 	b.names = newDebouncer(5*time.Second, b.refreshNames)
 	b.ocr = b.newOCR() // before connecting: history sync media arrives right after linking
 	b.voice = b.newVoice()
+	b.pdf = b.newPDF()
 	b.client.AddEventHandler(b.handleEvent)
 
 	if b.client.Store.ID == nil {
@@ -119,7 +121,7 @@ func main() {
 	} else if err := b.client.Connect(); err != nil {
 		fatal("Failed to connect", err)
 	}
-	for _, w := range []*mediaWorker{b.ocr, b.voice} {
+	for _, w := range []*mediaWorker{b.ocr, b.voice, b.pdf} {
 		if w != nil {
 			go w.run(ctx)
 		}
@@ -169,6 +171,36 @@ func (b *bridge) newVoice() *mediaWorker {
 	b.log.Infof("Transcription of voice messages enabled (%s at %s)", t.model, t.baseURL)
 	newAudio := func() mediaMessage { return &waE2E.AudioMessage{} }
 	return newMediaWorker(b.store, voiceQueue, "voice message", newAudio, b.download, t.transcribe, b.log)
+}
+
+// newPDF returns the worker that reads the text of PDF documents, or nil (and
+// empties its queue) when PDF_TEXT=off or poppler is missing. Scans are read by
+// OCR only when OCR of images works too (OCR_LANGS).
+func (b *bridge) newPDF() *mediaWorker {
+	on, err := pdfEnabled()
+	if err == nil && on {
+		err = checkPoppler()
+	}
+	if err != nil || !on {
+		if err != nil {
+			b.log.Errorf("Reading PDFs disabled: %v", err)
+		}
+		b.clearQueue(pdfQueue, "Reading PDFs is off")
+		return nil
+	}
+	langs := ocrLangs()
+	if langs != "" {
+		if err := checkTesseract(langs); err != nil {
+			langs = ""
+		}
+	}
+	scans := "text layer only, scans are skipped (OCR is off)"
+	if langs != "" {
+		scans = "scans by OCR (" + langs + ")"
+	}
+	b.log.Infof("Reading PDF documents enabled: %s", scans)
+	newDoc := func() mediaMessage { return &waE2E.DocumentMessage{} }
+	return newMediaWorker(b.store, pdfQueue, "PDF", newDoc, b.download, pdfText(langs, b.log), b.log)
 }
 
 func (b *bridge) download(ctx context.Context, media mediaMessage) ([]byte, error) {
@@ -271,6 +303,13 @@ func (b *bridge) save(evt *events.Message, chatName string) bool {
 			b.voice.Enqueue(msg.ChatJID, msg.ID, msg.Timestamp, audio)
 		} else {
 			b.log.Debugf("Not transcribing audio %s (voice note: %v, %d s)", msg.ID, audio.GetPTT(), audio.GetSeconds())
+		}
+	}
+	if doc := evt.Message.GetDocumentMessage(); doc != nil && b.pdf != nil {
+		if isReadablePDF(doc) {
+			b.pdf.Enqueue(msg.ChatJID, msg.ID, msg.Timestamp, doc)
+		} else {
+			b.log.Debugf("Not reading document %s (%s, %d bytes)", msg.ID, doc.GetMimetype(), doc.GetFileLength())
 		}
 	}
 	return isNew

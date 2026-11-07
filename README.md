@@ -30,9 +30,10 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 |---|---|
 | WhatsApp session keys, messages | only your server (Docker volume); messages deleted after `RETENTION_DAYS` |
 | Photos (for OCR) | downloaded by the bridge into memory, never written to disk; only the recognized text is stored, as part of the message |
+| PDF documents | downloaded by the bridge and read on your server (a temporary file inside the container, deleted right after); only the text is stored, as part of the message |
 | Voice messages (only with `TRANSCRIBE_VOICE=on`) | downloaded by the bridge into memory and **sent to the LLM provider** (Groq by default) for a transcript; only the transcript is stored, as part of the message |
 | Summaries with `--model dummy` / `ollama` | only your server |
-| Summaries with `--model openai` | the chat text of the selected groups (including text read from photos and voice message transcripts) is sent to the LLM provider (Groq by default) |
+| Summaries with `--model openai` | the chat text of the selected groups (including text read from photos and PDFs, and voice message transcripts) is sent to the LLM provider (Groq by default) |
 | LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
 | Librus grades (only with `LIBRUS_ACCOUNTS`) | read from Librus with each child's login; seen grade ids and the Librus sessions in `librus_state.json` on your server (no passwords) |
 | The email | the email provider (Resend) and your mailbox |
@@ -402,6 +403,38 @@ docker compose run --rm --no-deps -v "$PWD/photos":/photos:ro bridge bridge ocr 
 #   /photos/trip.jpg: no text (4 letters in rows), 31ms
 ```
 
+## PDF documents
+
+Teachers often send homework or notices as a PDF without a word of description. The bridge downloads every PDF
+posted in a watched group (up to 20 MB) and adds its text to the message, so the summary knows what
+"[document] Nowy Dokument.pdf" was:
+
+```
+[document] Zadanie.pdf
+[text in document]
+Zadanie domowe na piątek: podręcznik str. 45, ćw. 3 i 4
+```
+
+- The text layer of the first 10 pages is read with `pdftotext` (poppler). A PDF with no text layer (a scan
+  from a phone scanner app) has its first 3 pages rendered and read by Tesseract, like photos (`OCR_LANGS`;
+  with `OCR_LANGS=off` scans add nothing). OCR takes ~10–30 s per page on a small server.
+- The text of one document is capped at 3,000 characters. Other documents (Word, Excel...) are not read.
+- Everything happens on your server; nothing is sent anywhere. `PDF_TEXT=off` turns it off.
+- The email says so under the group's name ("📄 Uwzględniono tekst z dokumentów PDF (możliwe błędy odczytu):
+  1 dokument.").
+- Like photos: processed one at a time, newest first, the queue survives restarts and follows `RETENTION_DAYS`,
+  and PDFs received before this was enabled are read only if WhatsApp sends them again (after linking again).
+
+See what the bridge reads from your own PDFs (`bridge ocr` takes photos and PDFs):
+
+```sh
+docker compose run --rm --no-deps -v "$PWD/docs":/docs:ro bridge bridge ocr /docs
+#   /docs/zadanie.pdf: PDF text (text layer), 41ms
+#     Zadanie domowe na piątek: podręcznik str. 45, ćw. 3 i 4
+#   /docs/skan.pdf: PDF text (OCR of 1 page(s)), 9.2s
+#     ...
+```
+
 ## Voice messages
 
 Off by default, because the recordings themselves leave your server: with `TRANSCRIBE_VOICE=on` (in `.env`,
@@ -597,7 +630,8 @@ docker volume rm szalona-beata_wa-data
 | Variable | Default | Purpose |
 |---|---|---|
 | `WATCH_GROUPS` | (empty: store nothing) | Groups whose messages the bridge stores (JIDs or exact names, comma-separated) |
-| `OCR_LANGS` | `pol+eng` | Tesseract languages for text in photos; `off` disables OCR |
+| `OCR_LANGS` | `pol+eng` | Tesseract languages for text in photos (and scanned PDFs); `off` disables OCR |
+| `PDF_TEXT` | `on` | Read the text of PDF documents (on your server); `off` disables it |
 | `TRANSCRIBE_VOICE` | `off` | `on`: send voice messages to the LLM API (`LLM_API_KEY`, `LLM_BASE_URL`) for transcripts |
 | `TRANSCRIBE_MODEL`, `TRANSCRIBE_LANGUAGE` | `whisper-large-v3-turbo`, (detect) | Speech-to-text model and ISO 639-1 language (e.g. `pl`) |
 | `TRANSCRIBE_BASE_URL`, `TRANSCRIBE_API_KEY` | `LLM_BASE_URL`, `LLM_API_KEY` | Speech-to-text API, if not the summaries' provider |
