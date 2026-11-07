@@ -106,10 +106,23 @@ class StateFileTest(unittest.TestCase):
         self.assertEqual(lg.load_state(self.path), {"1234567u": {"seen": ["1"], "session": {"cookies": []}}})
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
 
-    def test_broken_file_is_empty_state(self):
+    def test_broken_file_is_empty_state_with_a_warning(self):
+        import io
+        from contextlib import redirect_stderr
+
         with open(self.path, "w") as f:
             f.write("{not json")
-        self.assertEqual(lg.load_state(self.path), {})
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(lg.load_state(self.path), {})
+        self.assertIn("librus_state.json", err.getvalue())
+
+    def test_wrong_shapes_are_dropped(self):
+        with open(self.path, "w") as f:
+            json.dump({"a": [], "b": {"seen": "x", "session": {"cookies": [], "evil": 1}},
+                       "c": {"seen": [1, "2"], "session": {"cookies": [{"n": "v"}], "logged_in_at": 3}}}, f)
+        self.assertEqual(lg.load_state(self.path), {
+            "a": {}, "b": {}, "c": {"seen": ["1", "2"], "session": {"cookies": [{"n": "v"}], "logged_in_at": 3}}})
 
 
 class CheckGradesTest(unittest.TestCase):
@@ -164,6 +177,12 @@ class CheckGradesTest(unittest.TestCase):
         children, _ = self.check([lg.Account("Ania", "1234567u", "p")], {"1234567u": {"seen": []}})
         self.assertEqual([g.kind for g in children[0].grades],
                          ["semester_proposition", "final", "semester", "final_proposition"])
+
+    def test_string_ids_find_their_names(self):
+        self.grades["1234567u"] = [grade(9, subject_id="2", category_id="10", teacher_id="100")]
+        children, _ = self.check([lg.Account("Ania", "1234567u", "p")], {"1234567u": {"seen": []}})
+        g = children[0].grades[0]
+        self.assertEqual((g.subject, g.category, g.teacher), ("Język polski", "sprawdzian", "Jan Kowalski"))
 
     def test_unknown_ids_and_missing_date_do_not_fail(self):
         self.grades["1234567u"] = [grade(9, subject_id=99, category_id=None, teacher_id=None, add_date=None)]

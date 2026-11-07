@@ -812,7 +812,7 @@ class LibrusGradesRenderTest(unittest.TestCase):
 
     def test_first_check_and_error_messages(self):
         text = summarize.build_digest([], 24, lang="Polish", grades=[self.child(seeded=23), self.child(error="timeout")])
-        self.assertIn("*Nowe oceny – Ania*\nPierwsze sprawdzenie: zapamiętano 23 oceny, "
+        self.assertIn("*Nowe oceny – Ania*\nPierwsze sprawdzenie: pominięto dotychczasowe oceny (23), "
                       "od następnego podsumowania pojawią się tu tylko nowe.", text)
         self.assertIn("Nie udało się pobrać ocen (timeout).", text)
 
@@ -1857,7 +1857,7 @@ class MainTest(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             code, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
             self.assertEqual(code, 0)
-            self.assertIn("*Nowe oceny – Ania*\nPierwsze sprawdzenie: zapamiętano 1 ocenę", out)
+            self.assertIn("*Nowe oceny – Ania*\nPierwsze sprawdzenie: pominięto dotychczasowe oceny (1)", out)
             # default state file: next to the messages database, only for the owner
             self.assertEqual(oct(os.stat(self.state_path).st_mode & 0o777), "0o600")
 
@@ -1929,6 +1929,36 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("oceny", out.lower())
         self.assertNotIn("grades", out.lower())
+
+    def test_grades_are_never_posted_to_the_whatsapp_group(self):
+        import os
+        from unittest import mock
+
+        bridge = FakeServer({("GET", "/health"): (200, {"connected": True, "logged_in": True}),
+                             ("POST", "/send"): (200, {"id": "X"})})
+        self.addCleanup(bridge.close)
+        env, _ = self.librus_env(BRIDGE_URL=bridge.url)
+        with mock.patch.dict(os.environ, env), redirect_stderr(io.StringIO()):
+            self.run_main("--group", "rowery", "--hours", "2", "--send-to", "rowery")
+            self.accounts["1111111u"].append(grade(2))
+            _, out = self.run_main("--group", "rowery", "--hours", "2", "--send-to", "rowery")
+        posted = [r[2]["text"] for r in bridge.requests if r[1] == "/send"]
+        self.assertEqual(len(posted), 2)
+        self.assertTrue(all("oceny" not in t.lower() and "Ania" not in t.split("*Rowery*")[0] for t in posted))
+        self.assertNotIn("Nowe oceny", "".join(posted))
+        self.assertIn("Pierwsze sprawdzenie", out)  # without an email nothing was used up
+        self.assertNotIn("seen", librus_grades.load_state(self.state_path)["1111111u"])
+
+    def test_entrypoint_imports_with_isolated_mode(self):
+        # the Dockerfile runs `python -I /app/summarize.py`: -I leaves the script's folder off sys.path
+        import os
+        import subprocess
+        import sys
+
+        script = os.path.join(os.path.dirname(os.path.abspath(summarize.__file__)), "summarize.py")
+        run = subprocess.run([sys.executable, "-I", script, "--help"], capture_output=True, text=True,
+                             cwd=self.dir, env={"PATH": os.environ.get("PATH", "")})
+        self.assertEqual(run.returncode, 0, run.stderr)
 
     def test_unknown_group_exits_with_error(self):
         code, _ = self.run_main("--group", "nonexistent", "--model", "dummy")

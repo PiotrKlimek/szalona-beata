@@ -469,11 +469,13 @@ LIBRUS_ACCOUNTS=Ania:1234567u:password;Jaś:7654321u:password
   Leave the name empty (`:1234567u:password`) to use the student's first name from Librus. The password may
   contain `:` but not `;`.
 - **New** means: not shown in an emailed digest before. The first check of an account only remembers the existing
-  grades (the section says how many) so the whole school year isn't reported at once. A run that only prints the
-  digest (no `EMAIL_TO`, no `--send-to`) shows the new grades without using them up.
+  grades (the section says how many) so the whole school year isn't reported at once. Only an emailed digest uses
+  the new grades up: a run that just prints the digest shows them again next time.
+- Grades are **never posted to WhatsApp**: with `--send-to` the group gets the digest without the grades sections.
 - What has been shown is kept in `librus_state.json` next to the messages database (`LIBRUS_STATE` to change it),
-  together with the Librus session, so the password isn't sent on every run. The file is readable by its owner
-  only and contains no passwords, but the session grants access to the account while it is valid.
+  together with the Librus session (fewer password logins, and Librus's long-lived device cookie is reused). The
+  file is readable by its owner only and contains no passwords, but the session grants access to the account while
+  it is valid. If the file is damaged, the log says so and every account starts over with a first check.
 - Ordinary grades and semester/final grades and their proposals are shown (`grades()`); point, descriptive and
   free-text grades are not.
 - It uses [librus-synergia](https://pypi.org/project/librus-synergia/), an **unofficial** client of Librus's

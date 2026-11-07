@@ -24,7 +24,9 @@ from html.parser import HTMLParser
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
-import librus_grades
+# `python -I` (the Dockerfile) leaves the script's own folder off sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import librus_grades  # noqa: E402
 
 # The bridge appends text read from a photo (OCR) after this tag; see bridge/ocr.go.
 OCR_TAG = "[text in image]"
@@ -111,8 +113,7 @@ LABELS = {
         "grades_title": "New grades – {name}",
         "grades_none": "No new grades.",
         "grades_error": "Could not fetch the grades ({error}).",
-        "grades_first": "First check: {count} remembered, from the next digest on only new ones are shown here.",
-        "grade": ("grade", "grades", "grades"),
+        "grades_first": "First check: the existing grades ({count}) are skipped, from the next digest on only new ones are shown here.",
         "weight": "weight {weight}", "improvement": "improvement", "no_subject": "(unknown subject)",
         "grade_kinds": {"semester": "semester grade", "semester_proposition": "proposed semester grade",
                         "final": "final grade", "final_proposition": "proposed final grade"},
@@ -146,8 +147,7 @@ LABELS = {
         "grades_title": "Nowe oceny – {name}",
         "grades_none": "Brak nowych ocen.",
         "grades_error": "Nie udało się pobrać ocen ({error}).",
-        "grades_first": "Pierwsze sprawdzenie: zapamiętano {count}, od następnego podsumowania pojawią się tu tylko nowe.",
-        "grade": ("ocenę", "oceny", "ocen"),
+        "grades_first": "Pierwsze sprawdzenie: pominięto dotychczasowe oceny ({count}), od następnego podsumowania pojawią się tu tylko nowe.",
         "weight": "waga {weight}", "improvement": "poprawa", "no_subject": "(przedmiot nieznany)",
         "grade_kinds": {"semester": "ocena śródroczna", "semester_proposition": "propozycja oceny śródrocznej",
                         "final": "ocena roczna", "final_proposition": "propozycja oceny rocznej"},
@@ -443,7 +443,7 @@ def _grades_lines(child, lang):
     if child.error:
         return [L["grades_error"].format(error=child.error)], False
     if child.seeded:
-        return [L["grades_first"].format(count=plural(child.seeded, L["grade"], lang))], False
+        return [L["grades_first"].format(count=child.seeded)], False
     if not child.grades:
         return [L["grades_none"]], False
     return [_grade_line(g, lang) for g in child.grades], True
@@ -1035,8 +1035,9 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
             f"= {run['total_tokens']} total",
             file=sys.stderr,
         )
-    if target:
-        send_to_bridge(args.bridge_url, target[0], digest)
+    if target:  # a group chat: children's grades are only for the email
+        group_text = build_digest(sections, args.hours, **{**common, "grades": ()}) if grades else digest
+        send_to_bridge(args.bridge_url, target[0], group_text)
         print(f"\nSent to {target[1]}.", file=sys.stderr)
     day = datetime.fromtimestamp(now, tz).strftime("%d.%m.%Y")
     html = build_html_digest(sections, args.hours, day, **common)
@@ -1049,7 +1050,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         send_email(args.smtp, args.email_from, args.email_to, subject, digest, html=html)
         print(f"\nEmailed to {', '.join(args.email_to)}.", file=sys.stderr)
     if librus_state is not None:
-        if target or args.email_to:  # delivered: these grades are no longer new
+        if args.email_to:  # emailed: these grades are no longer new
             librus_grades.commit(librus_state, librus_seen)
         try:  # sessions are kept either way (fewer password logins)
             librus_grades.save_state(args.librus_state, librus_state)

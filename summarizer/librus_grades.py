@@ -4,12 +4,13 @@ LIBRUS_ACCOUNTS="Ania:1234567u:password;Jaś:7654321u:password" - a child's name
 student's first name from Librus), the Librus login and its password. What has already been
 reported is kept in a JSON state file (seen grade ids and the Librus session per login, no
 passwords). New grades are remembered only after the digest has been delivered (`commit`), so
-a preview run doesn't use them up.
+a preview run (or a --send-to post, which never includes grades) doesn't use them up.
 """
 
 import asyncio
 import json
 import os
+import sys
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import date
@@ -58,14 +59,40 @@ def parse_accounts(value):
     return accounts
 
 
+SESSION_KEYS = {"cookies", "logged_in_at"}  # librus_synergia.LibrusSessionData
+
+
+def _clean_entry(entry):
+    """Only well-formed parts of one login's state: a bad entry must not fail that child forever."""
+    if not isinstance(entry, dict):
+        return {}
+    clean = {}
+    seen = entry.get("seen")
+    if isinstance(seen, list):
+        clean["seen"] = [str(i) for i in seen]
+    session = entry.get("session")
+    if isinstance(session, dict) and set(session) <= SESSION_KEYS and isinstance(session.get("cookies", []), list):
+        clean["session"] = session
+    return clean
+
+
 def load_state(path):
-    """{login: {"seen": [grade ids], "session": {...}}}; missing or unreadable file = {}."""
+    """{login: {"seen": [grade ids], "session": {...}}}; missing file = {}, unreadable = {} with a warning
+    (every account then starts with a first check)."""
     try:
         with open(path, encoding="utf-8") as f:
             state = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
-    return state if isinstance(state, dict) else {}
+    except (OSError, ValueError) as e:
+        print(f"warning: could not read {path} ({e}); Librus accounts start over with a first check",
+              file=sys.stderr, flush=True)
+        return {}
+    if not isinstance(state, dict):
+        print(f"warning: unexpected content in {path}; Librus accounts start over with a first check",
+              file=sys.stderr, flush=True)
+        return {}
+    return {str(login): _clean_entry(entry) for login, entry in state.items()}
 
 
 def save_state(path, state):
@@ -75,6 +102,8 @@ def save_state(path, state):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())  # never an empty file after a power loss
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -113,6 +142,16 @@ def _kind(g):
     return ""
 
 
+def _lookup(table, key):
+    """table[key] for ids that come as 5 or "5" (lookups are keyed by int)."""
+    if key is None:
+        return None
+    if key in table:
+        return table[key]
+    text = str(key).strip()
+    return table.get(int(text)) if text.isdigit() else None
+
+
 def _day(add_date):
     try:
         return date.fromisoformat(str(add_date)[:10]) if add_date else None
@@ -140,13 +179,13 @@ async def _check(account, entry):
                     categories = await librus.grade_categories()
                     teachers = await librus.teachers()
                     for g in new:
-                        cat = categories.get(g.category_id) if g.category_id is not None else None
+                        cat = _lookup(categories, g.category_id)
                         result.append(Grade(
-                            subjects.get(g.subject_id, "") if g.subject_id is not None else "",
+                            _lookup(subjects, g.subject_id) or "",
                             str(g.value),
                             cat.name if cat else "",
                             cat.weight if cat and cat.count_to_average else None,
-                            teachers.get(g.teacher_id, "") if g.teacher_id is not None else "",
+                            _lookup(teachers, g.teacher_id) or "",
                             _day(g.add_date),
                             _kind(g),
                             g.improves_id is not None,
