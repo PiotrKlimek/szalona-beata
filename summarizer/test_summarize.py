@@ -5,11 +5,13 @@ import sqlite3
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import timezone
+from datetime import date, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import librus_grades
 import sample_data
 import summarize
+from test_librus_grades import FakeLibrus, grade
 
 # Same schema the Go bridge creates (bridge/store.go).
 SCHEMA = """
@@ -782,6 +784,69 @@ class SubstitutionsTest(unittest.TestCase):
         html = summarize.build_html_digest([], 24, "27.10.2025", lang="Polish",
                                            substitutions=self.subs([], error="<oops>"))
         self.assertIn("Nie udało się pobrać zastępstw (&lt;oops&gt;).", html)
+
+
+class LibrusGradesRenderTest(unittest.TestCase):
+    def child(self, grades=(), error=None, seeded=0, name="Ania"):
+        return librus_grades.ChildGrades(name, list(grades), error, seeded)
+
+    def grade(self, **kw):
+        fields = dict(subject="Matematyka", value="5", category="sprawdzian", weight=3, teacher="Jan Kowalski",
+                      day=date(2026, 11, 6), kind="", improvement=False, comment="")
+        fields.update(kw)
+        return librus_grades.Grade(**fields)
+
+    def test_text_section_per_child_after_substitutions(self):
+        subs = summarize.Substitutions("1C", date(2026, 11, 9), [], None, "")
+        text = summarize.build_digest([], 24, lang="Polish", substitutions=subs, grades=[
+            self.child([self.grade(improvement=True), self.grade(subject="Język polski", value="4+", category="aktywność",
+                                                                  weight=None, comment="Brawo", day=None)]),
+            self.child(name="Jaś"),
+        ])
+        self.assertIn("*Nowe oceny – Ania*\n"
+                      "- Matematyka: 5 (sprawdzian, waga 3, poprawa) – Jan Kowalski, 06.11\n"
+                      "- Język polski: 4+ (aktywność) – Jan Kowalski – „Brawo”", text)
+        self.assertIn("*Nowe oceny – Jaś*\nBrak nowych ocen.", text)
+        self.assertGreater(text.index("Nowe oceny – Ania"), text.index("Zastępstwa"))
+        self.assertGreater(text.index("Nowe oceny – Jaś"), text.index("Nowe oceny – Ania"))
+
+    def test_first_check_and_error_messages(self):
+        text = summarize.build_digest([], 24, lang="Polish", grades=[self.child(seeded=23), self.child(error="timeout")])
+        self.assertIn("*Nowe oceny – Ania*\nPierwsze sprawdzenie: zapamiętano 23 oceny, "
+                      "od następnego podsumowania pojawią się tu tylko nowe.", text)
+        self.assertIn("Nie udało się pobrać ocen (timeout).", text)
+
+    def test_grade_kinds_missing_details_and_fractional_weight(self):
+        text = summarize.build_digest([], 24, lang="Polish", grades=[self.child([
+            self.grade(kind="semester_proposition", category="", weight=None),
+            self.grade(kind="final", weight=0.5),
+            self.grade(subject="", teacher="", day=None, category="", weight=None),
+        ])])
+        self.assertIn("- Matematyka: 5 (propozycja oceny śródrocznej) – Jan Kowalski, 06.11", text)
+        self.assertIn("- Matematyka: 5 (ocena roczna, sprawdzian, waga 0,5) – Jan Kowalski, 06.11", text)
+        self.assertIn("- (przedmiot nieznany): 5\n", text + "\n")
+
+    def test_english_labels(self):
+        text = summarize.build_digest([], 24, lang="English", grades=[self.child([self.grade(weight=1.5)])])
+        self.assertIn("*New grades – Ania*\n- Matematyka: 5 (sprawdzian, weight 1.5) – Jan Kowalski, 06.11", text)
+
+    def test_text_digest_without_grades_is_unchanged(self):
+        self.assertEqual(summarize.build_digest([], 24, lang="Polish", grades=[]),
+                         summarize.build_digest([], 24, lang="Polish"))
+
+    def test_html_block_per_child_is_escaped_and_last(self):
+        subs = summarize.Substitutions("1C", date(2026, 11, 9), [], None, "")
+        html = summarize.build_html_digest([("Klasa 1C", "x", 1)], 24, "07.11.2026", lang="Polish",
+                                           substitutions=subs, grades=[
+            self.child([self.grade(value="<5>", comment="a & b")], name="<Ania>"), self.child(name="Jaś")])
+        self.assertEqual(html.count('data-grades="1"'), 2)
+        block = html[html.index('data-grades="1"'):]
+        self.assertGreater(html.index('data-grades="1"'), html.index('data-substitutions="1"'))
+        self.assertIn("Nowe oceny – &lt;Ania&gt;", block)
+        self.assertIn("&lt;5&gt;", block)
+        self.assertIn("a &amp; b", block)
+        self.assertIn("Brak nowych ocen.", block)
+        self.assertNotIn("data-grades", summarize.build_html_digest([], 24, "07.11.2026"))
 
 
 class OllamaTest(unittest.TestCase):
@@ -1762,6 +1827,108 @@ class MainTest(unittest.TestCase):
             code, _ = self.run_main("--group", "rowery", "--hours", "2")
         self.assertEqual(code, 0)
         self.assertIn("SUBSTITUTIONS_URL", err.getvalue())
+
+    def librus_env(self, **extra):
+        import os
+
+        self.state_path = os.path.join(self.dir, "librus_state.json")
+        self.accounts = {"1111111u": [grade(1)], "2222222u": []}
+        from unittest import mock
+
+        def opener(login, password, session):
+            return FakeLibrus(login, password, session, self.accounts[login])
+
+        patcher = mock.patch.object(librus_grades, "open_account", opener)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        smtp = FakeSMTPServer()
+        self.addCleanup(smtp.close)
+        env = {"SUMMARY_LANGUAGE": "Polish", "LIBRUS_ACCOUNTS": "Ania:1111111u:a;Jaś:2222222u:b",
+               "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(smtp.port), "SMTP_SECURITY": "none",
+               "SMTP_PASSWORD": "x", "EMAIL_FROM": "a@example.com", **extra}
+        return env, smtp
+
+    def test_librus_grades_since_the_last_emailed_digest(self):
+        import email
+        import os
+        from unittest import mock
+
+        env, smtp = self.librus_env()
+        with mock.patch.dict(os.environ, env):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+            self.assertEqual(code, 0)
+            self.assertIn("*Nowe oceny – Ania*\nPierwsze sprawdzenie: zapamiętano 1 ocenę", out)
+            # default state file: next to the messages database, only for the owner
+            self.assertEqual(oct(os.stat(self.state_path).st_mode & 0o777), "0o600")
+
+            self.accounts["1111111u"].append(grade(2, "3", subject_id=2))
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+            self.assertEqual(code, 0)
+            self.assertIn("*Nowe oceny – Ania*\n- Język polski: 3 (sprawdzian, waga 3) – Jan Kowalski, 06.11", out)
+            self.assertIn("*Nowe oceny – Jaś*\nBrak nowych ocen.", out)
+
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+            self.assertIn("*Nowe oceny – Ania*\nBrak nowych ocen.", out)
+
+        # parsed from bytes: an 8bit utf-8 part read from a str comes back escaped
+        msg = email.message_from_bytes(smtp.envelopes[1][2].encode(), policy=email.policy.default)
+        self.assertIn("Język polski: 3", msg.get_body(("plain",)).get_content())
+        self.assertIn("Nowe oceny – Ania", msg.get_body(("html",)).get_content())
+        with open(self.state_path) as f:
+            state = json.load(f)
+        self.assertEqual(state["1111111u"]["seen"], ["1", "2"])
+        self.assertEqual(set(state["1111111u"]), {"seen", "session"})  # no password stored
+
+    def test_printed_only_run_does_not_use_up_new_grades(self):
+        import os
+        from unittest import mock
+
+        env, _ = self.librus_env()
+        with mock.patch.dict(os.environ, env):
+            self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")  # seeds
+            self.accounts["1111111u"].append(grade(2))
+            _, out = self.run_main("--group", "rowery", "--hours", "2")  # no email: just a preview
+            self.assertIn("- Matematyka: 5", out)
+            _, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+            self.assertIn("- Matematyka: 5", out)  # still new for the emailed digest
+
+    def test_librus_failure_does_not_block_the_digest(self):
+        import os
+        from unittest import mock
+
+        env, smtp = self.librus_env(LIBRUS_STATE=os.path.join(self.dir, "elsewhere.json"))
+
+        def broken(login, password, session):
+            return FakeLibrus(login, password, session, fail=ConnectionError("Librus is down"))
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(librus_grades, "open_account", broken), \
+                redirect_stderr(err):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+
+        self.assertEqual(code, 0)
+        self.assertIn("*Rowery*", out)
+        self.assertIn("*Nowe oceny – Ania*\nNie udało się pobrać ocen (Librus is down).", out)
+        self.assertIn("warning: librus: Ania: Librus is down", err.getvalue())
+        self.assertEqual(len(smtp.envelopes), 1)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "elsewhere.json")))
+
+    def test_bad_librus_accounts_exit_without_showing_the_password(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"LIBRUS_ACCOUNTS": "Ania:sekret123"}), redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            self.run_main("--group", "rowery")
+        self.assertIn("LIBRUS_ACCOUNTS", err.getvalue())
+        self.assertNotIn("sekret123", err.getvalue())
+
+    def test_no_grades_section_without_librus_accounts(self):
+        code, out = self.run_main("--group", "rowery", "--hours", "2")
+        self.assertEqual(code, 0)
+        self.assertNotIn("oceny", out.lower())
+        self.assertNotIn("grades", out.lower())
 
     def test_unknown_group_exits_with_error(self):
         code, _ = self.run_main("--group", "nonexistent", "--model", "dummy")
