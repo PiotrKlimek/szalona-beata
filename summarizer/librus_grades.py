@@ -1,4 +1,5 @@
-"""New grades from Librus Synergia, one account per child (unofficial API, librus-synergia).
+"""New grades from Librus Synergia, one account per child (unofficial API, librus-synergia):
+ordinary, point and text grades and behaviour points.
 
 LIBRUS_ACCOUNTS="Ania:1234567u:password;Jaś:7654321u:password" - a child's name (empty: the
 student's first name from Librus), the Librus login and its password. What has already been
@@ -40,6 +41,8 @@ class ChildGrades(NamedTuple):
     grades: list        # [Grade] new since the last delivered digest
     error: object = None  # str if they could not be fetched
     seeded: int = 0     # > 0 on the first check: how many existing grades were only remembered
+    first: bool = True  # False: `seeded` are only new kinds of grades of a child checked before
+    skipped: tuple = ()  # "kind: error" for kinds that could not be fetched this time (retried next time)
 
 
 def parse_accounts(value):
@@ -70,6 +73,9 @@ def _clean_entry(entry):
     seen = entry.get("seen")
     if isinstance(seen, list):
         clean["seen"] = [str(i) for i in seen]
+    kinds = entry.get("kinds")
+    if isinstance(kinds, list):
+        clean["kinds"] = [str(k) for k in kinds]
     session = entry.get("session")
     if isinstance(session, dict) and set(session) <= SESSION_KEYS and isinstance(session.get("cookies", []), list):
         clean["session"] = session
@@ -114,9 +120,9 @@ def save_state(path, state):
 
 
 def commit(state, seen):
-    """Remember the grades of a delivered digest ({login: [ids]} from check_grades)."""
-    for login, ids in seen.items():
-        state.setdefault(login, {})["seen"] = ids
+    """Remember the grades of a delivered digest ({login: {"seen": ids, "kinds": kinds}} from check_grades)."""
+    for login, update in seen.items():
+        state.setdefault(login, {}).update(update)
 
 
 @asynccontextmanager
@@ -159,53 +165,118 @@ def _day(add_date):
         return None
 
 
+# Kinds of grades: the library call, and the prefix of their ids in the state file (ordinary grades have
+# none, as in the first version of the file, so that state keeps working).
+KINDS = (("grades", "grades", ""), ("point", "point_grades", "point:"),
+         ("text", "text_grades", "text:"), ("behaviour", "behaviour_grades", "behaviour:"))
+MAX_TEXT = 300  # a text grade can be a whole paragraph
+
+
+def _num(x):
+    return f"{x:g}"
+
+
+def _comments(items):
+    return " ".join(" ".join(c.split()) for c in (items or []) if c and c.strip())
+
+
+def _point_value(g):
+    points = g.points
+    if points is None:
+        try:
+            points = float(g.value)
+        except (TypeError, ValueError):
+            return str(g.value or "")
+    return f"{_num(points)}/{_num(g.max_points)}" if g.max_points else _num(points)
+
+
+def _shorten(text):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= MAX_TEXT else text[:MAX_TEXT].rstrip() + "…"
+
+
+def _grade(kind, g, subjects, categories, teachers):
+    subject = _lookup(subjects, getattr(g, "subject_id", None)) or ""
+    teacher = _lookup(teachers, g.teacher_id) or ""
+    day = _day(g.add_date)
+    if kind == "point":
+        return Grade(subject, _point_value(g), g.category or "", g.weight if g.counts_to_average and g.weight else None,
+                     teacher, day, "", False, "")
+    if kind == "text":
+        return Grade(subject, _shorten(g.value), g.category or "", None, teacher, _day(g.date) or day, "", False, "")
+    if kind == "behaviour":
+        if getattr(g, "grade_id", None) is not None:  # classic scale ("bdb"), may come with no short name
+            value, comment = getattr(g, "display", "") or g.short_name or g.text, _comments(g.comments)
+        elif g.value is not None:  # points; the library passes Value through unconverted
+            try:
+                value = f"{float(g.value):+g}"
+            except (TypeError, ValueError):
+                value = str(g.value)
+            comment = _comments([*(g.comments or []), g.text])
+        else:
+            value, comment = g.short_name or g.text, _comments(g.comments)
+        return Grade("", value, "", None, teacher, day, "behaviour", False, comment)
+    cat = _lookup(categories, g.category_id)
+    return Grade(subject, str(g.value), cat.name if cat else "", cat.weight if cat and cat.count_to_average else None,
+                 teacher, day, _kind(g), g.improves_id is not None, _comments(g.comments))
+
+
 async def _check(account, entry):
-    """(ChildGrades, seen ids or None); updates entry["session"]."""
+    """(ChildGrades, {"seen": ids, "kinds": seeded kinds} or None); updates entry["session"]."""
     name = account.name
     try:
         async with open_account(account.login, account.password, entry.get("session")) as librus:
             try:
                 if not name:
                     name = (await librus.me()).first_name or account.login
-                grades = await librus.grades()
                 known = set(entry.get("seen") or ())
-                new = [g for g in grades if str(g.id) not in known]
-                if "seen" not in entry:  # first check: report nothing, remember everything
-                    seen = sorted({str(g.id) for g in grades}, key=_id_order)
-                    return ChildGrades(name, [], None, len(seen)), seen
+                # a file from the first version has "seen" for ordinary grades only
+                kinds = set(entry.get("kinds") or (["grades"] if "seen" in entry else []))
+                first = "seen" not in entry
+                seen, new, seeded, skipped, done = set(known), [], 0, [], set()
+                for kind, method, prefix in KINDS:
+                    try:
+                        ids = {prefix + str(g.id): g for g in await getattr(librus, method)()}
+                    except Exception as e:
+                        if kind == "grades":  # without the ordinary grades there is no section
+                            raise
+                        # the other kinds are extras: skip this one for now, keep its state, retry next time
+                        skipped.append(f"{kind}: {e or type(e).__name__}")
+                        done |= kinds & {kind}
+                        continue
+                    if kind in kinds:
+                        new += [(kind, g) for key, g in ids.items() if key not in known]
+                        done.add(kind)
+                    else:  # first check of this kind: report nothing, remember everything
+                        seeded += len(set(ids) - known)
+                        # Librus answers a refused module (or disabled point grades) with []: an empty kind
+                        # stays unseeded, or its whole history would come as "new" once the module answers
+                        if ids or kind == "grades":
+                            done.add(kind)
+                    seen |= set(ids)
                 result = []
                 if new:  # the lookups only when there is something to show
                     subjects = await librus.subjects()
-                    categories = await librus.grade_categories()
                     teachers = await librus.teachers()
-                    for g in new:
-                        cat = _lookup(categories, g.category_id)
-                        result.append(Grade(
-                            _lookup(subjects, g.subject_id) or "",
-                            str(g.value),
-                            cat.name if cat else "",
-                            cat.weight if cat and cat.count_to_average else None,
-                            _lookup(teachers, g.teacher_id) or "",
-                            _day(g.add_date),
-                            _kind(g),
-                            g.improves_id is not None,
-                            " ".join(" ".join(c.split()) for c in (g.comments or []) if c),
-                        ))
-                    result.sort(key=lambda r: (r.day or date.max, r.subject))
-                seen = sorted(known | {str(g.id) for g in grades}, key=_id_order)
-                return ChildGrades(name, result), seen
+                    categories = await librus.grade_categories() if any(k == "grades" for k, _ in new) else {}
+                    result = [_grade(kind, g, subjects, categories, teachers) for kind, g in new]
+                    result.sort(key=lambda r: (r.day or date.max, r.kind == "behaviour", r.subject))
+                commit_ = {"seen": sorted(seen, key=_id_order), "kinds": sorted(done)}
+                return ChildGrades(name, result, None, seeded, first, tuple(skipped)), commit_
             finally:
                 entry["session"] = librus.session_dict()
     except Exception as e:  # one child's failure must not cost the digest or the other children
         return ChildGrades(name or account.login, [], str(e) or type(e).__name__), None
 
 
-def _id_order(i):
-    return (0, int(i), "") if i.isdigit() else (1, 0, i)
+def _id_order(key):
+    """'7' < '12' < 'behaviour:3' < 'point:5': by kind prefix, then by number."""
+    prefix, _, rest = key.rpartition(":")
+    return (prefix, 0, int(rest), "") if rest.isdigit() else (prefix, 1, 0, rest)
 
 
 def check_grades(accounts, state):
-    """([ChildGrades] in account order, {login: seen ids to commit}). Sessions in `state` are updated."""
+    """([ChildGrades] in account order, {login: what to commit}). Sessions in `state` are updated."""
     async def run():
         return [await _check(a, state.setdefault(a.login, {})) for a in accounts]
 

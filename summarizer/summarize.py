@@ -114,7 +114,9 @@ LABELS = {
         "grades_none": "No new grades.",
         "grades_error": "Could not fetch the grades ({error}).",
         "grades_first": "First check: the existing grades ({count}) are skipped, from the next digest on only new ones are shown here.",
+        "grades_first_kind": "Point grades, text grades and behaviour points are now checked too: the existing ones ({count}) are skipped, from the next digest on only new ones are shown here.",
         "weight": "weight {weight}", "improvement": "improvement", "no_subject": "(unknown subject)",
+        "behaviour": "Behaviour",
         "grade_kinds": {"semester": "semester grade", "semester_proposition": "proposed semester grade",
                         "final": "final grade", "final_proposition": "proposed final grade"},
         "bridge": {
@@ -148,7 +150,9 @@ LABELS = {
         "grades_none": "Brak nowych ocen.",
         "grades_error": "Nie udało się pobrać ocen ({error}).",
         "grades_first": "Pierwsze sprawdzenie: pominięto dotychczasowe oceny ({count}), od następnego podsumowania pojawią się tu tylko nowe.",
+        "grades_first_kind": "Sprawdzane są teraz także oceny punktowe, tekstowe i punkty z zachowania: pominięto dotychczasowe ({count}), od następnego podsumowania pojawią się tu tylko nowe.",
         "weight": "waga {weight}", "improvement": "poprawa", "no_subject": "(przedmiot nieznany)",
+        "behaviour": "Zachowanie",
         "grade_kinds": {"semester": "ocena śródroczna", "semester_proposition": "propozycja oceny śródrocznej",
                         "final": "ocena roczna", "final_proposition": "propozycja oceny rocznej"},
         "bridge": {
@@ -426,7 +430,8 @@ def _grade_line(g, lang):
         details.append(L["weight"].format(weight=weight.replace(".", ",") if lang.lower() == "polish" else weight))
     if g.improvement:
         details.append(L["improvement"])
-    line = f"{g.subject or L['no_subject']}: {g.value}"
+    subject = L["behaviour"] if g.kind == "behaviour" else g.subject or L["no_subject"]
+    line = f"{subject}: {g.value}"
     if details:
         line += f" ({', '.join(details)})"
     who_when = ", ".join(x for x in (g.teacher, g.day.strftime("%d.%m") if g.day else "") if x)
@@ -438,20 +443,19 @@ def _grade_line(g, lang):
 
 
 def _grades_lines(child, lang):
-    """One line per new grade, or the 'first check' / 'none' / 'error' message (second item False)."""
+    """(lines, note): one line per new grade, and the 'first check' / 'none' / 'error' message or None."""
     L = labels(lang)
     if child.error:
-        return [L["grades_error"].format(error=child.error)], False
+        return [], L["grades_error"].format(error=child.error)
+    lines = [_grade_line(g, lang) for g in child.grades]
     if child.seeded:
-        return [L["grades_first"].format(count=child.seeded)], False
-    if not child.grades:
-        return [L["grades_none"]], False
-    return [_grade_line(g, lang) for g in child.grades], True
+        return lines, L["grades_first" if child.first else "grades_first_kind"].format(count=child.seeded)
+    return lines, None if lines else L["grades_none"]
 
 
 def _grades_text(child, lang):
-    lines, is_list = _grades_lines(child, lang)
-    body = "\n".join(f"- {line}" for line in lines) if is_list else lines[0]
+    lines, note = _grades_lines(child, lang)
+    body = "\n".join([*(f"- {line}" for line in lines), *([note] if note else [])])
     return f"*{labels(lang)['grades_title'].format(name=child.name)}*\n{body}"
 
 
@@ -605,12 +609,13 @@ GRADES_BLOCK = """<table role="presentation" width="100%" cellpadding="0" cellsp
 
 
 def render_grades_html(child, lang):
-    lines, is_list = _grades_lines(child, lang)
-    if is_list:
+    lines, note = _grades_lines(child, lang)
+    body = ""
+    if lines:
         lis = "".join(f'<li style="{LI_STYLE}">{htmllib.escape(line)}</li>' for line in lines)
         body = f'<ul style="{UL_STYLE};margin-bottom:0">{lis}</ul>'
-    else:
-        body = f'<p style="margin:0;color:#7a8783;font-style:italic">{htmllib.escape(lines[0])}</p>'
+    if note:
+        body += f'<p style="margin:0;color:#7a8783;font-style:italic">{htmllib.escape(note)}</p>'
     title = labels(lang)["grades_title"].format(name=child.name)
     return GRADES_BLOCK.format(title=htmllib.escape(title), body=body)
 
@@ -1024,6 +1029,8 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         for child in grades:
             if child.error:
                 print(f"warning: librus: {child.name}: {child.error}", file=sys.stderr, flush=True)
+            for skipped in child.skipped:
+                print(f"warning: librus: {child.name}: {skipped}", file=sys.stderr, flush=True)
     common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions,
               "grades": grades}
     digest = build_digest(sections, args.hours, **common)
