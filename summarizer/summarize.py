@@ -24,6 +24,10 @@ from html.parser import HTMLParser
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
+# `python -I` (the Dockerfile) leaves the script's own folder off sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import librus_grades  # noqa: E402
+
 # The bridge appends text read from a photo (OCR) after this tag; see bridge/ocr.go.
 OCR_TAG = "[text in image]"
 OCR_NOTE = (
@@ -106,6 +110,13 @@ LABELS = {
         "subst_link": "Substitutions page",
         "lesson": ("period", "periods"),
         "weekdays": ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
+        "grades_title": "New grades – {name}",
+        "grades_none": "No new grades.",
+        "grades_error": "Could not fetch the grades ({error}).",
+        "grades_first": "First check: the existing grades ({count}) are skipped, from the next digest on only new ones are shown here.",
+        "weight": "weight {weight}", "improvement": "improvement", "no_subject": "(unknown subject)",
+        "grade_kinds": {"semester": "semester grade", "semester_proposition": "proposed semester grade",
+                        "final": "final grade", "final_proposition": "proposed final grade"},
         "bridge": {
             "logged_out": "⚠️ The WhatsApp bridge is logged out: new messages are not collected. "
                           "Link the device again (README, step 3).",
@@ -133,6 +144,13 @@ LABELS = {
         "subst_link": "Strona zastępstw",
         "lesson": ("lekcja", "lekcje"),
         "weekdays": ("poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"),
+        "grades_title": "Nowe oceny – {name}",
+        "grades_none": "Brak nowych ocen.",
+        "grades_error": "Nie udało się pobrać ocen ({error}).",
+        "grades_first": "Pierwsze sprawdzenie: pominięto dotychczasowe oceny ({count}), od następnego podsumowania pojawią się tu tylko nowe.",
+        "weight": "waga {weight}", "improvement": "poprawa", "no_subject": "(przedmiot nieznany)",
+        "grade_kinds": {"semester": "ocena śródroczna", "semester_proposition": "propozycja oceny śródrocznej",
+                        "final": "ocena roczna", "final_proposition": "propozycja oceny rocznej"},
         "bridge": {
             "logged_out": "⚠️ Mostek WhatsApp jest wylogowany: nowe wiadomości nie są zbierane. "
                           "Połącz urządzenie ponownie (README, krok 3).",
@@ -397,7 +415,47 @@ def _subst_text(subs, lang):
     return f"*{_subst_title(subs, lang)}*\n{body}"
 
 
-def build_digest(sections, hours, title=None, lang="English", warning=None, substitutions=None):
+def _grade_line(g, lang):
+    """'Matematyka: 5 (sprawdzian, waga 3) – Jan Kowalski, 06.11 – „comment”'."""
+    L = labels(lang)
+    details = [L["grade_kinds"][g.kind]] if g.kind in L["grade_kinds"] else []
+    if g.category:
+        details.append(g.category)
+    if g.weight is not None:
+        weight = f"{g.weight:g}"
+        details.append(L["weight"].format(weight=weight.replace(".", ",") if lang.lower() == "polish" else weight))
+    if g.improvement:
+        details.append(L["improvement"])
+    line = f"{g.subject or L['no_subject']}: {g.value}"
+    if details:
+        line += f" ({', '.join(details)})"
+    who_when = ", ".join(x for x in (g.teacher, g.day.strftime("%d.%m") if g.day else "") if x)
+    if who_when:
+        line += f" – {who_when}"
+    if g.comment:
+        line += f" – „{g.comment}”"
+    return line
+
+
+def _grades_lines(child, lang):
+    """One line per new grade, or the 'first check' / 'none' / 'error' message (second item False)."""
+    L = labels(lang)
+    if child.error:
+        return [L["grades_error"].format(error=child.error)], False
+    if child.seeded:
+        return [L["grades_first"].format(count=child.seeded)], False
+    if not child.grades:
+        return [L["grades_none"]], False
+    return [_grade_line(g, lang) for g in child.grades], True
+
+
+def _grades_text(child, lang):
+    lines, is_list = _grades_lines(child, lang)
+    body = "\n".join(f"- {line}" for line in lines) if is_list else lines[0]
+    return f"*{labels(lang)['grades_title'].format(name=child.name)}*\n{body}"
+
+
+def build_digest(sections, hours, title=None, lang="English", warning=None, substitutions=None, grades=()):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     header = f"📋 {title or L['digest']} ({L['last'].format(hours=hours)})"
@@ -410,6 +468,7 @@ def build_digest(sections, hours, title=None, lang="English", warning=None, subs
         parts.append(f"*{s.name}*{count}\n{note}{_summary_text(s.summary, lang)}")
     if substitutions:
         parts.append(_subst_text(substitutions, lang))
+    parts.extend(_grades_text(child, lang) for child in grades or ())
     return "\n\n".join(parts)
 
 
@@ -538,13 +597,32 @@ def render_substitutions_html(subs, lang):
     return SUBST_BLOCK.format(title=htmllib.escape(_subst_title(subs, lang)), body=body, link=link)
 
 
+GRADES_BLOCK = """<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px" data-grades="1">
+<tr><td style="background:#eef4fd;border-left:4px solid #3b74c4;border-radius:0 8px 8px 0;padding:10px 14px">
+<div style="font-size:17px;font-weight:700;color:#1d4580;margin:0 0 8px">🎓 {title}</div>
+<div style="font-size:15px;line-height:1.5">{body}</div>
+</td></tr></table>"""
+
+
+def render_grades_html(child, lang):
+    lines, is_list = _grades_lines(child, lang)
+    if is_list:
+        lis = "".join(f'<li style="{LI_STYLE}">{htmllib.escape(line)}</li>' for line in lines)
+        body = f'<ul style="{UL_STYLE};margin-bottom:0">{lis}</ul>'
+    else:
+        body = f'<p style="margin:0;color:#7a8783;font-style:italic">{htmllib.escape(lines[0])}</p>'
+    title = labels(lang)["grades_title"].format(name=child.name)
+    return GRADES_BLOCK.format(title=htmllib.escape(title), body=body)
+
+
 KICKER = ('<div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a8dcd1">'
           'Szalona Beata</div>\n')
 WARNING_BANNER = ('<div data-warning="1" style="background:#fdecea;color:#8a1c12;border-radius:8px;'
                   'padding:10px 12px;margin:16px 0 0;font-weight:600">{}</div>\n')
 
 
-def build_html_digest(sections, hours, day, title=None, lang="English", warning=None, substitutions=None):
+def build_html_digest(sections, hours, day, title=None, lang="English", warning=None, substitutions=None,
+                      grades=()):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     cards = "\n".join(
@@ -557,6 +635,8 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
     )
     if substitutions:
         cards += "\n" + render_substitutions_html(substitutions, lang)
+    for child in grades or ():
+        cards += "\n" + render_grades_html(child, lang)
     total = _total_line(sections, lang)
     return HTML_PAGE.format(
         title=htmllib.escape(title or L["html_title"]),
@@ -861,6 +941,11 @@ def parse_args(argv):
     p.add_argument("--substitutions-class", default=env("SUBSTITUTIONS_CLASS", ""),
                    help="class whose substitutions for the next school day are added to the digest, e.g. 1C")
     args = p.parse_args(argv)
+    try:  # env only: passwords don't belong on the command line
+        args.librus_accounts = librus_grades.parse_accounts(env("LIBRUS_ACCOUNTS", ""))
+    except ValueError as e:
+        p.error(str(e))
+    args.librus_state = env("LIBRUS_STATE", "") or os.path.join(os.path.dirname(args.db) or ".", "librus_state.json")
     if args.max_chars < 1:
         p.error(f"--max-chars / MAX_TRANSCRIPT_CHARS must be at least 1, got {args.max_chars}")
     args.llm_api_key = env("LLM_API_KEY", "")
@@ -932,7 +1017,15 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                                             next_school_day(now, tz))
         if substitutions.error:
             print(f"warning: substitutions: {substitutions.error}", file=sys.stderr, flush=True)
-    common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions}
+    grades, librus_state, librus_seen = [], None, {}
+    if args.librus_accounts:
+        librus_state = librus_grades.load_state(args.librus_state)
+        grades, librus_seen = librus_grades.check_grades(args.librus_accounts, librus_state)
+        for child in grades:
+            if child.error:
+                print(f"warning: librus: {child.name}: {child.error}", file=sys.stderr, flush=True)
+    common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions,
+              "grades": grades}
     digest = build_digest(sections, args.hours, **common)
     print(digest, flush=True)
     if usage := getattr(llm, "usage", None):
@@ -942,8 +1035,9 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
             f"= {run['total_tokens']} total",
             file=sys.stderr,
         )
-    if target:
-        send_to_bridge(args.bridge_url, target[0], digest)
+    if target:  # a group chat: children's grades are only for the email
+        group_text = build_digest(sections, args.hours, **{**common, "grades": ()}) if grades else digest
+        send_to_bridge(args.bridge_url, target[0], group_text)
         print(f"\nSent to {target[1]}.", file=sys.stderr)
     day = datetime.fromtimestamp(now, tz).strftime("%d.%m.%Y")
     html = build_html_digest(sections, args.hours, day, **common)
@@ -955,6 +1049,13 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         subject = args.email_subject.format(date=day, hours=args.hours, groups=groups_list)
         send_email(args.smtp, args.email_from, args.email_to, subject, digest, html=html)
         print(f"\nEmailed to {', '.join(args.email_to)}.", file=sys.stderr)
+    if librus_state is not None:
+        if args.email_to:  # emailed: these grades are no longer new
+            librus_grades.commit(librus_state, librus_seen)
+        try:  # sessions are kept either way (fewer password logins)
+            librus_grades.save_state(args.librus_state, librus_state)
+        except OSError as e:
+            print(f"warning: could not save {args.librus_state}: {e}", file=sys.stderr, flush=True)
 
 
 def main(argv=None, now=None):

@@ -34,6 +34,7 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 | Summaries with `--model dummy` / `ollama` | only your server |
 | Summaries with `--model openai` | the chat text of the selected groups (including text read from photos and voice message transcripts) is sent to the LLM provider (Groq by default) |
 | LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
+| Librus grades (only with `LIBRUS_ACCOUNTS`) | read from Librus with each child's login; seen grade ids and the Librus sessions in `librus_state.json` on your server (no passwords) |
 | The email | the email provider (Resend) and your mailbox |
 
 ## Before you start: read this
@@ -445,6 +446,45 @@ SUBSTITUTIONS_CLASS=1C
 - Both settings are needed; with only one of them the section is skipped and the log says so.
 - Check without emailing: `docker compose run --rm -e EMAIL_TO= summarizer --hours 1`.
 
+## School grades (Librus)
+
+If the school uses Librus Synergia, the digest can end with one section per child listing the grades added since
+the last emailed digest:
+
+```
+*Nowe oceny – Ania*
+- Matematyka: 5 (sprawdzian, waga 3) – Jan Kowalski, 06.11
+- Język polski: 4+ (aktywność, poprawa) – Anna Nowak, 07.11 – „Świetna praca”
+
+*Nowe oceny – Jaś*
+Brak nowych ocen.
+```
+
+```sh
+# .env - one entry per child: name:login:password, separated by ';'
+LIBRUS_ACCOUNTS=Ania:1234567u:password;Jaś:7654321u:password
+```
+
+- Each child has its own Librus account (the login is the number with `u` at the end, from the parent's account).
+  Leave the name empty (`:1234567u:password`) to use the student's first name from Librus. The password may
+  contain `:` but not `;`.
+- **New** means: not shown in an emailed digest before. The first check of an account only remembers the existing
+  grades (the section says how many) so the whole school year isn't reported at once. Only an emailed digest uses
+  the new grades up: a run that just prints the digest shows them again next time.
+- Grades are **never posted to WhatsApp**: with `--send-to` the group gets the digest without the grades sections.
+- What has been shown is kept in `librus_state.json` next to the messages database (`LIBRUS_STATE` to change it),
+  together with the Librus session (fewer password logins, and Librus's long-lived device cookie is reused). The
+  file is readable by its owner only and contains no passwords, but the session grants access to the account while
+  it is valid. If the file is damaged, the log says so and every account starts over with a first check.
+- Ordinary grades and semester/final grades and their proposals are shown (`grades()`); point, descriptive and
+  free-text grades are not.
+- It uses [librus-synergia](https://pypi.org/project/librus-synergia/), an **unofficial** client of Librus's
+  private API: it can stop working when Librus changes something, and it may be against Librus's terms of service.
+  It makes a few requests per child once a day. Grades go only to your email; no chat data is sent to Librus.
+- If an account can't be checked (wrong password, Librus down), its section says so, the grades stay new for the
+  next digest, and the rest of the digest is sent as usual.
+- Check without emailing: `docker compose run --rm -e EMAIL_TO= summarizer --hours 1`.
+
 ## Local models (Ollama)
 
 `--model ollama` keeps everything on your server. Ollama starts only on demand (profile `llm`) and unloads the
@@ -542,6 +582,8 @@ docker volume rm szalona-beata_wa-data
 | `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
 | `SUBSTITUTIONS_URL`, `SUBSTITUTIONS_CLASS` | (off) | School's Edupage site and class: adds that class's substitutions for the next school day to the digest ([section](#school-substitutions-edupage)) |
+| `LIBRUS_ACCOUNTS` | (off) | `name:login:password;...`, one Librus account per child: adds each child's new grades to the digest ([section](#school-grades-librus)) |
+| `LIBRUS_STATE` | `librus_state.json` next to `--db` | Grades already shown and the Librus sessions |
 | `MAX_TRANSCRIPT_CHARS` | `12000` | Max chat length sent to the model per group; on busier days the oldest messages are left out and the email says so under the group |
 | `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
 | `OLLAMA_MODEL` | `qwen2.5:3b` | Local model for `--model ollama` (needs ~2.5 GB free RAM) |
@@ -568,7 +610,8 @@ Next steps:
 bridge/        Go: whatsmeow wiring (main.go) + tested logic (text, convert, filter, names, store, http,
                textdetect: fast "has text?" check, ocr: Tesseract, voice: transcription API,
                mediaworker: queue of photos to OCR and voice messages to transcribe)
-summarizer/    Python stdlib only: summarize.py, sample_data.py, test_summarize.py
+summarizer/    Python: summarize.py (stdlib only), librus_grades.py (librus-synergia, imported only when
+               LIBRUS_ACCOUNTS is set), sample_data.py, tests (run without librus-synergia installed)
 test.sh        runs both test suites in Docker (no local toolchains needed)
 ```
 
