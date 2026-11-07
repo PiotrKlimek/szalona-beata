@@ -66,7 +66,8 @@ THREADS_PROMPT = (
     "never split one topic into several threads, and don't make a thread for every sentence of one message. "
     "A question someone asked in the chat that nobody answered is written as a question, "
     "never as a decision or fact, always prefixed exactly like this: '{question}: ...'; "
-    "if anyone replied (even with a guess), write the answer as a fact instead. "
+    "if anyone replied, write the answer as a fact instead. A reply that is only a guess stays "
+    "hedged (e.g. 'probably ...'). "
     "Never add questions of your own: a '{question}:' point must repeat a question that a message "
     "in the chat actually asks; an announcement, request or reminder is not a question. "
     "Skip greetings and thanks-only chatter. Do not invent anything that is not in the chat, "
@@ -855,8 +856,11 @@ class CallLog:
         self.db.commit()
 
 
+MAX_REPLAY_IDS = 1000
+
+
 def parse_ids(spec):
-    """'25,30-32' -> [25, 30, 31, 32]; ValueError on anything else."""
+    """'25,30-32' -> [25, 30, 31, 32]; ValueError on anything else or more than MAX_REPLAY_IDS ids."""
     ids = []
     for part in spec.split(","):
         m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", part)
@@ -865,6 +869,8 @@ def parse_ids(spec):
         first, last = int(m.group(1)), int(m.group(2) or m.group(1))
         if last < first:
             raise ValueError(f"bad range {part.strip()!r}")
+        if len(ids) + last - first + 1 > MAX_REPLAY_IDS:
+            raise ValueError(f"at most {MAX_REPLAY_IDS} calls per replay")
         ids.extend(range(first, last + 1))
     return ids
 
@@ -874,10 +880,14 @@ def replay(log_path, ids, llm, tz, allow_real_data, out=None):
 
     Nothing is logged or sent. Returns an exit code."""
     out = out or sys.stdout
-    db = sqlite3.connect(f"file:{log_path}?mode=ro", uri=True)
-    rows = {r[0]: r for r in db.execute(
-        f"SELECT id, ts, group_name, language, transcript, response, total_tokens, synthetic FROM llm_calls "
-        f"WHERE id IN ({', '.join('?' * len(ids))})", ids)}
+    try:
+        db = sqlite3.connect(f"file:{log_path}?mode=ro", uri=True)
+        rows = {r[0]: r for r in db.execute(
+            f"SELECT id, ts, group_name, language, transcript, response, total_tokens, synthetic, error "
+            f"FROM llm_calls WHERE id IN ({', '.join('?' * len(ids))})", ids)}
+    except sqlite3.Error as e:
+        print(f"error: cannot read {log_path}: {e}", file=sys.stderr)
+        return 2
     for missing in (i for i in ids if i not in rows):
         print(f"warning: no call #{missing} in {log_path}", file=sys.stderr)
     if not allow_real_data and any(not r[7] for r in rows.values()):
@@ -887,16 +897,19 @@ def replay(log_path, ids, llm, tz, allow_real_data, out=None):
     for i in ids:
         if i not in rows:
             continue
-        _, ts, group, language, transcript, response, tokens, _ = rows[i]
+        _, ts, group, language, transcript, response, tokens, _, error = rows[i]
         when = datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
         print(f"=== #{i} {when} {group}", file=out)
-        print(f"--- before ({tokens or 0} tokens)", file=out)
-        print(_summary_text(parse_threads(response or ""), language), file=out)
+        if response is None:
+            print(f"--- before: failed: {error}", file=out)
+        else:
+            print(f"--- before ({tokens or 0} tokens)", file=out)
+            print(_summary_text(parse_threads(response), language), file=out)
         used = llm.usage["total_tokens"]
         try:
             new = llm.summarize(transcript, language)
-        except (RuntimeError, OSError) as e:
-            print(f"--- after: failed: {e}", file=out, flush=True)
+        except Exception as e:  # one bad reply must not end the whole replay
+            print(f"--- after: failed: {e!r}", file=out, flush=True)
             continue
         print(f"--- after ({llm.usage['total_tokens'] - used} tokens)", file=out)
         print(_summary_text(new, language) + "\n", file=out, flush=True)
@@ -1144,7 +1157,10 @@ def main(argv=None, now=None):
         if args.model != "openai" or not args.llm_api_key:
             print("error: --replay needs --model openai and LLM_API_KEY", file=sys.stderr)
             return 2
-        if not args.llm_log or not os.path.exists(args.llm_log):
+        if not args.llm_log:
+            print("error: --replay reads the LLM call log, which is disabled (LLM_LOG_DB=off)", file=sys.stderr)
+            return 2
+        if not os.path.exists(args.llm_log):
             print(f"error: no LLM call log at {args.llm_log} (LLM_LOG_DB)", file=sys.stderr)
             return 2
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort)

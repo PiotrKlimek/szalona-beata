@@ -313,10 +313,11 @@ docker compose run --rm summarizer --model openai --allow-real-data --replay 25,
 === #25 2026-10-27 19:00 Klasa 3B
 --- before (1926 tokens)
 ▸ Wyjście do muzeum
+- Wtorek 3.11, koszt 5 zł
 - Pytanie: Czy rodzice mają przynieść 5 zł?
 --- after (1852 tokens)
 ▸ Wyjście do muzeum
-- Koszt: 5 zł od ucznia
+- Wtorek 3.11, koszt 5 zł
 ...
 Replayed 6 calls: 9800 tokens before, 10400 after.
 ```

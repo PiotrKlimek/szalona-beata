@@ -1996,7 +1996,8 @@ class PromptRulesTest(unittest.TestCase):
     def test_only_questions_asked_in_the_chat_and_left_unanswered(self):
         text = self.prompt()
         self.assertIn("Never add questions of your own", text)
-        self.assertIn("if anyone replied (even with a guess), write the answer as a fact", text)
+        self.assertIn("if anyone replied, write the answer as a fact instead", text)
+        self.assertIn("A reply that is only a guess stays hedged", text)
         self.assertIn("'Pytanie:' point must repeat a question that a message in the chat actually asks", text)
 
     def test_points_are_optional_not_a_quota(self):
@@ -2020,6 +2021,12 @@ class PromptRulesTest(unittest.TestCase):
 class ParseIdsTest(unittest.TestCase):
     def test_single_ids_and_ranges(self):
         self.assertEqual(summarize.parse_ids("25, 30-32,7"), [25, 30, 31, 32, 7])
+
+    def test_rejects_more_than_the_limit(self):
+        self.assertEqual(len(summarize.parse_ids("1-1000")), 1000)
+        for bad in ("1-1001", "1-1000000000", "1-999,2000-2001"):
+            with self.assertRaises(ValueError, msg=bad):
+                summarize.parse_ids(bad)
 
     def test_rejects_garbage(self):
         for bad in ("", "a", "3-1", "1-", "1,,2"):
@@ -2099,6 +2106,48 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("#1 ", out)
         self.assertIn("no call #99", err)
+
+    def test_unexpected_reply_fails_one_call_and_the_rest_continue(self):
+        self.llm.responses[("POST", "/chat/completions")] = [
+            (200, {"unexpected": True}),
+            (200, {"choices": [{"message": {"content": '{"threads": []}'}}],
+                   "usage": {"total_tokens": 7}}),
+        ]
+        code, out, _ = self.run_main("--model", "openai", "--allow-real-data", "--replay", "1-2")
+
+        self.assertEqual(code, 0)
+        self.assertIn("--- after: failed:", out)
+        self.assertIn("#2 ", out)
+        self.assertIn("Replayed 1 calls", out)
+
+    def test_failed_original_call_is_shown_as_failed(self):
+        log = summarize.CallLog(self.log_path)
+        log.record({"language": "Polish", "transcript": "x", "response": None, "error": "429 rate limited"},
+                   SCHOOL, "Klasa 3B", T0, synthetic=True)
+        log.db.close()
+
+        _, out, _ = self.run_main("--model", "openai", "--replay", "3")
+
+        self.assertIn("--- before: failed: 429 rate limited", out)
+
+    def test_broken_log_file_is_a_clean_error(self):
+        with open(self.log_path, "w") as f:
+            f.write("not a database")
+
+        code, _, err = self.run_main("--model", "openai", "--allow-real-data", "--replay", "1")
+
+        self.assertEqual(code, 2)
+        self.assertIn("error: cannot read", err)
+
+    def test_disabled_log_is_a_clear_error(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"LLM_LOG_DB": "off"}):
+            code, _, err = self.run_main("--model", "openai", "--allow-real-data", "--replay", "1")
+
+        self.assertEqual(code, 2)
+        self.assertIn("LLM_LOG_DB=off", err)
 
     def test_real_chats_need_allow_real_data(self):
         code, out, err = self.run_main("--model", "openai", "--replay", "1-2")
