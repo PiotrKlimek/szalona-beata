@@ -42,11 +42,17 @@ VOICE_NOTE = (
     f"Text after '{VOICE_TAG}' is an automatic transcript of a voice message: treat it as what "
     "the sender said and ignore misheard fragments."
 )
+# The bridge appends the text of a PDF document after this tag; see bridge/pdf.go.
+DOC_TAG = "[text in document]"
+DOC_NOTE = (
+    f"Text after '{DOC_TAG}' was read from a PDF the sender attached (its text, or OCR of a scan): "
+    "treat it as the content of that document (e.g. homework or a notice) and ignore garbled fragments."
+)
 
 SYSTEM_PROMPT = (
     "You summarize WhatsApp group chats. Write a short summary in {language}: "
     "the main topics, decisions, dates and open questions, as 3-6 bullet points. "
-    "Do not invent anything that is not in the chat. " + OCR_NOTE + " " + VOICE_NOTE
+    "Do not invent anything that is not in the chat. " + OCR_NOTE + " " + VOICE_NOTE + " " + DOC_NOTE
 )
 
 
@@ -54,6 +60,14 @@ SYSTEM_PROMPT = (
 # Images with text recognized by the bridge are not bare: "[image]\n[text in image]\n...",
 # nor are transcribed voice messages: "[voice note]\n[voice transcript]\n...".
 BARE_PLACEHOLDER = re.compile(r"^\[[a-z ]+\]$")
+
+
+def _sent(msgs, keep_senders=()):
+    """Messages that go to the model: captionless media is dropped, except from IMPORTANT_SENDERS
+    (a teacher's homework photo or PDF matters even without a caption; a sticker never does)."""
+    keep = {n.strip().casefold() for n in keep_senders}
+    return [m for m in msgs if not BARE_PLACEHOLDER.match(m.text)
+            or (m.sender.strip().casefold() in keep and m.text != "[sticker]")]
 
 
 THREADS_PROMPT = (
@@ -75,7 +89,7 @@ THREADS_PROMPT = (
     "'will send details' is not 'sent details'); when it is unclear, keep the chat's wording. "
     "Copy dates, names and abbreviations as written: don't add a year nobody wrote and don't expand "
     "abbreviations. "
-    + OCR_NOTE + " " + VOICE_NOTE + " "
+    + OCR_NOTE + " " + VOICE_NOTE + " " + DOC_NOTE + " "
     "Write titles and points in {language}. Respond with JSON only: "
     '{{"threads": [{{"title": "...", "points": ["...", "..."]}}]}}'
 )
@@ -91,7 +105,7 @@ def important_senders_note(names):
     return (
         f"Messages from these senders are always important (e.g. a teacher's homework or notices): {quoted}. "
         "Never skip any of their messages, even an attachment without any text (e.g. '[document] file.pdf' "
-        "or a photo): give it a thread or a point saying who sent what, with the file name as written."
+        "or '[image]'): give it a thread or a point saying who sent what, with the file name if there is one."
     )
 
 
@@ -114,6 +128,7 @@ class Section(NamedTuple):
     omitted: int = 0  # messages left out of a too-long transcript
     ocr_images: int = 0  # photos whose recognized text the model was given
     voice_notes: int = 0  # voice messages whose transcript the model was given
+    documents: int = 0  # PDFs whose text the model was given
 
 
 # Email/digest labels by SUMMARY_LANGUAGE; plural forms are (one, few, many).
@@ -130,6 +145,8 @@ LABELS = {
         "photo": ("photo", "photos", "photos"),
         "voice": "🎤 Includes {count} (automatic transcript, may contain errors).",
         "voice_note": ("voice message", "voice messages", "voice messages"),
+        "doc": "📄 Includes text from {count} (may contain recognition errors).",
+        "document": ("PDF document", "PDF documents", "PDF documents"),
         "footer": "Generated locally by szalona-beata from your WhatsApp groups.",
         "subst_title": "Substitutions – class {cls}, {day}",
         "subst_none": "No substitutions.",
@@ -165,6 +182,8 @@ LABELS = {
         "ocr": "📷 Uwzględniono tekst odczytany ze zdjęć (OCR, możliwe błędy odczytu): {count}.",
         "photo": ("zdjęcie", "zdjęcia", "zdjęć"),
         "voice": "🎤 Uwzględniono treść wiadomości głosowych (automatyczna transkrypcja, możliwe błędy): {count}.",
+        "doc": "📄 Uwzględniono tekst z dokumentów PDF (możliwe błędy odczytu): {count}.",
+        "document": ("dokument", "dokumenty", "dokumentów"),
         "voice_note": ("wiadomość głosowa", "wiadomości głosowe", "wiadomości głosowych"),
         "footer": "Wygenerowane lokalnie przez szalona-beata z Twoich grup WhatsApp.",
         "subst_title": "Zastępstwa – klasa {cls}, {day}",
@@ -256,16 +275,16 @@ def _hhmm(ts, tz):
     return datetime.fromtimestamp(ts, tz).strftime("%H:%M")
 
 
-def format_transcript(msgs, max_chars, tz=None):
+def format_transcript(msgs, max_chars, tz=None, keep_senders=()):
     """The transcript text only (see build_transcript)."""
-    return build_transcript(msgs, max_chars, tz)[0]
+    return build_transcript(msgs, max_chars, tz, keep_senders)[0]
 
 
-def build_transcript(msgs, max_chars, tz=None):
+def build_transcript(msgs, max_chars, tz=None, keep_senders=()):
     """Render messages as chat lines, keeping the most recent ones within max_chars.
     Returns (text, number of messages left out). Captionless media ("[image]") is
-    never sent, so it doesn't count as left out."""
-    lines = [f"[{_hhmm(m.ts, tz)}] {m.sender}: {m.text}" for m in msgs if not BARE_PLACEHOLDER.match(m.text)]
+    not sent (see _sent), so it doesn't count as left out."""
+    lines = [f"[{_hhmm(m.ts, tz)}] {m.sender}: {m.text}" for m in _sent(msgs, keep_senders)]
     kept, size = [], 0
     for line in reversed(lines):
         size += len(line) + (1 if kept else 0)
@@ -317,16 +336,22 @@ def _voice_note(section, lang):
     return L["voice"].format(count=plural(section.voice_notes, L["voice_note"], lang))
 
 
+def _doc_note(section, lang):
+    L = labels(lang)
+    return L["doc"].format(count=plural(section.documents, L["document"], lang))
+
+
 def _section_notes(section, lang):
-    """Notes under a group's name: truncated chat, text read from photos, transcribed voice messages."""
+    """Notes under a group's name: truncated chat, text read from photos, voice messages and PDFs."""
     return ([_truncated_note(section, lang)] if section.omitted else []) + \
         ([_ocr_note(section, lang)] if section.ocr_images else []) + \
-        ([_voice_note(section, lang)] if section.voice_notes else [])
+        ([_voice_note(section, lang)] if section.voice_notes else []) + \
+        ([_doc_note(section, lang)] if section.documents else [])
 
 
-def tagged_sent(msgs, omitted, tag):
-    """Messages with text added by the bridge (tag: OCR_TAG, VOICE_TAG) among those build_transcript kept."""
-    sent = [m for m in msgs if not BARE_PLACEHOLDER.match(m.text)][omitted:]
+def tagged_sent(msgs, omitted, tag, keep_senders=()):
+    """Messages with text added by the bridge (OCR_TAG, VOICE_TAG, DOC_TAG) among those build_transcript kept."""
+    sent = _sent(msgs, keep_senders)[omitted:]
     return sum(tag in m.text for m in sent)
 
 
@@ -602,6 +627,9 @@ def _card_meta_html(section, lang):
         html += f'<div style="font-size:13px;color:#7a8783;margin:0 0 8px">{note}</div>'
     if section.voice_notes:
         note = htmllib.escape(_voice_note(section, lang))
+        html += f'<div style="font-size:13px;color:#7a8783;margin:0 0 8px">{note}</div>'
+    if section.documents:
+        note = htmllib.escape(_doc_note(section, lang))
         html += f'<div style="font-size:13px;color:#7a8783;margin:0 0 8px">{note}</div>'
     return html
 
@@ -1095,15 +1123,17 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
     sections = []
     for jid, name in groups:
         msgs = fetch_messages(db, jid, since)
-        omitted = ocr = voice = 0
+        omitted = ocr = voice = docs = 0
         if not msgs:
             summary = None
         elif llm:
-            transcript, omitted = build_transcript(msgs, args.max_chars, tz)
+            keep = args.important_senders
+            transcript, omitted = build_transcript(msgs, args.max_chars, tz, keep)
             try:
                 summary = llm.summarize(transcript, args.language)
-                ocr = tagged_sent(msgs, omitted, OCR_TAG)
-                voice = tagged_sent(msgs, omitted, VOICE_TAG)
+                ocr = tagged_sent(msgs, omitted, OCR_TAG, keep)
+                voice = tagged_sent(msgs, omitted, VOICE_TAG, keep)
+                docs = tagged_sent(msgs, omitted, DOC_TAG, keep)
             except (RuntimeError, OSError) as e:  # API error, timeout, network
                 print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
                 omitted = 0  # the fallback statistics cover every message
@@ -1116,7 +1146,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                     print(f"warning: could not log the LLM call: {e}", file=sys.stderr, flush=True)
         else:
             summary = dummy_summary(msgs, tz, lang)
-        sections.append(Section(name, summary, len(msgs), omitted, ocr, voice))
+        sections.append(Section(name, summary, len(msgs), omitted, ocr, voice, docs))
 
     substitutions = None
     if bool(args.substitutions_url) != bool(args.substitutions_class):

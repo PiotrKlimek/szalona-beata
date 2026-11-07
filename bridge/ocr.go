@@ -160,6 +160,10 @@ func runOCRCommand(paths []string, langs string) error {
 			return err
 		}
 		start := time.Now()
+		if looksLikePDF(data) {
+			printPDFResult(f, data, langs)
+			continue
+		}
 		res, err := recognize(context.Background(), data, langs)
 		took := time.Since(start).Round(time.Millisecond)
 		switch {
@@ -174,6 +178,25 @@ func runOCRCommand(paths []string, langs string) error {
 		}
 	}
 	return nil
+}
+
+// printPDFResult shows what the bridge reads from a local PDF (ocr subcommand).
+func printPDFResult(f string, data []byte, langs string) {
+	start := time.Now()
+	res, err := readPDF(context.Background(), data, langs)
+	took := time.Since(start).Round(time.Millisecond)
+	how := "text layer"
+	if res.OCR {
+		how = fmt.Sprintf("OCR of %d page(s)", res.Pages)
+	}
+	switch {
+	case err != nil:
+		fmt.Printf("%s: error: %v\n", f, err)
+	case res.Text == "":
+		fmt.Printf("%s: PDF, no text (%s), %s\n", f, how, took)
+	default:
+		fmt.Printf("%s: PDF text (%s), %s\n  %s\n", f, how, took, strings.ReplaceAll(res.Text, "\n", "\n  "))
+	}
 }
 
 // checkTesseract verifies that tesseract is installed with every language in langs ("pol+eng").

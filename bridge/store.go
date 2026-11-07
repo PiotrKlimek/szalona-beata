@@ -48,6 +48,17 @@ CREATE TABLE IF NOT EXISTS voice_queue (
 	next_try INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (chat_jid, id)
 );
+-- PDF documents waiting for their text to be read, like ocr_queue (document is
+-- the marshaled waE2E.DocumentMessage).
+CREATE TABLE IF NOT EXISTS pdf_queue (
+	chat_jid TEXT NOT NULL,
+	id       TEXT NOT NULL,
+	ts       INTEGER NOT NULL,
+	document BLOB NOT NULL,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	next_try INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (chat_jid, id)
+);
 `
 
 // mediaQueue is a queue of media messages whose text (recognized in an image,
@@ -59,7 +70,8 @@ type mediaQueue struct {
 var (
 	imageQueue  = mediaQueue{"ocr_queue", "image", ocrTag}
 	voiceQueue  = mediaQueue{"voice_queue", "audio", voiceTag}
-	mediaQueues = []mediaQueue{imageQueue, voiceQueue}
+	pdfQueue    = mediaQueue{"pdf_queue", "document", pdfTag}
+	mediaQueues = []mediaQueue{imageQueue, voiceQueue, pdfQueue}
 )
 
 // Message is a group message as stored for the summarizer.
