@@ -613,7 +613,7 @@ docker volume rm szalona-beata_wa-data
 | `LLM_API_KEY` | | Groq (or other OpenAI-compatible) API key; the bridge uses it only with `TRANSCRIBE_VOICE=on` |
 | `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
-| `IMPORTANT_SENDERS` | (none) | Comma-separated sender names (as shown in the chat, e.g. a teacher) whose messages the model must never skip, even an attachment without text |
+| `IMPORTANT_SENDERS` | (none) | Comma-separated sender names, e.g. a teacher, whose messages are never skipped: even a photo or a file sent without a caption goes to the model. Spell each name as the sender appears in the chat transcript (case doesn't matter, no commas inside a name); a sender shown under another name or as a phone number is not matched |
 | `SUBSTITUTIONS_URL`, `SUBSTITUTIONS_CLASS` | (off) | School's Edupage site and class: adds that class's substitutions for the next school day to the digest ([section](#school-substitutions-edupage)) |
 | `LIBRUS_ACCOUNTS` | (off) | `name:login:password;...`, one Librus account per child: adds each child's new grades to the digest ([section](#school-grades-librus)) |
 | `LIBRUS_STATE` | `librus_state.json` next to `--db` | Grades already shown and the Librus sessions |

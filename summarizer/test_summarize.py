@@ -1588,6 +1588,23 @@ class MainTest(unittest.TestCase):
         self.assertEqual((parsed, tokens, error, synthetic), (1, 60, None, 0))
         self.assertEqual(ts, T0 + 3600)
 
+    def test_important_senders_reach_prompt_and_transcript(self):
+        import os
+        from unittest import mock
+
+        db = sqlite3.connect(self.db_path)
+        add_msg(db, BIKES, "c", T0 + 120, "Anna Nowak ", "[document]")
+        db.commit()
+        db.close()
+        srv = self.llm_server()
+        with mock.patch.dict(os.environ, {"LLM_API_KEY": "k", "LLM_BASE_URL": srv.url, "LLM_LOG_DB": "off",
+                                          "IMPORTANT_SENDERS": "Anna Nowak"}):
+            self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+
+        system, user = (m["content"] for m in srv.requests[0][2]["messages"])
+        self.assertIn("'Anna Nowak'", system)
+        self.assertIn("Anna Nowak : [document]", user)
+
     def test_failed_llm_call_is_logged_with_error(self):
         import os
         from unittest import mock
@@ -2035,7 +2052,7 @@ class ImportantSendersTest(unittest.TestCase):
             "choices": [{"message": {"content": '{"threads": []}'}}]})})
         self.addCleanup(srv.close)
         llm = summarize.OpenAICompat(srv.url + "/v1", "k", "m", important_senders=["Anna Nowak"])
-        llm.summarize("[11:25] Anna Nowak: [document] zadanie.pdf", "Polish")
+        llm.summarize("[11:25] Anna Nowak : [document] zadanie.pdf", "Polish")
         system = srv.requests[0][2]["messages"][0]["content"]
         self.assertTrue(system.startswith(summarize.THREADS_PROMPT.format(language="Polish", question="Pytanie")))
         self.assertIn(summarize.important_senders_note(["Anna Nowak"]), system)
@@ -2054,6 +2071,37 @@ class ImportantSendersTest(unittest.TestCase):
         self.addCleanup(srv.close)
         summarize.Ollama(srv.url, "m", important_senders=["Anna Nowak"]).summarize("x", "Polish")
         self.assertIn("'Anna Nowak'", srv.requests[0][2]["messages"][0]["content"])
+
+    def test_ollama_prompt_unchanged_without_senders(self):
+        srv = FakeServer({("POST", "/api/chat"): (200, {"message": {"content": "ok"}})})
+        self.addCleanup(srv.close)
+        summarize.Ollama(srv.url, "m").summarize("x", "Polish")
+        self.assertEqual(srv.requests[0][2]["messages"][0]["content"], summarize.SYSTEM_PROMPT.format(language="Polish"))
+
+    def test_braces_in_a_name_are_safe(self):
+        self.assertIn("'{x}'", summarize.important_senders_note(["{x}"]))
+
+    MSGS = [
+        summarize.Msg(T0, "Anna Nowak ", "[image]"),          # the bridge's names can end with a space
+        summarize.Msg(T0 + 60, "Anna Nowak", "[document]"),
+        summarize.Msg(T0 + 120, "Anna Nowak", "[sticker]"),   # never content
+        summarize.Msg(T0 + 180, "Bartek", "[image]"),
+        summarize.Msg(T0 + 240, "Bartek", "Dzięki!"),
+    ]
+
+    def test_bare_media_from_important_senders_reaches_the_model(self):
+        got = summarize.format_transcript(self.MSGS, 10_000, timezone.utc, keep_senders=["anna nowak"])
+        self.assertEqual(got, "[10:00] Anna Nowak : [image]\n[10:01] Anna Nowak: [document]\n[10:04] Bartek: Dzięki!")
+
+    def test_bare_media_still_skipped_for_others(self):
+        self.assertEqual(summarize.format_transcript(self.MSGS, 10_000, timezone.utc), "[10:04] Bartek: Dzięki!")
+
+    def test_tagged_sent_counts_the_same_messages(self):
+        msgs = [summarize.Msg(T0, "Anna Nowak", "[image]"),
+                summarize.Msg(T0 + 60, "Ola", "[image]\n[text in image]\nZebranie")]
+        _, omitted = summarize.build_transcript(msgs, 40, timezone.utc, keep_senders=["Anna Nowak"])
+        self.assertEqual(omitted, 1)
+        self.assertEqual(summarize.tagged_sent(msgs, omitted, summarize.OCR_TAG, keep_senders=["Anna Nowak"]), 1)
 
     def test_parse_args_reads_comma_separated_names(self):
         import os
@@ -2140,6 +2188,14 @@ class ReplayTest(unittest.TestCase):
         system = body["messages"][0]["content"]
         self.assertIn("Polish", system)
         self.assertEqual(system, summarize.THREADS_PROMPT.format(language="Polish", question="Pytanie"))
+
+    def test_replay_prompt_includes_important_senders(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"IMPORTANT_SENDERS": "Anna Nowak"}):
+            self.run_main("--model", "openai", "--allow-real-data", "--replay", "1")
+        self.assertIn("'Anna Nowak'", self.llm.requests[0][2]["messages"][0]["content"])
 
     def test_nothing_is_logged_or_emailed(self):
         self.run_main("--model", "openai", "--allow-real-data", "--replay", "1-2")

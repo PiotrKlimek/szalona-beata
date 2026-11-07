@@ -56,6 +56,14 @@ SYSTEM_PROMPT = (
 BARE_PLACEHOLDER = re.compile(r"^\[[a-z ]+\]$")
 
 
+def _sent(msgs, keep_senders=()):
+    """Messages that go to the model: captionless media is dropped, except from IMPORTANT_SENDERS
+    (a teacher's homework photo or PDF matters even without a caption; a sticker never does)."""
+    keep = {n.strip().casefold() for n in keep_senders}
+    return [m for m in msgs if not BARE_PLACEHOLDER.match(m.text)
+            or (m.sender.strip().casefold() in keep and m.text != "[sticker]")]
+
+
 THREADS_PROMPT = (
     "You summarize WhatsApp group chats. Messages about different topics are often interleaved; "
     "split the chat into separate threads, one per topic (e.g. homework, a lost item, a trip), "
@@ -91,7 +99,7 @@ def important_senders_note(names):
     return (
         f"Messages from these senders are always important (e.g. a teacher's homework or notices): {quoted}. "
         "Never skip any of their messages, even an attachment without any text (e.g. '[document] file.pdf' "
-        "or a photo): give it a thread or a point saying who sent what, with the file name as written."
+        "or '[image]'): give it a thread or a point saying who sent what, with the file name if there is one."
     )
 
 
@@ -256,16 +264,16 @@ def _hhmm(ts, tz):
     return datetime.fromtimestamp(ts, tz).strftime("%H:%M")
 
 
-def format_transcript(msgs, max_chars, tz=None):
+def format_transcript(msgs, max_chars, tz=None, keep_senders=()):
     """The transcript text only (see build_transcript)."""
-    return build_transcript(msgs, max_chars, tz)[0]
+    return build_transcript(msgs, max_chars, tz, keep_senders)[0]
 
 
-def build_transcript(msgs, max_chars, tz=None):
+def build_transcript(msgs, max_chars, tz=None, keep_senders=()):
     """Render messages as chat lines, keeping the most recent ones within max_chars.
     Returns (text, number of messages left out). Captionless media ("[image]") is
-    never sent, so it doesn't count as left out."""
-    lines = [f"[{_hhmm(m.ts, tz)}] {m.sender}: {m.text}" for m in msgs if not BARE_PLACEHOLDER.match(m.text)]
+    not sent (see _sent), so it doesn't count as left out."""
+    lines = [f"[{_hhmm(m.ts, tz)}] {m.sender}: {m.text}" for m in _sent(msgs, keep_senders)]
     kept, size = [], 0
     for line in reversed(lines):
         size += len(line) + (1 if kept else 0)
@@ -324,9 +332,9 @@ def _section_notes(section, lang):
         ([_voice_note(section, lang)] if section.voice_notes else [])
 
 
-def tagged_sent(msgs, omitted, tag):
+def tagged_sent(msgs, omitted, tag, keep_senders=()):
     """Messages with text added by the bridge (tag: OCR_TAG, VOICE_TAG) among those build_transcript kept."""
-    sent = [m for m in msgs if not BARE_PLACEHOLDER.match(m.text)][omitted:]
+    sent = _sent(msgs, keep_senders)[omitted:]
     return sum(tag in m.text for m in sent)
 
 
@@ -1099,11 +1107,12 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         if not msgs:
             summary = None
         elif llm:
-            transcript, omitted = build_transcript(msgs, args.max_chars, tz)
+            keep = args.important_senders
+            transcript, omitted = build_transcript(msgs, args.max_chars, tz, keep)
             try:
                 summary = llm.summarize(transcript, args.language)
-                ocr = tagged_sent(msgs, omitted, OCR_TAG)
-                voice = tagged_sent(msgs, omitted, VOICE_TAG)
+                ocr = tagged_sent(msgs, omitted, OCR_TAG, keep)
+                voice = tagged_sent(msgs, omitted, VOICE_TAG, keep)
             except (RuntimeError, OSError) as e:  # API error, timeout, network
                 print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
                 omitted = 0  # the fallback statistics cover every message
