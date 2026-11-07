@@ -676,6 +676,20 @@ Next steps:
       what. The prompt now forbids each of these; checked with `--replay` on the same transcripts.
       Known leftovers: OCR text from photos of notebooks can still become a vague point, and roles in
       very short messages (e.g. "X paid") are sometimes misread.
+- [x] **Important senders and PDFs (November 2026).** A teacher's homework sent as a captionless scanned PDF
+      was summarized as "nothing notable". `IMPORTANT_SENDERS` now keeps everything chosen senders post, and
+      the bridge reads the text of PDFs (text layer, or OCR of scans).
+- [ ] **Check PDF reading on real files.** So far tested only on generated PDFs. After the first real PDFs
+      arrive, look at what was read (`docker compose logs bridge | grep -i pdf`, `llm_log.db`) and tune the
+      thresholds in `bridge/pdf.go` (text layer vs OCR, render size) if needed.
+- [ ] **Look for important messages the model skipped.** Go through a week of `llm_log.db` for messages that
+      were left out of the digest but look important (from teachers, with dates, homework, things to bring,
+      meetings); fix the prompt and check with `--replay` on the same transcripts.
+- [ ] **Known prompt weak spots.** Photos of notebooks still turn into vague points; roles in very short
+      messages ("X paid") are sometimes misread.
+- [ ] **Word and Excel documents.** Only PDFs are read; `.docx`/`.xlsx` could be read locally the same way.
+- [ ] **Warn at the top of the email when a source breaks.** An expired Librus session or a changed Edupage
+      page now shows only as an error inside its section; show it prominently, like a disconnected bridge.
 
 ## Development
 
