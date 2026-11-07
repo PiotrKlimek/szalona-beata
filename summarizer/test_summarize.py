@@ -2018,6 +2018,53 @@ class PromptRulesTest(unittest.TestCase):
             self.assertIn("skip it entirely", prompt.format(language="Polish", question="Pytanie"))
 
 
+class ImportantSendersTest(unittest.TestCase):
+    """IMPORTANT_SENDERS: e.g. a teacher whose bare attachment (homework PDF) was dropped as unimportant."""
+
+    def test_note_names_the_senders_and_keeps_bare_attachments(self):
+        note = summarize.important_senders_note(["Anna Nowak", "Jan Kowalski"])
+        self.assertIn("'Anna Nowak', 'Jan Kowalski'", note)
+        self.assertIn("always important", note)
+        self.assertIn("even an attachment without any text", note)
+
+    def test_no_senders_no_note(self):
+        self.assertEqual(summarize.important_senders_note([]), "")
+
+    def test_openai_prompt_includes_the_note(self):
+        srv = FakeServer({("POST", "/v1/chat/completions"): (200, {
+            "choices": [{"message": {"content": '{"threads": []}'}}]})})
+        self.addCleanup(srv.close)
+        llm = summarize.OpenAICompat(srv.url + "/v1", "k", "m", important_senders=["Anna Nowak"])
+        llm.summarize("[11:25] Anna Nowak: [document] zadanie.pdf", "Polish")
+        system = srv.requests[0][2]["messages"][0]["content"]
+        self.assertTrue(system.startswith(summarize.THREADS_PROMPT.format(language="Polish", question="Pytanie")))
+        self.assertIn(summarize.important_senders_note(["Anna Nowak"]), system)
+        self.assertEqual(llm.last_exchange["system_prompt"], system)
+
+    def test_openai_prompt_unchanged_without_senders(self):
+        srv = FakeServer({("POST", "/v1/chat/completions"): (200, {
+            "choices": [{"message": {"content": '{"threads": []}'}}]})})
+        self.addCleanup(srv.close)
+        summarize.OpenAICompat(srv.url + "/v1", "k", "m").summarize("x", "Polish")
+        self.assertEqual(srv.requests[0][2]["messages"][0]["content"],
+                         summarize.THREADS_PROMPT.format(language="Polish", question="Pytanie"))
+
+    def test_ollama_prompt_includes_the_note(self):
+        srv = FakeServer({("POST", "/api/chat"): (200, {"message": {"content": "ok"}})})
+        self.addCleanup(srv.close)
+        summarize.Ollama(srv.url, "m", important_senders=["Anna Nowak"]).summarize("x", "Polish")
+        self.assertIn("'Anna Nowak'", srv.requests[0][2]["messages"][0]["content"])
+
+    def test_parse_args_reads_comma_separated_names(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"IMPORTANT_SENDERS": " Anna Nowak , ,Jan Kowalski"}):
+            self.assertEqual(summarize.parse_args([]).important_senders, ["Anna Nowak", "Jan Kowalski"])
+        with mock.patch.dict(os.environ, {"IMPORTANT_SENDERS": ""}):
+            self.assertEqual(summarize.parse_args([]).important_senders, [])
+
+
 class ParseIdsTest(unittest.TestCase):
     def test_single_ids_and_ranges(self):
         self.assertEqual(summarize.parse_ids("25, 30-32,7"), [25, 30, 31, 32, 7])
