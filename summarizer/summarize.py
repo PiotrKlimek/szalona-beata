@@ -165,12 +165,11 @@ LABELS = {
         "payments_title": "Payments – {name}",
         "payments_none": "Nothing to pay.",
         "payments_error": "Could not fetch the payments ({error}).",
-        "payments_due": "{child}: {amount} due {day}",
-        "payments_owed": "{child}: {amount}",
-        "payments_nothing": "{child}: nothing to pay",
+        "payments_due": "To pay: {amount} by {day}",
+        "payments_owed": "To pay: {amount}",
+        "payments_nothing": "Nothing to pay",
         "payments_overdue": "including {amount} overdue",
         "payments_overpaid": "overpaid {amount}",
-        "payments_total": "Total: {amount}",
         "grade_kinds": {"semester": "semester grade", "semester_proposition": "proposed semester grade",
                         "final": "final grade", "final_proposition": "proposed final grade"},
         "bridge": {
@@ -212,12 +211,11 @@ LABELS = {
         "payments_title": "Płatności – {name}",
         "payments_none": "Nic do zapłaty.",
         "payments_error": "Nie udało się pobrać płatności ({error}).",
-        "payments_due": "{child}: {amount} do {day}",
-        "payments_owed": "{child}: {amount}",
-        "payments_nothing": "{child}: nic do zapłaty",
+        "payments_due": "Do zapłaty: {amount} do {day}",
+        "payments_owed": "Do zapłaty: {amount}",
+        "payments_nothing": "Nic do zapłaty",
         "payments_overdue": "w tym zaległość {amount}",
         "payments_overpaid": "nadpłata {amount}",
-        "payments_total": "Razem: {amount}",
         "grade_kinds": {"semester": "ocena śródroczna", "semester_proposition": "propozycja oceny śródrocznej",
                         "final": "ocena roczna", "final_proposition": "propozycja oceny rocznej"},
         "bridge": {
@@ -536,30 +534,27 @@ def _money(amount, lang):
     return f"PLN {amount:.2f}"
 
 
-def _payments_lines(payments, lang):
-    """(lines, note): one line per agreement plus a total when more than one has something to pay,
-    or the 'none' / 'error' message as the note."""
+def _payments_line(payments, lang):
+    """(line, muted): one total for all children - what is due by the nearest date, arrears included -
+    or 'nothing to pay' (with the overpayment) / 'no agreements' / the error."""
     L = labels(lang)
     if payments.error:
-        return [], L["payments_error"].format(error=payments.error)
+        return L["payments_error"].format(error=payments.error), True
     if not payments.items:
-        return [], L["payments_none"]
-    lines = []
-    for due in payments.items:
-        if due.amount > 0:
-            day = due.day.strftime("%d.%m.%Y") if due.day else None
-            line = L["payments_due" if day else "payments_owed"].format(
-                child=due.child, amount=_money(due.amount, lang), day=day)
-            if due.overdue > 0:
-                line += f" ({L['payments_overdue'].format(amount=_money(due.overdue, lang))})"
-        else:
-            line = L["payments_nothing"].format(child=due.child)
-            if due.overpaid > 0:
-                line += f" ({L['payments_overpaid'].format(amount=_money(due.overpaid, lang))})"
-        lines.append(line)
-    owing = [d.amount for d in payments.items if d.amount > 0]
-    total = L["payments_total"].format(amount=_money(sum(owing), lang)) if len(owing) > 1 else None
-    return lines, total
+        return L["payments_none"], True
+    owing = [d for d in payments.items if d.amount > 0]
+    if not owing:
+        line = L["payments_nothing"]
+        if overpaid := sum(d.overpaid for d in payments.items):
+            line += f" ({L['payments_overpaid'].format(amount=_money(overpaid, lang))})"
+        return line + ".", True
+    days = [d.day for d in owing if d.day]
+    amount = _money(sum(d.amount for d in owing), lang)
+    line = (L["payments_due"].format(amount=amount, day=min(days).strftime("%d.%m.%Y")) if days
+            else L["payments_owed"].format(amount=amount))
+    if overdue := sum(d.overdue for d in owing):
+        line += f" ({L['payments_overdue'].format(amount=_money(overdue, lang))})"
+    return line, False
 
 
 def _payments_title(payments, lang):
@@ -567,9 +562,7 @@ def _payments_title(payments, lang):
 
 
 def _payments_text(payments, lang):
-    lines, note = _payments_lines(payments, lang)
-    body = "\n".join([*(f"- {line}" for line in lines), *([note] if note else [])])
-    return f"*{_payments_title(payments, lang)}*\n{body}"
+    return f"*{_payments_title(payments, lang)}*\n{_payments_line(payments, lang)[0]}"
 
 
 def build_digest(sections, hours, title=None, lang="English", warning=None, substitutions=None, grades=(),
@@ -747,14 +740,9 @@ PAYMENTS_BLOCK = """<table role="presentation" width="100%" cellpadding="0" cell
 
 
 def render_payments_html(payments, lang):
-    lines, note = _payments_lines(payments, lang)
-    body = ""
-    if lines:
-        lis = "".join(f'<li style="{LI_STYLE}">{htmllib.escape(line)}</li>' for line in lines)
-        body = f'<ul style="{UL_STYLE};margin-bottom:0">{lis}</ul>'
-    if note:
-        style = "margin:0;font-weight:600" if lines else "margin:0;color:#7a8783;font-style:italic"
-        body += f'<p style="{style}">{htmllib.escape(note)}</p>'
+    line, muted = _payments_line(payments, lang)
+    style = "margin:0;color:#7a8783;font-style:italic" if muted else "margin:0;font-weight:600"
+    body = f'<p style="{style}">{htmllib.escape(line)}</p>'
     return PAYMENTS_BLOCK.format(title=htmllib.escape(_payments_title(payments, lang)), body=body)
 
 

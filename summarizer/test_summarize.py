@@ -917,31 +917,35 @@ class EduskyPaymentsRenderTest(unittest.TestCase):
     def due(self, child="Ania", day=date(2026, 11, 10), amount=255.0, overdue=0.0, overpaid=0.0):
         return edusky_payments.Due(child, day, amount, overdue, overpaid)
 
-    def test_text_section_is_last(self):
+    def test_one_total_as_the_last_section(self):
         subs = summarize.Substitutions("1C", date(2026, 11, 10), [], None, "")
         grades = [librus_grades.ChildGrades("Ania", [])]
         text = summarize.build_digest([("Klasa 1C", "x", 1)], 24, lang="Polish", substitutions=subs, grades=grades,
                                       payments=self.payments([self.due(), self.due("Jaś", amount=340.0)]))
-        self.assertTrue(text.endswith("*Płatności – Angielski*\n"
-                                      "- Ania: 255,00 zł do 10.11.2026\n"
-                                      "- Jaś: 340,00 zł do 10.11.2026\n"
-                                      "Razem: 595,00 zł"), text)
+        self.assertTrue(text.endswith("*Płatności – Angielski*\nDo zapłaty: 595,00 zł do 10.11.2026"), text)
+        self.assertNotIn("Ania: ", text.split("Płatności")[1])  # no per-child lines
         self.assertLess(text.index("Nowe oceny"), text.index("Zastępstwa"))
         self.assertLess(text.index("Zastępstwa"), text.index("Płatności"))
 
-    def test_arrears_overpayment_and_nothing_due(self):
+    def test_nearest_due_date_and_summed_arrears(self):
         text = summarize.build_digest([], 24, lang="Polish", payments=self.payments([
-            self.due(amount=1234.5, overdue=100.0),
-            self.due("Jaś", day=None, amount=0.0, overpaid=20.0),
+            self.due(day=date(2026, 12, 10), amount=1000.0, overdue=60.0),
+            self.due("Jaś", day=date(2026, 11, 10), amount=234.5, overdue=40.0),
+            self.due("Ola", day=None, amount=0.0, overpaid=20.0),  # paid up: not in the sum
         ]))
-        no_date = summarize.build_digest([], 24, lang="Polish", payments=self.payments([
-            self.due(day=None, amount=100.0, overdue=100.0)]))
-        self.assertIn("- Ania: 100,00 zł (w tym zaległość 100,00 zł)", no_date)
-        self.assertIn("- Ania: 1234,50 zł do 10.11.2026 (w tym zaległość 100,00 zł)\n"
-                      "- Jaś: nic do zapłaty (nadpłata 20,00 zł)", text)
-        self.assertNotIn("Razem", text)  # only one child owes anything
+        self.assertIn("*Płatności – Angielski*\nDo zapłaty: 1234,50 zł do 10.11.2026 (w tym zaległość 100,00 zł)",
+                      text)
+        self.assertNotIn("nadpłata", text)
 
-    def test_no_agreements_and_error(self):
+    def test_arrears_without_a_date(self):
+        text = summarize.build_digest([], 24, lang="Polish", payments=self.payments([
+            self.due(day=None, amount=100.0, overdue=100.0)]))
+        self.assertIn("\nDo zapłaty: 100,00 zł (w tym zaległość 100,00 zł)", text)
+
+    def test_nothing_to_pay_overpayment_no_agreements_and_error(self):
+        paid = summarize.build_digest([], 24, lang="Polish", payments=self.payments([
+            self.due(day=None, amount=0.0, overpaid=20.0), self.due("Jaś", day=None, amount=0.0, overpaid=5.0)]))
+        self.assertIn("*Płatności – Angielski*\nNic do zapłaty (nadpłata 25,00 zł).", paid)
         none = summarize.build_digest([], 24, lang="Polish", payments=self.payments())
         self.assertIn("*Płatności – Angielski*\nNic do zapłaty.", none)
         failed = summarize.build_digest([], 24, lang="Polish", payments=self.payments(error="timeout"))
@@ -950,8 +954,10 @@ class EduskyPaymentsRenderTest(unittest.TestCase):
     def test_english_labels(self):
         text = summarize.build_digest([], 24, lang="English", payments=self.payments([
             self.due(amount=440.0, overdue=100.0), self.due("Jaś", amount=340.0)]))
-        self.assertIn("*Payments – Angielski*\n- Ania: PLN 440.00 due 10.11.2026 (including PLN 100.00 overdue)\n"
-                      "- Jaś: PLN 340.00 due 10.11.2026\nTotal: PLN 780.00", text)
+        self.assertIn("*Payments – Angielski*\nTo pay: PLN 780.00 by 10.11.2026 (including PLN 100.00 overdue)", text)
+        paid = summarize.build_digest([], 24, lang="English", payments=self.payments([
+            self.due(day=None, amount=0.0, overpaid=20.0)]))
+        self.assertIn("\nNothing to pay (overpaid PLN 20.00).", paid)
 
     def test_text_digest_without_payments_is_unchanged(self):
         self.assertEqual(summarize.build_digest([], 24, lang="Polish", payments=None),
@@ -961,13 +967,11 @@ class EduskyPaymentsRenderTest(unittest.TestCase):
         subs = summarize.Substitutions("1C", date(2026, 11, 10), [], None, "")
         html = summarize.build_html_digest([("Klasa 1C", "x", 1)], 24, "09.11.2026", lang="Polish",
                                            substitutions=subs, grades=[librus_grades.ChildGrades("Ania", [])],
-                                           payments=self.payments([self.due("<Ania>"), self.due("Jaś")],
-                                                                  name="A & B"))
+                                           payments=self.payments([self.due(), self.due("Jaś")], name="A & B"))
         block = html[html.index('data-payments="1"'):]
         self.assertGreater(html.index('data-payments="1"'), html.index('data-substitutions="1"'))
         self.assertIn("Płatności – A &amp; B", block)
-        self.assertIn("&lt;Ania&gt;: 255,00 zł do 10.11.2026", block)
-        self.assertIn("Razem: 510,00 zł", block)
+        self.assertIn("Do zapłaty: 510,00 zł do 10.11.2026", block)
         self.assertNotIn("data-payments", summarize.build_html_digest([], 24, "09.11.2026"))
         failed = summarize.build_html_digest([], 24, "09.11.2026", lang="Polish",
                                              payments=self.payments(error="<oops>"))
@@ -2110,7 +2114,7 @@ class MainTest(unittest.TestCase):
             code, out = self.run_main("--group", "rowery", "--hours", "2")
         self.assertEqual(code, 0)
         self.assertEqual(calls, [("https://szkola.edusky.example", "Rodzic", "tajne", "Angielski")])
-        self.assertTrue(out.rstrip().endswith("*Płatności – Angielski*\n- Ania: 255,00 zł do 10.11.2026"), out)
+        self.assertTrue(out.rstrip().endswith("*Płatności – Angielski*\nDo zapłaty: 255,00 zł do 10.11.2026"), out)
 
     def test_edusky_failure_is_a_warning(self):
         import os

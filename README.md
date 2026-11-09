@@ -558,13 +558,11 @@ LIBRUS_ACCOUNTS=Ania:1234567u:password;Jaś:7654321u:password
 ## Payments (eduSky)
 
 If an after-school activity (e.g. a language school) runs on eduSky and gives parents a panel at
-`https://school.edusky.pl/studentpanel/`, the digest can end with what is due next, per child:
+`https://school.edusky.pl/studentpanel/`, the digest can end with one amount: what is due next for all children together:
 
 ```
 *Płatności – Angielski*
-- Ania: 255,00 zł do 10.11.2026
-- Jaś: 440,00 zł do 10.11.2026 (w tym zaległość 100,00 zł)
-Razem: 695,00 zł
+Do zapłaty: 695,00 zł do 10.11.2026 (w tym zaległość 100,00 zł)
 ```
 
 ```sh
@@ -575,10 +573,10 @@ EDUSKY_PASSWORD=password
 EDUSKY_NAME=Angielski        # section title; default "Edusky"
 ```
 
-- One line per agreement (child): the amount of the next payment and its due date, as the panel's
-  *Płatności* page shows it: arrears are added (and named), money paid in advance is deducted. A child with
-  nothing to pay shows *nic do zapłaty* (with the overpayment, if any). A total is added when more than one
-  line has something to pay. `EDUSKY_URL` may also be the panel's address; only the site is used.
+- The sum of the next payment of every agreement (child), as the panel's *Płatności* page shows them: arrears
+  are added (and named), money paid in advance is deducted. The date is the nearest due date among them. When
+  nobody has anything to pay, it says *Nic do zapłaty* (with the overpayment, if any).
+  `EDUSKY_URL` may also be the panel's address; only the site is used.
 - eduSky has **no public API**. This uses the panel's own private endpoints and logs in the way the panel does,
   so it can stop working when eduSky changes something, and it may be against eduSky's terms of service. It makes
   five requests or so per day. Nothing is stored; every run logs in again.
@@ -688,7 +686,7 @@ docker volume rm szalona-beata_wa-data
 | `SUBSTITUTIONS_URL`, `SUBSTITUTIONS_CLASS` | (off) | School's Edupage site and class: adds that class's substitutions for the next school day to the digest ([section](#school-substitutions-edupage)) |
 | `LIBRUS_ACCOUNTS` | (off) | `name:login:password;...`, one Librus account per child: adds each child's new grades to the digest ([section](#school-grades-librus)) |
 | `LIBRUS_STATE` | `librus_state.json` next to `--db` | Grades already shown and the Librus sessions |
-| `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` | (off) | eduSky site and the parent's login: adds what is due next for each child to the end of the digest ([section](#payments-edusky)) |
+| `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` | (off) | eduSky site and the parent's login: adds what is due next (all children together) to the end of the digest ([section](#payments-edusky)) |
 | `EDUSKY_NAME` | `Edusky` | Title of the payments section, e.g. the activity's name |
 | `MAX_TRANSCRIPT_CHARS` | `12000` | Max chat length sent to the model per group; on busier days the oldest messages are left out and the email says so under the group |
 | `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
