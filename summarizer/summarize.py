@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 
 # `python -I` (the Dockerfile) leaves the script's own folder off sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import edusky_payments  # noqa: E402
 import librus_grades  # noqa: E402
 
 # The bridge appends text read from a photo (OCR) after this tag; see bridge/ocr.go.
@@ -161,6 +162,14 @@ LABELS = {
         "grades_first_kind": "Point grades, text grades and behaviour points are now checked too: the existing ones ({count}) are skipped, from the next digest on only new ones are shown here.",
         "weight": "weight {weight}", "improvement": "improvement", "no_subject": "(unknown subject)",
         "behaviour": "Behaviour",
+        "payments_title": "Payments – {name}",
+        "payments_none": "Nothing to pay.",
+        "payments_error": "Could not fetch the payments ({error}).",
+        "payments_due": "{child}: {amount} due {day}",
+        "payments_nothing": "{child}: nothing to pay",
+        "payments_overdue": "including {amount} overdue",
+        "payments_overpaid": "overpaid {amount}",
+        "payments_total": "Total: {amount}",
         "grade_kinds": {"semester": "semester grade", "semester_proposition": "proposed semester grade",
                         "final": "final grade", "final_proposition": "proposed final grade"},
         "bridge": {
@@ -199,6 +208,14 @@ LABELS = {
         "grades_first_kind": "Sprawdzane są teraz także oceny punktowe, tekstowe i punkty z zachowania: pominięto dotychczasowe ({count}), od następnego podsumowania pojawią się tu tylko nowe.",
         "weight": "waga {weight}", "improvement": "poprawa", "no_subject": "(przedmiot nieznany)",
         "behaviour": "Zachowanie",
+        "payments_title": "Płatności – {name}",
+        "payments_none": "Nic do zapłaty.",
+        "payments_error": "Nie udało się pobrać płatności ({error}).",
+        "payments_due": "{child}: {amount} do {day}",
+        "payments_nothing": "{child}: nic do zapłaty",
+        "payments_overdue": "w tym zaległość {amount}",
+        "payments_overpaid": "nadpłata {amount}",
+        "payments_total": "Razem: {amount}",
         "grade_kinds": {"semester": "ocena śródroczna", "semester_proposition": "propozycja oceny śródrocznej",
                         "final": "ocena roczna", "final_proposition": "propozycja oceny rocznej"},
         "bridge": {
@@ -511,7 +528,49 @@ def _grades_text(child, lang):
     return f"*{labels(lang)['grades_title'].format(name=child.name)}*\n{body}"
 
 
-def build_digest(sections, hours, title=None, lang="English", warning=None, substitutions=None, grades=()):
+def _money(amount, lang):
+    if lang.lower() == "polish":
+        return f"{amount:.2f}".replace(".", ",") + " zł"
+    return f"PLN {amount:.2f}"
+
+
+def _payments_lines(payments, lang):
+    """(lines, note): one line per agreement plus a total when more than one has something to pay,
+    or the 'none' / 'error' message as the note."""
+    L = labels(lang)
+    if payments.error:
+        return [], L["payments_error"].format(error=payments.error)
+    if not payments.items:
+        return [], L["payments_none"]
+    lines = []
+    for due in payments.items:
+        if due.amount > 0:
+            day = due.day.strftime("%d.%m.%Y") if due.day else "?"
+            line = L["payments_due"].format(child=due.child, amount=_money(due.amount, lang), day=day)
+            if due.overdue > 0:
+                line += f" ({L['payments_overdue'].format(amount=_money(due.overdue, lang))})"
+        else:
+            line = L["payments_nothing"].format(child=due.child)
+            if due.overpaid > 0:
+                line += f" ({L['payments_overpaid'].format(amount=_money(due.overpaid, lang))})"
+        lines.append(line)
+    owing = [d.amount for d in payments.items if d.amount > 0]
+    total = L["payments_total"].format(amount=_money(sum(owing), lang)) if len(owing) > 1 else None
+    return lines, total
+
+
+def _payments_title(payments, lang):
+    return labels(lang)["payments_title"].format(name=payments.name)
+
+
+def _payments_text(payments, lang):
+    lines, note = _payments_lines(payments, lang)
+    body = "\n".join([*(f"- {line}" for line in lines), *([note] if note else [])])
+    return f"*{_payments_title(payments, lang)}*\n{body}"
+
+
+def build_digest(sections, hours, title=None, lang="English", warning=None, substitutions=None, grades=(),
+                 payments=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     header = f"📋 {title or L['digest']} ({L['last'].format(hours=hours)})"
@@ -522,9 +581,11 @@ def build_digest(sections, hours, title=None, lang="English", warning=None, subs
         count = f" ({plural(s.messages, L['message'], lang)})" if s.messages else ""
         note = "".join(f"{n}\n" for n in _section_notes(s, lang))
         parts.append(f"*{s.name}*{count}\n{note}{_summary_text(s.summary, lang)}")
+    parts.extend(_grades_text(child, lang) for child in grades or ())
     if substitutions:
         parts.append(_subst_text(substitutions, lang))
-    parts.extend(_grades_text(child, lang) for child in grades or ())
+    if payments:
+        parts.append(_payments_text(payments, lang))
     return "\n\n".join(parts)
 
 
@@ -675,6 +736,25 @@ def render_grades_html(child, lang):
     return GRADES_BLOCK.format(title=htmllib.escape(title), body=body)
 
 
+PAYMENTS_BLOCK = """<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px" data-payments="1">
+<tr><td style="background:#f4effa;border-left:4px solid #7a4fb5;border-radius:0 8px 8px 0;padding:10px 14px">
+<div style="font-size:17px;font-weight:700;color:#4a2a78;margin:0 0 8px">💳 {title}</div>
+<div style="font-size:15px;line-height:1.5">{body}</div>
+</td></tr></table>"""
+
+
+def render_payments_html(payments, lang):
+    lines, note = _payments_lines(payments, lang)
+    body = ""
+    if lines:
+        lis = "".join(f'<li style="{LI_STYLE}">{htmllib.escape(line)}</li>' for line in lines)
+        body = f'<ul style="{UL_STYLE};margin-bottom:0">{lis}</ul>'
+    if note:
+        style = "margin:0;font-weight:600" if lines else "margin:0;color:#7a8783;font-style:italic"
+        body += f'<p style="{style}">{htmllib.escape(note)}</p>'
+    return PAYMENTS_BLOCK.format(title=htmllib.escape(_payments_title(payments, lang)), body=body)
+
+
 KICKER = ('<div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a8dcd1">'
           'Szalona Beata</div>\n')
 WARNING_BANNER = ('<div data-warning="1" style="background:#fdecea;color:#8a1c12;border-radius:8px;'
@@ -682,7 +762,7 @@ WARNING_BANNER = ('<div data-warning="1" style="background:#fdecea;color:#8a1c12
 
 
 def build_html_digest(sections, hours, day, title=None, lang="English", warning=None, substitutions=None,
-                      grades=()):
+                      grades=(), payments=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     cards = "\n".join(
@@ -693,10 +773,12 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
         )
         for s in sections
     )
-    if substitutions:
-        cards += "\n" + render_substitutions_html(substitutions, lang)
     for child in grades or ():
         cards += "\n" + render_grades_html(child, lang)
+    if substitutions:
+        cards += "\n" + render_substitutions_html(substitutions, lang)
+    if payments:
+        cards += "\n" + render_payments_html(payments, lang)
     total = _total_line(sections, lang)
     return HTML_PAGE.format(
         title=htmllib.escape(title or L["html_title"]),
@@ -1081,6 +1163,8 @@ def parse_args(argv):
         args.librus_accounts = librus_grades.parse_accounts(env("LIBRUS_ACCOUNTS", ""))
     except ValueError as e:
         p.error(str(e))
+    # env only, like LIBRUS_ACCOUNTS: the password doesn't belong on the command line
+    args.edusky = {key: env(f"EDUSKY_{key.upper()}", "") for key in ("url", "login", "password", "name")}
     args.librus_state = env("LIBRUS_STATE", "") or os.path.join(os.path.dirname(args.db) or ".", "librus_state.json")
     if args.max_chars < 1:
         p.error(f"--max-chars / MAX_TRANSCRIPT_CHARS must be at least 1, got {args.max_chars}")
@@ -1166,8 +1250,18 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                 print(f"warning: librus: {child.name}: {child.error}", file=sys.stderr, flush=True)
             for skipped in child.skipped:
                 print(f"warning: librus: {child.name}: {skipped}", file=sys.stderr, flush=True)
+    payments = None
+    edusky = args.edusky
+    missing = [f"EDUSKY_{k.upper()}" for k in ("url", "login", "password") if not edusky[k]]
+    if len(missing) < 3 and missing:
+        print(f"warning: edusky payments need {', '.join(missing)}; skipped", file=sys.stderr, flush=True)
+    elif not missing:
+        payments = edusky_payments.fetch_payments(edusky["url"], edusky["login"], edusky["password"],
+                                                  edusky["name"])
+        if payments.error:
+            print(f"warning: edusky: {payments.error}", file=sys.stderr, flush=True)
     common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions,
-              "grades": grades}
+              "grades": grades, "payments": payments}
     digest = build_digest(sections, args.hours, **common)
     print(digest, flush=True)
     if usage := getattr(llm, "usage", None):
@@ -1177,8 +1271,10 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
             f"= {run['total_tokens']} total",
             file=sys.stderr,
         )
-    if target:  # a group chat: children's grades are only for the email
-        group_text = build_digest(sections, args.hours, **{**common, "grades": ()}) if grades else digest
+    if target:  # a group chat: children's grades and payments are only for the email
+        private = grades or payments
+        group_text = build_digest(sections, args.hours, **{**common, "grades": (), "payments": None}) \
+            if private else digest
         send_to_bridge(args.bridge_url, target[0], group_text)
         print(f"\nSent to {target[1]}.", file=sys.stderr)
     day = datetime.fromtimestamp(now, tz).strftime("%d.%m.%Y")
