@@ -1,6 +1,7 @@
 import unittest
 from datetime import date
-from urllib.parse import urlencode
+from unittest import mock
+from urllib.parse import parse_qs, urlencode
 
 import edusky_payments as ep
 from test_summarize import FakeServer
@@ -17,10 +18,7 @@ def agreement(name, upcoming_date="2026-11-10", upcoming_balance="255.00", overd
             "overdueValue": overdue_value, "paymentsMadeSum": "425.00", "paymentPlanLive": []}
 
 
-def token_path(login="Rodzic", password="tajne:hasło"):
-    query = urlencode({"grant_type": "password", "client_id": CLIENT_ID, "client_secret": ep.CLIENT_SECRET,
-                       "username": login, "password": password})
-    return f"/core/web/oauth/v2/token?{query}"
+TOKEN = ("POST", "/core/web/oauth/v2/token")
 
 
 def payments_path(child):
@@ -33,7 +31,7 @@ class FetchPaymentsTest(unittest.TestCase):
         responses = {
             ("GET", "/core/web/external/baseconfig"): (200, {"OAuth2": {
                 "clientId": CLIENT_ID, "accessTokenUri": "https://elsewhere.example/core/web/oauth/v2/token"}}),
-            ("GET", token_path()): (200, {"access_token": "TOKEN", "refresh_token": "R", "expires_in": 3600}),
+            TOKEN: (200, {"access_token": "TOKEN", "refresh_token": "R", "expires_in": 3600}),
             ("GET", "/core/web/api/common/users/auth"): (200, PARENT),
             ("GET", "/core/web/api/common/users?idUserParent=70"): (200, CHILDREN),
             ("GET", payments_path(11)): (200, [agreement("Ania")]),
@@ -56,6 +54,13 @@ class FetchPaymentsTest(unittest.TestCase):
         # the token goes only to the school's own site, as a bearer token
         api_calls = [h for (m, p, _), h in zip(srv.requests, srv.headers) if p.startswith("/core/web/api/")]
         self.assertEqual({h.get("Authorization") for h in api_calls}, {"Bearer TOKEN"})
+        # the password goes in a form body, never in a URL (access logs, redirects)
+        (token,) = [r for r in srv.requests if r[0] == "POST"]
+        self.assertEqual(token[1], "/core/web/oauth/v2/token")
+        self.assertEqual(parse_qs(token[2]), {"grant_type": ["password"], "client_id": [CLIENT_ID],
+                                              "client_secret": [ep.CLIENT_SECRET], "username": ["Rodzic"],
+                                              "password": ["tajne:hasło"]})
+        self.assertFalse(any("tajne" in p for _, p, _ in srv.requests))
         # eduSky's front rejects urllib's default User-Agent with 403
         self.assertEqual({h.get("User-Agent") for h in srv.headers}, {"szalona-beata/0.1"})
 
@@ -76,7 +81,7 @@ class FetchPaymentsTest(unittest.TestCase):
         self.assertEqual(result.items, [ep.Due("Ania", None, 0.0, 0.0, 20.0)])
 
     def test_wrong_password_is_an_error_without_the_password(self):
-        srv = self.server({("GET", token_path()): (400, {"error": "invalid_grant"})})
+        srv = self.server({TOKEN: (400, {"error": "invalid_grant"})})
         result = ep.fetch_payments(srv.url, "Rodzic", "tajne:hasło")
         self.assertEqual(result.items, [])
         self.assertIn("400", result.error)
@@ -87,6 +92,27 @@ class FetchPaymentsTest(unittest.TestCase):
         result = ep.fetch_payments(srv.url, "Rodzic", "tajne:hasło")
         self.assertEqual(result.items, [])
         self.assertTrue(result.error)
+
+    def test_panel_url_is_reduced_to_the_site(self):
+        srv = self.server()
+        result = ep.fetch_payments(srv.url + "/studentpanel/payments", "Rodzic", "tajne:hasło")
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.items), 2)
+
+    def test_arrears_without_an_upcoming_payment_are_still_owed(self):
+        srv = self.server({("GET", payments_path(11)): (200, [agreement(
+            "Ania", upcoming_date=None, upcoming_balance=None, overdue_value="-100.00")])})
+        result = ep.fetch_payments(srv.url, "Rodzic", "tajne:hasło")
+        self.assertEqual(result.items[0], ep.Due("Ania", None, 100.0, 100.0, 0.0))
+
+    def test_any_failure_is_an_error_not_an_exception(self):
+        import http.client
+
+        srv = self.server()
+        with mock.patch.object(ep, "_call", side_effect=http.client.IncompleteRead(b"{")):
+            result = ep.fetch_payments(srv.url, "Rodzic", "tajne:hasło")
+        self.assertEqual(result.items, [])
+        self.assertIn("IncompleteRead", result.error)
 
     def test_unreachable_site_is_an_error(self):
         result = ep.fetch_payments("http://127.0.0.1:9", "Rodzic", "tajne:hasło", timeout=2)

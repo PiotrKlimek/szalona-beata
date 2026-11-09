@@ -578,7 +578,7 @@ EDUSKY_NAME=Angielski        # section title; default "Edusky"
 - One line per agreement (child): the amount of the next payment and its due date, as the panel's
   *Płatności* page shows it: arrears are added (and named), money paid in advance is deducted. A child with
   nothing to pay shows *nic do zapłaty* (with the overpayment, if any). A total is added when more than one
-  child has something to pay.
+  line has something to pay. `EDUSKY_URL` may also be the panel's address; only the site is used.
 - eduSky has **no public API**. This uses the panel's own private endpoints and logs in the way the panel does,
   so it can stop working when eduSky changes something, and it may be against eduSky's terms of service. It makes
   five requests or so per day. Nothing is stored; every run logs in again.

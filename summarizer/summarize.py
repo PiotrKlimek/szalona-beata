@@ -166,6 +166,7 @@ LABELS = {
         "payments_none": "Nothing to pay.",
         "payments_error": "Could not fetch the payments ({error}).",
         "payments_due": "{child}: {amount} due {day}",
+        "payments_owed": "{child}: {amount}",
         "payments_nothing": "{child}: nothing to pay",
         "payments_overdue": "including {amount} overdue",
         "payments_overpaid": "overpaid {amount}",
@@ -212,6 +213,7 @@ LABELS = {
         "payments_none": "Nic do zapłaty.",
         "payments_error": "Nie udało się pobrać płatności ({error}).",
         "payments_due": "{child}: {amount} do {day}",
+        "payments_owed": "{child}: {amount}",
         "payments_nothing": "{child}: nic do zapłaty",
         "payments_overdue": "w tym zaległość {amount}",
         "payments_overpaid": "nadpłata {amount}",
@@ -545,8 +547,9 @@ def _payments_lines(payments, lang):
     lines = []
     for due in payments.items:
         if due.amount > 0:
-            day = due.day.strftime("%d.%m.%Y") if due.day else "?"
-            line = L["payments_due"].format(child=due.child, amount=_money(due.amount, lang), day=day)
+            day = due.day.strftime("%d.%m.%Y") if due.day else None
+            line = L["payments_due" if day else "payments_owed"].format(
+                child=due.child, amount=_money(due.amount, lang), day=day)
             if due.overdue > 0:
                 line += f" ({L['payments_overdue'].format(amount=_money(due.overdue, lang))})"
         else:

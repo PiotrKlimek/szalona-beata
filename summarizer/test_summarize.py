@@ -636,7 +636,11 @@ class FakeServer:
         class Handler(BaseHTTPRequestHandler):
             def _handle(self):
                 length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length)) if length else None
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw) if raw else None
+                except ValueError:  # e.g. a form-encoded body
+                    body = raw.decode()
                 outer.requests.append((self.command, self.path, body))
                 outer.headers.append(dict(self.headers))
                 # A response is (status, body) or (status, body, headers); a list is replayed in order.
@@ -930,6 +934,9 @@ class EduskyPaymentsRenderTest(unittest.TestCase):
             self.due(amount=1234.5, overdue=100.0),
             self.due("Jaś", day=None, amount=0.0, overpaid=20.0),
         ]))
+        no_date = summarize.build_digest([], 24, lang="Polish", payments=self.payments([
+            self.due(day=None, amount=100.0, overdue=100.0)]))
+        self.assertIn("- Ania: 100,00 zł (w tym zaległość 100,00 zł)", no_date)
         self.assertIn("- Ania: 1234,50 zł do 10.11.2026 (w tym zaległość 100,00 zł)\n"
                       "- Jaś: nic do zapłaty (nadpłata 20,00 zł)", text)
         self.assertNotIn("Razem", text)  # only one child owes anything
@@ -2112,12 +2119,12 @@ class MainTest(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.dict(os.environ, self.edusky_env()), redirect_stderr(err), \
                 mock.patch.object(edusky_payments, "fetch_payments",
-                                  lambda *a, **k: edusky_payments.Payments("Angielski", [], "HTTP Error 400")):
+                                  lambda *a, **k: edusky_payments.Payments("Angielski", [], "HTTP 400 Bad Request")):
             code, out = self.run_main("--group", "rowery", "--hours", "2")
         self.assertEqual(code, 0)
         self.assertIn("*Rowery*", out)
-        self.assertIn("Nie udało się pobrać płatności (HTTP Error 400).", out)
-        self.assertIn("warning: edusky: HTTP Error 400", err.getvalue())
+        self.assertIn("Nie udało się pobrać płatności (HTTP 400 Bad Request).", out)
+        self.assertIn("warning: edusky: HTTP 400 Bad Request", err.getvalue())
 
     def test_half_configured_edusky_warns_and_is_skipped(self):
         import os
