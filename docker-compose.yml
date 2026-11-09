@@ -25,6 +25,10 @@ x-summarizer-env: &summarizer-env
   SUBSTITUTIONS_CLASS: ${SUBSTITUTIONS_CLASS:-}
   LIBRUS_ACCOUNTS: ${LIBRUS_ACCOUNTS:-}  # name:login:password;... (one Librus account per child)
   LIBRUS_STATE: ${LIBRUS_STATE:-}
+  EDUSKY_URL: ${EDUSKY_URL:-}  # eduSky parent panel: what is due next per child
+  EDUSKY_LOGIN: ${EDUSKY_LOGIN:-}
+  EDUSKY_PASSWORD: ${EDUSKY_PASSWORD:-}
+  EDUSKY_NAME: ${EDUSKY_NAME:-}
 
 services:
   bridge:

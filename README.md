@@ -36,6 +36,7 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 | Summaries with `--model openai` | the chat text of the selected groups (including text read from photos and PDFs, and voice message transcripts) is sent to the LLM provider (Groq by default) |
 | LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
 | Librus grades (only with `LIBRUS_ACCOUNTS`) | read from Librus with each child's login; seen grade ids and the Librus sessions in `librus_state.json` on your server (no passwords) |
+| eduSky payments (only with `EDUSKY_URL`) | read from eduSky with the parent's login; nothing stored |
 | The email | the email provider (Resend) and your mailbox |
 
 ## Before you start: read this
@@ -485,7 +486,7 @@ docker compose run --rm --no-deps -v "$PWD/audio":/audio:ro bridge bridge transc
 ## School substitutions (Edupage)
 
 If the school publishes substitutions on Edupage (`https://yourschool.edupage.org/substitution/`), the digest can
-end with a separate section for one class:
+include a separate section for one class (after the grades, before the payments):
 
 ```
 *Zastępstwa – klasa 1C, poniedziałek 09.11.2026*
@@ -509,8 +510,8 @@ SUBSTITUTIONS_CLASS=1C
 
 ## School grades (Librus)
 
-If the school uses Librus Synergia, the digest can end with one section per child listing the grades added since
-the last emailed digest:
+If the school uses Librus Synergia, the digest can include one section per child (after the group summaries, before
+the substitutions) listing the grades added since the last emailed digest:
 
 ```
 *Nowe oceny – Ania*
@@ -553,6 +554,36 @@ LIBRUS_ACCOUNTS=Ania:1234567u:password;Jaś:7654321u:password
   If only point, text or behaviour grades can't be fetched, the ordinary ones are still shown, the log has a
   warning, and that kind is tried again next time.
 - Check without emailing: `docker compose run --rm -e EMAIL_TO= summarizer --hours 1`.
+
+## Payments (eduSky)
+
+If an after-school activity (e.g. a language school) runs on eduSky and gives parents a panel at
+`https://school.edusky.pl/studentpanel/`, the digest can end with one amount: what is due next for all children together:
+
+```
+*Płatności – Angielski*
+Do zapłaty: 695,00 zł do 10.11.2026 (w tym zaległość 100,00 zł)
+```
+
+```sh
+# .env - the parent's login to the eduSky panel
+EDUSKY_URL=https://school.edusky.pl
+EDUSKY_LOGIN=login
+EDUSKY_PASSWORD=password
+EDUSKY_NAME=Angielski        # section title; default "Edusky"
+```
+
+- The sum of the next payment of every agreement (child), as the panel's *Płatności* page shows them: arrears
+  are added (and named), money paid in advance is deducted. The date is the nearest due date among them. When
+  nobody has anything to pay, it says *Nic do zapłaty* (with the overpayment, if any).
+  `EDUSKY_URL` may also be the panel's address; only the site is used.
+- eduSky has **no public API**. This uses the panel's own private endpoints and logs in the way the panel does,
+  so it can stop working when eduSky changes something, and it may be against eduSky's terms of service. It makes
+  five requests or so per day. Nothing is stored; every run logs in again.
+- Payments are **never posted to WhatsApp**: with `--send-to` the group gets the digest without this section.
+- If the panel can't be read (wrong password, site down), the section says so and the rest of the digest is
+  sent as usual. With only some of `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` set, the section is skipped
+  and the log says which are missing.
 
 ## Local models (Ollama)
 
@@ -655,6 +686,8 @@ docker volume rm szalona-beata_wa-data
 | `SUBSTITUTIONS_URL`, `SUBSTITUTIONS_CLASS` | (off) | School's Edupage site and class: adds that class's substitutions for the next school day to the digest ([section](#school-substitutions-edupage)) |
 | `LIBRUS_ACCOUNTS` | (off) | `name:login:password;...`, one Librus account per child: adds each child's new grades to the digest ([section](#school-grades-librus)) |
 | `LIBRUS_STATE` | `librus_state.json` next to `--db` | Grades already shown and the Librus sessions |
+| `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` | (off) | eduSky site and the parent's login: adds what is due next (all children together) to the end of the digest ([section](#payments-edusky)) |
+| `EDUSKY_NAME` | `Edusky` | Title of the payments section, e.g. the activity's name |
 | `MAX_TRANSCRIPT_CHARS` | `12000` | Max chat length sent to the model per group; on busier days the oldest messages are left out and the email says so under the group |
 | `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
 | `OLLAMA_MODEL` | `qwen2.5:3b` | Local model for `--model ollama` (needs ~2.5 GB free RAM) |
@@ -689,7 +722,8 @@ Next steps:
       messages ("X paid") are sometimes misread.
 - [ ] **Word and Excel documents.** Only PDFs are read; `.docx`/`.xlsx` could be read locally the same way.
 - [ ] **Warn at the top of the email when a source breaks.** An expired Librus session or a changed Edupage
-      page now shows only as an error inside its section; show it prominently, like a disconnected bridge.
+      page (or a changed eduSky panel) now shows only as an error inside its section; show it prominently, like a
+      disconnected bridge.
 
 ## Development
 
@@ -698,7 +732,8 @@ bridge/        Go: whatsmeow wiring (main.go) + tested logic (text, convert, fil
                textdetect: fast "has text?" check, ocr: Tesseract, voice: transcription API,
                mediaworker: queue of photos to OCR and voice messages to transcribe)
 summarizer/    Python: summarize.py (stdlib only), librus_grades.py (librus-synergia, imported only when
-               LIBRUS_ACCOUNTS is set), sample_data.py, tests (run without librus-synergia installed)
+               LIBRUS_ACCOUNTS is set), edusky_payments.py (stdlib), sample_data.py, tests (run without
+               librus-synergia installed)
 test.sh        runs both test suites in Docker (no local toolchains needed)
 ```
 

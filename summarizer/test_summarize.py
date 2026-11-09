@@ -8,6 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import edusky_payments
 import librus_grades
 import sample_data
 import summarize
@@ -635,7 +636,11 @@ class FakeServer:
         class Handler(BaseHTTPRequestHandler):
             def _handle(self):
                 length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length)) if length else None
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw) if raw else None
+                except ValueError:  # e.g. a form-encoded body
+                    body = raw.decode()
                 outer.requests.append((self.command, self.path, body))
                 outer.headers.append(dict(self.headers))
                 # A response is (status, body) or (status, body, headers); a list is replayed in order.
@@ -834,7 +839,7 @@ class LibrusGradesRenderTest(unittest.TestCase):
         fields.update(kw)
         return librus_grades.Grade(**fields)
 
-    def test_text_section_per_child_after_substitutions(self):
+    def test_text_section_per_child_before_substitutions(self):
         subs = summarize.Substitutions("1C", date(2026, 11, 9), [], None, "")
         text = summarize.build_digest([], 24, lang="Polish", substitutions=subs, grades=[
             self.child([self.grade(improvement=True), self.grade(subject="Język polski", value="4+", category="aktywność",
@@ -845,7 +850,7 @@ class LibrusGradesRenderTest(unittest.TestCase):
                       "- Matematyka: 5 (sprawdzian, waga 3, poprawa) – Jan Kowalski, 06.11\n"
                       "- Język polski: 4+ (aktywność) – Jan Kowalski – „Brawo”", text)
         self.assertIn("*Nowe oceny – Jaś*\nBrak nowych ocen.", text)
-        self.assertGreater(text.index("Nowe oceny – Ania"), text.index("Zastępstwa"))
+        self.assertLess(text.index("Nowe oceny – Jaś"), text.index("Zastępstwa"))
         self.assertGreater(text.index("Nowe oceny – Jaś"), text.index("Nowe oceny – Ania"))
 
     def test_first_check_and_error_messages(self):
@@ -889,19 +894,88 @@ class LibrusGradesRenderTest(unittest.TestCase):
         self.assertEqual(summarize.build_digest([], 24, lang="Polish", grades=[]),
                          summarize.build_digest([], 24, lang="Polish"))
 
-    def test_html_block_per_child_is_escaped_and_last(self):
+    def test_html_block_per_child_is_escaped_and_before_substitutions(self):
         subs = summarize.Substitutions("1C", date(2026, 11, 9), [], None, "")
         html = summarize.build_html_digest([("Klasa 1C", "x", 1)], 24, "07.11.2026", lang="Polish",
                                            substitutions=subs, grades=[
             self.child([self.grade(value="<5>", comment="a & b")], name="<Ania>"), self.child(name="Jaś")])
         self.assertEqual(html.count('data-grades="1"'), 2)
-        block = html[html.index('data-grades="1"'):]
-        self.assertGreater(html.index('data-grades="1"'), html.index('data-substitutions="1"'))
+        block = html[html.index('data-grades="1"'):html.index('data-substitutions="1"')]
+        self.assertGreater(html.index('data-grades="1"'), html.index("Klasa 1C"))
+        self.assertLess(html.rindex('data-grades="1"'), html.index('data-substitutions="1"'))
         self.assertIn("Nowe oceny – &lt;Ania&gt;", block)
         self.assertIn("&lt;5&gt;", block)
         self.assertIn("a &amp; b", block)
         self.assertIn("Brak nowych ocen.", block)
         self.assertNotIn("data-grades", summarize.build_html_digest([], 24, "07.11.2026"))
+
+
+class EduskyPaymentsRenderTest(unittest.TestCase):
+    def payments(self, items=(), error=None, name="Angielski"):
+        return edusky_payments.Payments(name, list(items), error)
+
+    def due(self, child="Ania", day=date(2026, 11, 10), amount=255.0, overdue=0.0, overpaid=0.0):
+        return edusky_payments.Due(child, day, amount, overdue, overpaid)
+
+    def test_one_total_as_the_last_section(self):
+        subs = summarize.Substitutions("1C", date(2026, 11, 10), [], None, "")
+        grades = [librus_grades.ChildGrades("Ania", [])]
+        text = summarize.build_digest([("Klasa 1C", "x", 1)], 24, lang="Polish", substitutions=subs, grades=grades,
+                                      payments=self.payments([self.due(), self.due("Jaś", amount=340.0)]))
+        self.assertTrue(text.endswith("*Płatności – Angielski*\nDo zapłaty: 595,00 zł do 10.11.2026"), text)
+        self.assertNotIn("Ania: ", text.split("Płatności")[1])  # no per-child lines
+        self.assertLess(text.index("Nowe oceny"), text.index("Zastępstwa"))
+        self.assertLess(text.index("Zastępstwa"), text.index("Płatności"))
+
+    def test_nearest_due_date_and_summed_arrears(self):
+        text = summarize.build_digest([], 24, lang="Polish", payments=self.payments([
+            self.due(day=date(2026, 12, 10), amount=1000.0, overdue=60.0),
+            self.due("Jaś", day=date(2026, 11, 10), amount=234.5, overdue=40.0),
+            self.due("Ola", day=None, amount=0.0, overpaid=20.0),  # paid up: not in the sum
+        ]))
+        self.assertIn("*Płatności – Angielski*\nDo zapłaty: 1234,50 zł do 10.11.2026 (w tym zaległość 100,00 zł)",
+                      text)
+        self.assertNotIn("nadpłata", text)
+
+    def test_arrears_without_a_date(self):
+        text = summarize.build_digest([], 24, lang="Polish", payments=self.payments([
+            self.due(day=None, amount=100.0, overdue=100.0)]))
+        self.assertIn("\nDo zapłaty: 100,00 zł (w tym zaległość 100,00 zł)", text)
+
+    def test_nothing_to_pay_overpayment_no_agreements_and_error(self):
+        paid = summarize.build_digest([], 24, lang="Polish", payments=self.payments([
+            self.due(day=None, amount=0.0, overpaid=20.0), self.due("Jaś", day=None, amount=0.0, overpaid=5.0)]))
+        self.assertIn("*Płatności – Angielski*\nNic do zapłaty (nadpłata 25,00 zł).", paid)
+        none = summarize.build_digest([], 24, lang="Polish", payments=self.payments())
+        self.assertIn("*Płatności – Angielski*\nNic do zapłaty.", none)
+        failed = summarize.build_digest([], 24, lang="Polish", payments=self.payments(error="timeout"))
+        self.assertIn("*Płatności – Angielski*\nNie udało się pobrać płatności (timeout).", failed)
+
+    def test_english_labels(self):
+        text = summarize.build_digest([], 24, lang="English", payments=self.payments([
+            self.due(amount=440.0, overdue=100.0), self.due("Jaś", amount=340.0)]))
+        self.assertIn("*Payments – Angielski*\nTo pay: PLN 780.00 by 10.11.2026 (including PLN 100.00 overdue)", text)
+        paid = summarize.build_digest([], 24, lang="English", payments=self.payments([
+            self.due(day=None, amount=0.0, overpaid=20.0)]))
+        self.assertIn("\nNothing to pay (overpaid PLN 20.00).", paid)
+
+    def test_text_digest_without_payments_is_unchanged(self):
+        self.assertEqual(summarize.build_digest([], 24, lang="Polish", payments=None),
+                         summarize.build_digest([], 24, lang="Polish"))
+
+    def test_html_block_is_escaped_and_last(self):
+        subs = summarize.Substitutions("1C", date(2026, 11, 10), [], None, "")
+        html = summarize.build_html_digest([("Klasa 1C", "x", 1)], 24, "09.11.2026", lang="Polish",
+                                           substitutions=subs, grades=[librus_grades.ChildGrades("Ania", [])],
+                                           payments=self.payments([self.due(), self.due("Jaś")], name="A & B"))
+        block = html[html.index('data-payments="1"'):]
+        self.assertGreater(html.index('data-payments="1"'), html.index('data-substitutions="1"'))
+        self.assertIn("Płatności – A &amp; B", block)
+        self.assertIn("Do zapłaty: 510,00 zł do 10.11.2026", block)
+        self.assertNotIn("data-payments", summarize.build_html_digest([], 24, "09.11.2026"))
+        failed = summarize.build_html_digest([], 24, "09.11.2026", lang="Polish",
+                                             payments=self.payments(error="<oops>"))
+        self.assertIn("Nie udało się pobrać płatności (&lt;oops&gt;).", failed)
 
 
 class OllamaTest(unittest.TestCase):
@@ -2020,6 +2094,70 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("Nowe oceny", "".join(posted))
         self.assertIn("Pierwsze sprawdzenie", out)  # without an email nothing was used up
         self.assertNotIn("seen", librus_grades.load_state(self.state_path)["1111111u"])
+
+    def edusky_env(self, **extra):
+        return {"SUMMARY_LANGUAGE": "Polish", "EDUSKY_URL": "https://szkola.edusky.example",
+                "EDUSKY_LOGIN": "Rodzic", "EDUSKY_PASSWORD": "tajne", "EDUSKY_NAME": "Angielski", **extra}
+
+    def test_edusky_payments_at_the_end_of_the_digest(self):
+        import os
+        from unittest import mock
+
+        calls = []
+
+        def fake_fetch(url, login, password, name=""):
+            calls.append((url, login, password, name))
+            return edusky_payments.Payments(name, [edusky_payments.Due("Ania", date(2026, 11, 10), 255.0, 0, 85)])
+
+        with mock.patch.dict(os.environ, self.edusky_env()), \
+                mock.patch.object(edusky_payments, "fetch_payments", fake_fetch):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [("https://szkola.edusky.example", "Rodzic", "tajne", "Angielski")])
+        self.assertTrue(out.rstrip().endswith("*Płatności – Angielski*\nDo zapłaty: 255,00 zł do 10.11.2026"), out)
+
+    def test_edusky_failure_is_a_warning(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, self.edusky_env()), redirect_stderr(err), \
+                mock.patch.object(edusky_payments, "fetch_payments",
+                                  lambda *a, **k: edusky_payments.Payments("Angielski", [], "HTTP 400 Bad Request")):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")
+        self.assertEqual(code, 0)
+        self.assertIn("*Rowery*", out)
+        self.assertIn("Nie udało się pobrać płatności (HTTP 400 Bad Request).", out)
+        self.assertIn("warning: edusky: HTTP 400 Bad Request", err.getvalue())
+
+    def test_half_configured_edusky_warns_and_is_skipped(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        env = self.edusky_env(EDUSKY_PASSWORD="")
+        with mock.patch.dict(os.environ, env), redirect_stderr(err), \
+                mock.patch.object(edusky_payments, "fetch_payments", lambda *a, **k: self.fail("called")):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")
+        self.assertEqual(code, 0)
+        self.assertNotIn("Płatności", out)
+        self.assertIn("EDUSKY_PASSWORD", err.getvalue())
+
+    def test_payments_are_never_posted_to_the_whatsapp_group(self):
+        import os
+        from unittest import mock
+
+        bridge = FakeServer({("GET", "/health"): (200, {"connected": True, "logged_in": True}),
+                             ("POST", "/send"): (200, {"id": "X"})})
+        self.addCleanup(bridge.close)
+        payments = edusky_payments.Payments("Angielski", [edusky_payments.Due("Ania", None, 0, 0, 0)])
+        with mock.patch.dict(os.environ, self.edusky_env(BRIDGE_URL=bridge.url)), redirect_stderr(io.StringIO()), \
+                mock.patch.object(edusky_payments, "fetch_payments", lambda *a, **k: payments):
+            _, out = self.run_main("--group", "rowery", "--hours", "2", "--send-to", "rowery")
+        posted = [r[2]["text"] for r in bridge.requests if r[1] == "/send"]
+        self.assertEqual(len(posted), 1)
+        self.assertNotIn("Płatności", posted[0])
+        self.assertIn("Płatności – Angielski", out)
 
     def test_entrypoint_imports_with_isolated_mode(self):
         # the Dockerfile runs `python -I /app/summarize.py`: -I leaves the script's folder off sys.path
