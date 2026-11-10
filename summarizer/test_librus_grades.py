@@ -86,6 +86,25 @@ class FakeLibrus:
         self.calls.append("behaviour_grades")
         return self._extra("behaviour")
 
+    async def agenda(self):
+        self.calls.append("agenda")
+        return self._extra("agenda")
+
+    async def agenda_categories(self):
+        self.calls.append("agenda_categories")
+        return self.extra.get("agenda_categories", {})
+
+    async def homework(self):
+        self.calls.append("homework")
+        return self._extra("homework")
+
+    async def _lesson_subjects(self):  # lesson id -> subject id, to tell a homework's subject
+        self.calls.append("lessons")
+        got = self.extra.get("lessons", {})
+        if isinstance(got, Exception):
+            raise got
+        return got
+
     async def subjects(self):
         self.calls.append("subjects")
         return {1: "Matematyka", 2: "Język polski"}

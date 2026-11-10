@@ -5,11 +5,13 @@ import sqlite3
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import edusky_payments
 import librus_grades
+import librus_upcoming
 import sample_data
 import summarize
 from test_librus_grades import FakeLibrus, grade
@@ -908,6 +910,73 @@ class LibrusGradesRenderTest(unittest.TestCase):
         self.assertIn("a &amp; b", block)
         self.assertIn("Brak nowych ocen.", block)
         self.assertNotIn("data-grades", summarize.build_html_digest([], 24, "07.11.2026"))
+
+
+class LibrusUpcomingRenderTest(unittest.TestCase):
+    def item(self, day=date(2026, 11, 12), group="test", subject="Matematyka", category="praca klasowa", text="z.z. 43-60"):
+        return librus_upcoming.Item(day, group, subject, category, text)
+
+    def child(self, items=(), error=None, name="Ania", skipped=()):
+        return librus_upcoming.ChildUpcoming(name, list(items), error, tuple(skipped))
+
+    def test_text_grouped_by_kind_per_child_after_grades_before_substitutions(self):
+        subs = summarize.Substitutions("1C", date(2026, 11, 11), [], None, "")
+        text = summarize.build_digest([], 24, lang="Polish", substitutions=subs,
+                                      grades=[librus_grades.ChildGrades("Ania", [])], upcoming=[
+            self.child([self.item(date(2026, 11, 11), "homework", category="", text="Ułamki – ćw. 3"),
+                        self.item(),
+                        self.item(date(2026, 11, 13), "quiz", "Chemia", "kartkówka", "Budowa atomu"),
+                        self.item(date(2026, 11, 16), "other", "Fizyka", "wycieczka edukacyjna", "Muzeum"),
+                        self.item(date(2026, 11, 17), "test", "Historia", "Sprawdziany", "Dział I")]),
+            self.child(name="Jaś"),
+        ], upcoming_days=7)
+        self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\n"
+                      "Sprawdziany i prace klasowe:\n"
+                      "- czwartek 12.11 – Matematyka: z.z. 43-60 (praca klasowa)\n"
+                      "- wtorek 17.11 – Historia: Dział I\n"
+                      "Kartkówki:\n"
+                      "- piątek 13.11 – Chemia: Budowa atomu\n"
+                      "Zadania domowe:\n"
+                      "- środa 11.11 – Matematyka: Ułamki – ćw. 3\n"
+                      "Inne:\n"
+                      "- poniedziałek 16.11 – Fizyka: Muzeum (wycieczka edukacyjna)", text)
+        self.assertIn("*Sprawdziany i zadania na 7 dni – Jaś*\nNic w najbliższych 7 dniach.", text)
+        self.assertLess(text.index("Nowe oceny"), text.index("Sprawdziany i zadania"))
+        self.assertLess(text.index("Sprawdziany i zadania na 7 dni – Jaś"), text.index("Zastępstwa"))
+
+    def test_errors_and_skipped_parts(self):
+        text = summarize.build_digest([], 24, lang="Polish", upcoming=[
+            self.child(error="timeout"), self.child([self.item()], name="Jaś", skipped=["homework: 500"])],
+            upcoming_days=7)
+        self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\nNie udało się pobrać terminarza (timeout).", text)
+        self.assertIn("Nie udało się pobrać części danych (homework: 500).", text)
+        # nothing fetched from one part: "nothing in the next days" would be a claim it can't make
+        text = summarize.build_digest([], 24, lang="Polish", upcoming=[self.child(skipped=["homework: 500"])],
+                                      upcoming_days=7)
+        self.assertNotIn("Nic w najbliższych", text)
+
+    def test_english_and_no_section_without_data(self):
+        text = summarize.build_digest([], 24, lang="English", upcoming=[self.child([self.item(subject="")])],
+                                      upcoming_days=3)
+        self.assertIn("*Tests and homework, next 3 days – Ania*\nTests:\n- Thursday 12.11 – z.z. 43-60 (praca klasowa)",
+                      text)
+        self.assertEqual(summarize.build_digest([], 24, lang="Polish", upcoming=[]),
+                         summarize.build_digest([], 24, lang="Polish"))
+
+    def test_html_block_per_child_is_escaped_and_ordered(self):
+        subs = summarize.Substitutions("1C", date(2026, 11, 11), [], None, "")
+        html = summarize.build_html_digest([], 24, "10.11.2026", lang="Polish", substitutions=subs,
+                                           grades=[librus_grades.ChildGrades("Ania", [])], upcoming=[
+            self.child([self.item(text="<b>a & b</b>")], name="<Ania>"), self.child(name="Jaś")], upcoming_days=7)
+        self.assertEqual(html.count('data-upcoming="1"'), 2)
+        self.assertLess(html.index('data-grades="1"'), html.index('data-upcoming="1"'))
+        self.assertLess(html.rindex('data-upcoming="1"'), html.index('data-substitutions="1"'))
+        block = html[html.index('data-upcoming="1"'):html.index('data-substitutions="1"')]
+        self.assertIn("Sprawdziany i zadania na 7 dni – &lt;Ania&gt;", block)
+        self.assertIn("Sprawdziany i prace klasowe", block)
+        self.assertIn("&lt;b&gt;a &amp; b&lt;/b&gt;", block)
+        self.assertIn("Nic w najbliższych 7 dniach.", block)
+        self.assertNotIn("data-upcoming", summarize.build_html_digest([], 24, "10.11.2026"))
 
 
 class EduskyPaymentsRenderTest(unittest.TestCase):
@@ -2047,6 +2116,7 @@ class MainTest(unittest.TestCase):
         def broken(login, password, session):
             return FakeLibrus(login, password, session, fail=ConnectionError("Librus is down"))
 
+        FakeLibrus.instances = []
         err = io.StringIO()
         with mock.patch.dict(os.environ, env), mock.patch.object(librus_grades, "open_account", broken), \
                 redirect_stderr(err):
@@ -2056,6 +2126,9 @@ class MainTest(unittest.TestCase):
         self.assertIn("*Rowery*", out)
         self.assertIn("*Nowe oceny – Ania*\nNie udało się pobrać ocen (Librus is down).", out)
         self.assertIn("warning: librus: Ania: Librus is down", err.getvalue())
+        # no second failed login for the agenda: the grades' error is shown there too
+        self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\nNie udało się pobrać terminarza (Librus is down).", out)
+        self.assertEqual(len(FakeLibrus.instances), 2)
         self.assertEqual(len(smtp.envelopes), 1)
         self.assertTrue(os.path.exists(os.path.join(self.dir, "elsewhere.json")))
 
@@ -2069,6 +2142,52 @@ class MainTest(unittest.TestCase):
             self.run_main("--group", "rowery")
         self.assertIn("LIBRUS_ACCOUNTS", err.getvalue())
         self.assertNotIn("sekret123", err.getvalue())
+
+    def test_upcoming_tests_and_homework_in_the_email_but_never_in_the_group(self):
+        import os
+        from unittest import mock
+
+        bridge = FakeServer({("GET", "/health"): (200, {"connected": True, "logged_in": True}),
+                             ("POST", "/send"): (200, {"id": "X"})})
+        self.addCleanup(bridge.close)
+        env, smtp = self.librus_env(BRIDGE_URL=bridge.url)
+        soon = datetime.fromtimestamp(T0 + 3600, timezone.utc).date() + timedelta(days=2)  # in any time zone
+
+        def opener(login, password, session):
+            extra = {"agenda": [SimpleNamespace(id=1, date=soon.isoformat(), content="Dział II", category_id=1,
+                                                subject_id=1, time_from=None)],
+                     "agenda_categories": {1: "sprawdzian"}} if login == "1111111u" else {}
+            return FakeLibrus(login, password, session, self.accounts[login], extra=extra)
+
+        with mock.patch.dict(os.environ, env), mock.patch.object(librus_grades, "open_account", opener), \
+                redirect_stderr(io.StringIO()):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--send-to", "rowery",
+                                      "--email-to", "piko@example.com")
+            self.assertEqual(code, 0)
+            self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\nSprawdziany i prace klasowe:\n- ", out)
+            self.assertIn("Matematyka: Dział II", out)
+            self.assertIn("*Sprawdziany i zadania na 7 dni – Jaś*\nNic w najbliższych 7 dniach.", out)
+            with mock.patch.dict(os.environ, {"LIBRUS_UPCOMING_DAYS": "0"}):
+                _, off = self.run_main("--group", "rowery", "--hours", "2")
+            self.assertNotIn("Sprawdziany i zadania", off)
+        posted = [r[2]["text"] for r in bridge.requests if r[1] == "/send"]
+        self.assertEqual(len(posted), 1)
+        self.assertNotIn("Sprawdziany", posted[0])
+        msg = email.message_from_bytes(smtp.envelopes[0][2].encode(), policy=email.policy.default)
+        self.assertIn("Matematyka: Dział II", msg.get_body(("html",)).get_content())
+
+    def test_bad_librus_upcoming_days_is_an_error(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"LIBRUS_UPCOMING_DAYS": "tydzień", "LIBRUS_ACCOUNTS": "A:1u:p"}), \
+                redirect_stderr(err), self.assertRaises(SystemExit):
+            self.run_main("--group", "rowery")
+        self.assertIn("LIBRUS_UPCOMING_DAYS", err.getvalue())
+        with mock.patch.dict(os.environ, {"LIBRUS_UPCOMING_DAYS": "tydzień"}):  # Librus off: not in the way
+            code, _ = self.run_main("--group", "rowery", "--hours", "2")
+        self.assertEqual(code, 0)
 
     def test_no_grades_section_without_librus_accounts(self):
         code, out = self.run_main("--group", "rowery", "--hours", "2")

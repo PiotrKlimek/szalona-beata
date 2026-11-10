@@ -35,7 +35,7 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 | Summaries with `--model dummy` / `ollama` | only your server |
 | Summaries with `--model openai` | the chat text of the selected groups (including text read from photos and PDFs, and voice message transcripts) is sent to the LLM provider (Groq by default) |
 | LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
-| Librus grades (only with `LIBRUS_ACCOUNTS`) | read from Librus with each child's login; seen grade ids and the Librus sessions in `librus_state.json` on your server (no passwords) |
+| Librus grades, tests and homework (only with `LIBRUS_ACCOUNTS`) | read from Librus with each child's login; seen grade ids and the Librus sessions in `librus_state.json` on your server (no passwords) |
 | eduSky payments (only with `EDUSKY_URL`) | read from eduSky with the parent's login; nothing stored |
 | The email | the email provider (Resend) and your mailbox |
 
@@ -555,6 +555,35 @@ LIBRUS_ACCOUNTS=Ania:1234567u:password;Jaś:7654321u:password
   warning, and that kind is tried again next time.
 - Check without emailing: `docker compose run --rm -e EMAIL_TO= summarizer --hours 1`.
 
+### Tests and homework (Librus)
+
+With `LIBRUS_ACCOUNTS` set, each child also gets a section, after the grades, with what is coming in the next
+7 days (from tomorrow on): the Librus agenda ("Terminarz": tests, quizzes, trips, meetings) and homework
+assignments ("Zadania domowe") by their due date, grouped by kind:
+
+```
+*Sprawdziany i zadania na 7 dni – Ania*
+Sprawdziany i prace klasowe:
+- czwartek 12.11 – Matematyka: Dział II (praca klasowa)
+Kartkówki:
+- piątek 13.11 – Chemia: Budowa atomu
+Zadania domowe:
+- środa 11.11 – Matematyka: Ułamki – ćw. 3/13
+Inne:
+- poniedziałek 16.11 – Fizyka: Muzeum (wycieczka edukacyjna)
+```
+
+- Every digest shows the whole window again (nothing is remembered), so a test stays listed until its day.
+- Agenda categories are named by each school; they are grouped by keywords (`kartk…` → quizzes; `sprawdzian`,
+  `klasow…`, `diagnoz…`, `test` → tests; `…domow…` → homework; anything else → other). The category is shown in
+  brackets unless it just repeats the group.
+- A homework assignment names its lesson, not its subject; when the subject can't be found, the teacher is shown.
+- `LIBRUS_UPCOMING_DAYS` changes the number of days (`0` turns the section off). It uses the same accounts and
+  saved sessions as the grades and stores nothing new. Like the grades, it is never posted to WhatsApp.
+- If the agenda or the homework can't be fetched, the section says so (and doesn't claim "nothing") and the rest
+  of the digest is sent as usual. A module the school doesn't have (Librus refuses it) just counts as empty. An
+  account whose grades couldn't be checked (e.g. a wrong password) isn't logged into a second time for this.
+
 ## Payments (eduSky)
 
 If an after-school activity (e.g. a language school) runs on eduSky and gives parents a panel at
@@ -686,6 +715,7 @@ docker volume rm szalona-beata_wa-data
 | `SUBSTITUTIONS_URL`, `SUBSTITUTIONS_CLASS` | (off) | School's Edupage site and class: adds that class's substitutions for the next school day to the digest ([section](#school-substitutions-edupage)) |
 | `LIBRUS_ACCOUNTS` | (off) | `name:login:password;...`, one Librus account per child: adds each child's new grades to the digest ([section](#school-grades-librus)) |
 | `LIBRUS_STATE` | `librus_state.json` next to `--db` | Grades already shown and the Librus sessions |
+| `LIBRUS_UPCOMING_DAYS` | `7` | With `LIBRUS_ACCOUNTS`: tests and homework for that many days ahead ([section](#tests-and-homework-librus)); `0` turns it off |
 | `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` | (off) | eduSky site and the parent's login: adds what is due next (all children together) to the end of the digest ([section](#payments-edusky)) |
 | `EDUSKY_NAME` | `Edusky` | Title of the payments section, e.g. the activity's name |
 | `MAX_TRANSCRIPT_CHARS` | `12000` | Max chat length sent to the model per group; on busier days the oldest messages are left out and the email says so under the group |
@@ -731,8 +761,8 @@ Next steps:
 bridge/        Go: whatsmeow wiring (main.go) + tested logic (text, convert, filter, names, store, http,
                textdetect: fast "has text?" check, ocr: Tesseract, voice: transcription API,
                mediaworker: queue of photos to OCR and voice messages to transcribe)
-summarizer/    Python: summarize.py (stdlib only), librus_grades.py (librus-synergia, imported only when
-               LIBRUS_ACCOUNTS is set), edusky_payments.py (stdlib), sample_data.py, tests (run without
+summarizer/    Python: summarize.py (stdlib only), librus_grades.py and librus_upcoming.py
+               (librus-synergia, imported only when LIBRUS_ACCOUNTS is set), edusky_payments.py (stdlib), sample_data.py, tests (run without
                librus-synergia installed)
 test.sh        runs both test suites in Docker (no local toolchains needed)
 ```

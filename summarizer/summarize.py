@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import edusky_payments  # noqa: E402
 import librus_grades  # noqa: E402
+import librus_upcoming  # noqa: E402
 
 # The bridge appends text read from a photo (OCR) after this tag; see bridge/ocr.go.
 OCR_TAG = "[text in image]"
@@ -162,6 +163,11 @@ LABELS = {
         "grades_first_kind": "Point grades, text grades and behaviour points are now checked too: the existing ones ({count}) are skipped, from the next digest on only new ones are shown here.",
         "weight": "weight {weight}", "improvement": "improvement", "no_subject": "(unknown subject)",
         "behaviour": "Behaviour",
+        "upcoming_title": "Tests and homework, next {days} days – {name}",
+        "upcoming_none": "Nothing in the next {days} days.",
+        "upcoming_error": "Could not fetch the agenda ({error}).",
+        "upcoming_skipped": "Could not fetch part of the data ({error}).",
+        "upcoming_groups": {"test": "Tests", "quiz": "Quizzes", "homework": "Homework", "other": "Other"},
         "payments_title": "Payments – {name}",
         "payments_none": "Nothing to pay.",
         "payments_error": "Could not fetch the payments ({error}).",
@@ -208,6 +214,12 @@ LABELS = {
         "grades_first_kind": "Sprawdzane są teraz także oceny punktowe, tekstowe i punkty z zachowania: pominięto dotychczasowe ({count}), od następnego podsumowania pojawią się tu tylko nowe.",
         "weight": "waga {weight}", "improvement": "poprawa", "no_subject": "(przedmiot nieznany)",
         "behaviour": "Zachowanie",
+        "upcoming_title": "Sprawdziany i zadania na {days} dni – {name}",
+        "upcoming_none": "Nic w najbliższych {days} dniach.",
+        "upcoming_error": "Nie udało się pobrać terminarza ({error}).",
+        "upcoming_skipped": "Nie udało się pobrać części danych ({error}).",
+        "upcoming_groups": {"test": "Sprawdziany i prace klasowe", "quiz": "Kartkówki",
+                            "homework": "Zadania domowe", "other": "Inne"},
         "payments_title": "Płatności – {name}",
         "payments_none": "Nic do zapłaty.",
         "payments_error": "Nie udało się pobrać płatności ({error}).",
@@ -528,6 +540,46 @@ def _grades_text(child, lang):
     return f"*{labels(lang)['grades_title'].format(name=child.name)}*\n{body}"
 
 
+# An agenda category that only repeats its group's name is not shown next to the item.
+PLAIN_CATEGORY = {"test": {"sprawdzian", "sprawdziany"}, "quiz": {"kartkówka", "kartkówki"},
+                  "homework": {"praca domowa", "prace domowe", "zadanie domowe", "zadania domowe"}}
+
+
+def _upcoming_line(item, lang):
+    """'czwartek 12.11 – Matematyka: z.z. 43-60 (praca klasowa)'."""
+    when = f"{labels(lang)['weekdays'][item.day.weekday()]} {item.day.strftime('%d.%m')}"
+    what = ": ".join(x for x in (item.subject, item.text) if x)
+    line = f"{when} – {what}" if what else when
+    if item.category and item.category.lower() not in PLAIN_CATEGORY.get(item.group, ()):
+        line += f" ({item.category})"
+    return line
+
+
+def _upcoming_parts(child, days, lang):
+    """([(group title, [lines])] in group order, [notes]): the notes are 'nothing' / the error / skipped parts."""
+    L = labels(lang)
+    if child.error:
+        return [], [L["upcoming_error"].format(error=child.error)]
+    groups = [(L["upcoming_groups"][g], [_upcoming_line(i, lang) for i in child.items if i.group == g])
+              for g in librus_upcoming.GROUPS]
+    groups = [(title, lines) for title, lines in groups if lines]
+    # with a part missing, "nothing" can't be said
+    notes = [] if groups or child.skipped else [L["upcoming_none"].format(days=days)]
+    if child.skipped:
+        notes.append(L["upcoming_skipped"].format(error="; ".join(child.skipped)))
+    return groups, notes
+
+
+def _upcoming_title(child, days, lang):
+    return labels(lang)["upcoming_title"].format(days=days, name=child.name)
+
+
+def _upcoming_text(child, days, lang):
+    groups, notes = _upcoming_parts(child, days, lang)
+    body = [line for title, lines in groups for line in (f"{title}:", *(f"- {x}" for x in lines))]
+    return "\n".join([f"*{_upcoming_title(child, days, lang)}*", *body, *notes])
+
+
 def _money(amount, lang):
     if lang.lower() == "polish":
         return f"{amount:.2f}".replace(".", ",") + " zł"
@@ -566,7 +618,7 @@ def _payments_text(payments, lang):
 
 
 def build_digest(sections, hours, title=None, lang="English", warning=None, substitutions=None, grades=(),
-                 payments=None):
+                 payments=None, upcoming=(), upcoming_days=7):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     header = f"📋 {title or L['digest']} ({L['last'].format(hours=hours)})"
@@ -578,6 +630,7 @@ def build_digest(sections, hours, title=None, lang="English", warning=None, subs
         note = "".join(f"{n}\n" for n in _section_notes(s, lang))
         parts.append(f"*{s.name}*{count}\n{note}{_summary_text(s.summary, lang)}")
     parts.extend(_grades_text(child, lang) for child in grades or ())
+    parts.extend(_upcoming_text(child, upcoming_days, lang) for child in upcoming or ())
     if substitutions:
         parts.append(_subst_text(substitutions, lang))
     if payments:
@@ -732,6 +785,25 @@ def render_grades_html(child, lang):
     return GRADES_BLOCK.format(title=htmllib.escape(title), body=body)
 
 
+UPCOMING_BLOCK = """<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px" data-upcoming="1">
+<tr><td style="background:#ecf7f0;border-left:4px solid #2f8f5b;border-radius:0 8px 8px 0;padding:10px 14px">
+<div style="font-size:17px;font-weight:700;color:#1d5c3a;margin:0 0 8px">📝 {title}</div>
+<div style="font-size:15px;line-height:1.5">{body}</div>
+</td></tr></table>"""
+
+
+def render_upcoming_html(child, days, lang):
+    groups, notes = _upcoming_parts(child, days, lang)
+    body = ""
+    for title, lines in groups:
+        lis = "".join(f'<li style="{LI_STYLE}">{htmllib.escape(line)}</li>' for line in lines)
+        body += (f'<div style="font-weight:700;color:#1d5c3a;margin:4px 0 2px">{htmllib.escape(title)}</div>'
+                 f'<ul style="{UL_STYLE}">{lis}</ul>')
+    for note in notes:
+        body += f'<p style="margin:0;color:#7a8783;font-style:italic">{htmllib.escape(note)}</p>'
+    return UPCOMING_BLOCK.format(title=htmllib.escape(_upcoming_title(child, days, lang)), body=body)
+
+
 PAYMENTS_BLOCK = """<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px" data-payments="1">
 <tr><td style="background:#f4effa;border-left:4px solid #7a4fb5;border-radius:0 8px 8px 0;padding:10px 14px">
 <div style="font-size:17px;font-weight:700;color:#4a2a78;margin:0 0 8px">💳 {title}</div>
@@ -753,7 +825,7 @@ WARNING_BANNER = ('<div data-warning="1" style="background:#fdecea;color:#8a1c12
 
 
 def build_html_digest(sections, hours, day, title=None, lang="English", warning=None, substitutions=None,
-                      grades=(), payments=None):
+                      grades=(), payments=None, upcoming=(), upcoming_days=7):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     cards = "\n".join(
@@ -766,6 +838,8 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
     )
     for child in grades or ():
         cards += "\n" + render_grades_html(child, lang)
+    for child in upcoming or ():
+        cards += "\n" + render_upcoming_html(child, upcoming_days, lang)
     if substitutions:
         cards += "\n" + render_substitutions_html(substitutions, lang)
     if payments:
@@ -1156,6 +1230,11 @@ def parse_args(argv):
         p.error(str(e))
     # env only, like LIBRUS_ACCOUNTS: the password doesn't belong on the command line
     args.edusky = {key: env(f"EDUSKY_{key.upper()}", "") for key in ("url", "login", "password", "name")}
+    days = env("LIBRUS_UPCOMING_DAYS", "7").strip()
+    valid = days.isascii() and days.isdigit() and int(days) <= 60
+    if not valid and args.librus_accounts:  # Librus off: not in the way of the digest
+        p.error(f"LIBRUS_UPCOMING_DAYS must be a whole number of days between 0 and 60, got {days!r}")
+    args.librus_upcoming_days = int(days) if valid else 0
     args.librus_state = env("LIBRUS_STATE", "") or os.path.join(os.path.dirname(args.db) or ".", "librus_state.json")
     if args.max_chars < 1:
         p.error(f"--max-chars / MAX_TRANSCRIPT_CHARS must be at least 1, got {args.max_chars}")
@@ -1241,6 +1320,17 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                 print(f"warning: librus: {child.name}: {child.error}", file=sys.stderr, flush=True)
             for skipped in child.skipped:
                 print(f"warning: librus: {child.name}: {skipped}", file=sys.stderr, flush=True)
+    upcoming = []
+    if args.librus_accounts and args.librus_upcoming_days:
+        today = datetime.fromtimestamp(now, tz).date()
+        failed = {a.login: (child.name, child.error) for a, child in zip(args.librus_accounts, grades) if child.error}
+        upcoming = librus_upcoming.check_upcoming(args.librus_accounts, librus_state, today,
+                                                  args.librus_upcoming_days, failed)
+        for account, child in zip(args.librus_accounts, upcoming):
+            if account.login in failed:
+                continue  # already in the log as the grades' error
+            for problem in ([child.error] if child.error else []) + list(child.skipped):
+                print(f"warning: librus agenda: {child.name}: {problem}", file=sys.stderr, flush=True)
     payments = None
     edusky = args.edusky
     missing = [f"EDUSKY_{k.upper()}" for k in ("url", "login", "password") if not edusky[k]]
@@ -1252,7 +1342,8 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         if payments.error:
             print(f"warning: edusky: {payments.error}", file=sys.stderr, flush=True)
     common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions,
-              "grades": grades, "payments": payments}
+              "grades": grades, "payments": payments, "upcoming": upcoming,
+              "upcoming_days": args.librus_upcoming_days}
     digest = build_digest(sections, args.hours, **common)
     print(digest, flush=True)
     if usage := getattr(llm, "usage", None):
@@ -1262,9 +1353,10 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
             f"= {run['total_tokens']} total",
             file=sys.stderr,
         )
-    if target:  # a group chat: children's grades and payments are only for the email
-        private = grades or payments
-        group_text = build_digest(sections, args.hours, **{**common, "grades": (), "payments": None}) \
+    if target:  # a group chat: children's grades, agenda and payments are only for the email
+        private = grades or payments or upcoming
+        group_text = build_digest(sections, args.hours,
+                                  **{**common, "grades": (), "payments": None, "upcoming": ()}) \
             if private else digest
         send_to_bridge(args.bridge_url, target[0], group_text)
         print(f"\nSent to {target[1]}.", file=sys.stderr)

@@ -241,7 +241,7 @@ async def _check(account, entry):
                         if kind == "grades":  # without the ordinary grades there is no section
                             raise
                         # the other kinds are extras: skip this one for now, keep its state, retry next time
-                        skipped.append(f"{kind}: {e or type(e).__name__}")
+                        skipped.append(f"{kind}: {str(e) or type(e).__name__}")
                         done |= kinds & {kind}
                         continue
                     if kind in kinds:
