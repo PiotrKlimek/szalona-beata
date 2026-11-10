@@ -927,7 +927,7 @@ class LibrusUpcomingRenderTest(unittest.TestCase):
                         self.item(),
                         self.item(date(2026, 11, 13), "quiz", "Chemia", "kartkówka", "Budowa atomu"),
                         self.item(date(2026, 11, 16), "other", "Fizyka", "wycieczka edukacyjna", "Muzeum"),
-                        self.item(date(2026, 11, 17), "test", "Historia", "sprawdzian", "Dział I")]),
+                        self.item(date(2026, 11, 17), "test", "Historia", "Sprawdziany", "Dział I")]),
             self.child(name="Jaś"),
         ], upcoming_days=7)
         self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\n"
@@ -950,6 +950,10 @@ class LibrusUpcomingRenderTest(unittest.TestCase):
             upcoming_days=7)
         self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\nNie udało się pobrać terminarza (timeout).", text)
         self.assertIn("Nie udało się pobrać części danych (homework: 500).", text)
+        # nothing fetched from one part: "nothing in the next days" would be a claim it can't make
+        text = summarize.build_digest([], 24, lang="Polish", upcoming=[self.child(skipped=["homework: 500"])],
+                                      upcoming_days=7)
+        self.assertNotIn("Nic w najbliższych", text)
 
     def test_english_and_no_section_without_data(self):
         text = summarize.build_digest([], 24, lang="English", upcoming=[self.child([self.item(subject="")])],
@@ -2112,6 +2116,7 @@ class MainTest(unittest.TestCase):
         def broken(login, password, session):
             return FakeLibrus(login, password, session, fail=ConnectionError("Librus is down"))
 
+        FakeLibrus.instances = []
         err = io.StringIO()
         with mock.patch.dict(os.environ, env), mock.patch.object(librus_grades, "open_account", broken), \
                 redirect_stderr(err):
@@ -2121,6 +2126,9 @@ class MainTest(unittest.TestCase):
         self.assertIn("*Rowery*", out)
         self.assertIn("*Nowe oceny – Ania*\nNie udało się pobrać ocen (Librus is down).", out)
         self.assertIn("warning: librus: Ania: Librus is down", err.getvalue())
+        # no second failed login for the agenda: the grades' error is shown there too
+        self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\nNie udało się pobrać terminarza (Librus is down).", out)
+        self.assertEqual(len(FakeLibrus.instances), 2)
         self.assertEqual(len(smtp.envelopes), 1)
         self.assertTrue(os.path.exists(os.path.join(self.dir, "elsewhere.json")))
 
@@ -2173,10 +2181,13 @@ class MainTest(unittest.TestCase):
         from unittest import mock
 
         err = io.StringIO()
-        with mock.patch.dict(os.environ, {"LIBRUS_UPCOMING_DAYS": "tydzień"}), redirect_stderr(err), \
-                self.assertRaises(SystemExit):
+        with mock.patch.dict(os.environ, {"LIBRUS_UPCOMING_DAYS": "tydzień", "LIBRUS_ACCOUNTS": "A:1u:p"}), \
+                redirect_stderr(err), self.assertRaises(SystemExit):
             self.run_main("--group", "rowery")
         self.assertIn("LIBRUS_UPCOMING_DAYS", err.getvalue())
+        with mock.patch.dict(os.environ, {"LIBRUS_UPCOMING_DAYS": "tydzień"}):  # Librus off: not in the way
+            code, _ = self.run_main("--group", "rowery", "--hours", "2")
+        self.assertEqual(code, 0)
 
     def test_no_grades_section_without_librus_accounts(self):
         code, out = self.run_main("--group", "rowery", "--hours", "2")

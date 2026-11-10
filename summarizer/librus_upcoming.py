@@ -55,16 +55,29 @@ def _clean(text):
     return text if len(text) <= MAX_TEXT else text[:MAX_TEXT].rstrip() + "…"
 
 
-async def _lesson_subjects(librus):
-    """{lesson id: subject id} - a homework assignment names its lesson, not its subject."""
-    payload = await librus.client.async_get_lessons()
-    lessons = payload.get("Lessons") if isinstance(payload, dict) else None
-    result = {}
-    for lesson in lessons if isinstance(lessons, list) else ():
-        subject = lesson.get("Subject") if isinstance(lesson, dict) else None
-        if isinstance(subject, dict) and lesson.get("Id") is not None and subject.get("Id") is not None:
-            result[str(lesson["Id"])] = subject["Id"]
-    return result
+REFUSED = (403, 404, 405)  # the school has no such module (or not for parents)
+
+
+def _error(e):
+    return str(e) or type(e).__name__
+
+
+async def _fetch(load, part, skipped):
+    """The items of one part; a refused module is empty, another error goes to `skipped`."""
+    try:
+        return await load()
+    except Exception as e:
+        if getattr(e, "status_code", None) not in REFUSED:
+            skipped.append(f"{part}: {_error(e)}")
+        return []
+
+
+async def _names(load):
+    """A lookup that is only for display: {} when it fails."""
+    try:
+        return await load() or {}
+    except Exception:
+        return {}
 
 
 async def _check(account, entry, first, last):
@@ -74,36 +87,31 @@ async def _check(account, entry, first, last):
             try:
                 if not name:
                     name = (await librus.me()).first_name or account.login
-                skipped, events, assignments = [], [], []
-                try:
-                    events = [e for e in await librus.agenda() if (d := _day(e.date)) and first <= d <= last]
-                except Exception as e:
-                    skipped.append(f"agenda: {e or type(e).__name__}")
-                try:
-                    assignments = [h for h in await librus.homework()
-                                   if (d := _day(h.due_date)) and first <= d <= last]
-                except Exception as e:
-                    skipped.append(f"homework: {e or type(e).__name__}")
+                skipped = []
+                events = [e for e in await _fetch(librus.agenda, "agenda", skipped)
+                          if (d := _day(e.date)) and first <= d <= last]
+                assignments = [h for h in await _fetch(librus.homework, "homework", skipped)
+                               if (d := _day(h.due_date)) and first <= d <= last]
+                if len(skipped) == 2:  # nothing could be fetched
+                    return ChildUpcoming(name, [], "; ".join(skipped))
                 items = []
                 if events or assignments:  # the lookups only when there is something to show
-                    subjects = await librus.subjects()
+                    subjects = await _names(librus.subjects)
                 if events:
-                    categories = await librus.agenda_categories()
+                    categories = await _names(librus.agenda_categories)
                     for e in events:
                         category = librus_grades._lookup(categories, e.category_id) or ""
                         items.append(Item(_day(e.date), group_of(category),
                                           librus_grades._lookup(subjects, e.subject_id) or "", category,
                                           _clean(e.content)))
                 if assignments:
-                    try:
-                        lessons = await _lesson_subjects(librus)
-                    except Exception:  # only for the subject's name
-                        lessons = {}
+                    # a homework assignment names its lesson, not its subject (private, but the library's own lookup)
+                    lessons = await _names(librus._lesson_subjects)
                     teachers = None
                     for h in assignments:
-                        subject = librus_grades._lookup(subjects, lessons.get(str(h.lesson_id)))
+                        subject = librus_grades._lookup(subjects, librus_grades._lookup(lessons, h.lesson_id))
                         if not subject:
-                            teachers = teachers if teachers is not None else await librus.teachers()
+                            teachers = teachers if teachers is not None else await _names(librus.teachers)
                             subject = librus_grades._lookup(teachers, h.teacher_id) or ""
                         text = " – ".join(t for t in (_clean(h.topic), _clean(h.text)) if t)
                         items.append(Item(_day(h.due_date), "homework", subject, "", text))
@@ -112,15 +120,23 @@ async def _check(account, entry, first, last):
             finally:
                 entry["session"] = librus.session_dict()
     except Exception as e:  # one child's failure must not cost the digest or the other children
-        return ChildUpcoming(name or account.login, [], str(e) or type(e).__name__)
+        return ChildUpcoming(name or account.login, [], _error(e))
 
 
-def check_upcoming(accounts, state, today, days):
+def check_upcoming(accounts, state, today, days, failed=None):
     """[ChildUpcoming] in account order: from the day after `today` for `days` days. Sessions in `state`
-    are updated (saved by the caller together with the grades)."""
+    are updated (saved by the caller together with the grades). `failed` = {login: (name, error)} of
+    accounts whose grades just failed: not logged into again (a wrong password would fail twice a day)."""
     first, last = today + timedelta(days=1), today + timedelta(days=days)
+    failed = failed or {}
+
+    async def one(a):
+        if a.login in failed:
+            name, error = failed[a.login]
+            return ChildUpcoming(name, [], error)
+        return await _check(a, state.setdefault(a.login, {}), first, last)
 
     async def run():
-        return [await _check(a, state.setdefault(a.login, {}), first, last) for a in accounts]
+        return [await one(a) for a in accounts]
 
     return asyncio.run(run())

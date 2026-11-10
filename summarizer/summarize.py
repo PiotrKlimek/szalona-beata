@@ -541,7 +541,8 @@ def _grades_text(child, lang):
 
 
 # An agenda category that only repeats its group's name is not shown next to the item.
-PLAIN_CATEGORY = {"test": "sprawdzian", "quiz": "kartkówka", "homework": "praca domowa"}
+PLAIN_CATEGORY = {"test": {"sprawdzian", "sprawdziany"}, "quiz": {"kartkówka", "kartkówki"},
+                  "homework": {"praca domowa", "prace domowe", "zadanie domowe", "zadania domowe"}}
 
 
 def _upcoming_line(item, lang):
@@ -549,7 +550,7 @@ def _upcoming_line(item, lang):
     when = f"{labels(lang)['weekdays'][item.day.weekday()]} {item.day.strftime('%d.%m')}"
     what = ": ".join(x for x in (item.subject, item.text) if x)
     line = f"{when} – {what}" if what else when
-    if item.category and item.category.lower() != PLAIN_CATEGORY.get(item.group):
+    if item.category and item.category.lower() not in PLAIN_CATEGORY.get(item.group, ()):
         line += f" ({item.category})"
     return line
 
@@ -562,7 +563,8 @@ def _upcoming_parts(child, days, lang):
     groups = [(L["upcoming_groups"][g], [_upcoming_line(i, lang) for i in child.items if i.group == g])
               for g in librus_upcoming.GROUPS]
     groups = [(title, lines) for title, lines in groups if lines]
-    notes = [] if groups else [L["upcoming_none"].format(days=days)]
+    # with a part missing, "nothing" can't be said
+    notes = [] if groups or child.skipped else [L["upcoming_none"].format(days=days)]
     if child.skipped:
         notes.append(L["upcoming_skipped"].format(error="; ".join(child.skipped)))
     return groups, notes
@@ -1229,9 +1231,10 @@ def parse_args(argv):
     # env only, like LIBRUS_ACCOUNTS: the password doesn't belong on the command line
     args.edusky = {key: env(f"EDUSKY_{key.upper()}", "") for key in ("url", "login", "password", "name")}
     days = env("LIBRUS_UPCOMING_DAYS", "7").strip()
-    if not (days.isascii() and days.isdigit() and int(days) <= 60):
+    valid = days.isascii() and days.isdigit() and int(days) <= 60
+    if not valid and args.librus_accounts:  # Librus off: not in the way of the digest
         p.error(f"LIBRUS_UPCOMING_DAYS must be a whole number of days between 0 and 60, got {days!r}")
-    args.librus_upcoming_days = int(days)
+    args.librus_upcoming_days = int(days) if valid else 0
     args.librus_state = env("LIBRUS_STATE", "") or os.path.join(os.path.dirname(args.db) or ".", "librus_state.json")
     if args.max_chars < 1:
         p.error(f"--max-chars / MAX_TRANSCRIPT_CHARS must be at least 1, got {args.max_chars}")
@@ -1320,9 +1323,12 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
     upcoming = []
     if args.librus_accounts and args.librus_upcoming_days:
         today = datetime.fromtimestamp(now, tz).date()
+        failed = {a.login: (child.name, child.error) for a, child in zip(args.librus_accounts, grades) if child.error}
         upcoming = librus_upcoming.check_upcoming(args.librus_accounts, librus_state, today,
-                                                  args.librus_upcoming_days)
-        for child in upcoming:
+                                                  args.librus_upcoming_days, failed)
+        for account, child in zip(args.librus_accounts, upcoming):
+            if account.login in failed:
+                continue  # already in the log as the grades' error
             for problem in ([child.error] if child.error else []) + list(child.skipped):
                 print(f"warning: librus agenda: {child.name}: {problem}", file=sys.stderr, flush=True)
     payments = None

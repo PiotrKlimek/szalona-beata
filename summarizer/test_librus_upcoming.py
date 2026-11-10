@@ -35,6 +35,12 @@ class GroupTest(unittest.TestCase):
             self.assertEqual(lu.group_of(category), group, category)
 
 
+class Refused(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
 class CheckUpcomingTest(unittest.TestCase):
     def setUp(self):
         FakeLibrus.instances = []
@@ -57,7 +63,7 @@ class CheckUpcomingTest(unittest.TestCase):
                        event(6, None)],
             "agenda_categories": CATEGORIES,
             "homework": [assignment(10, "2026-11-11"), assignment(11, "2026-11-20"), assignment(12, None)],
-            "lessons": {"Lessons": [{"Id": 7, "Subject": {"Id": 1}}]},
+            "lessons": {7: 1},
         }
         [child] = self.check([lg.Account("Ania", "1u", "p")])
         self.assertIsNone(child.error)
@@ -87,6 +93,39 @@ class CheckUpcomingTest(unittest.TestCase):
         self.assertIsNone(child.error)
         self.assertEqual(len(child.items), 1)
         self.assertEqual(child.skipped, ("agenda: agenda down",))
+
+    def test_both_parts_failing_is_an_error(self):
+        self.extra["1u"] = {"agenda": RuntimeError("a"), "homework": TimeoutError()}
+        [child] = self.check([lg.Account("Ania", "1u", "p")])
+        self.assertEqual(child.error, "agenda: a; homework: TimeoutError")
+        self.assertEqual(child.items, [])
+
+    def test_a_module_the_school_refuses_is_just_empty(self):
+        self.extra["1u"] = {"agenda": [event(1, "2026-11-11")], "agenda_categories": CATEGORIES,
+                            "homework": Refused(403)}
+        [child] = self.check([lg.Account("Ania", "1u", "p")])
+        self.assertEqual((child.error, child.skipped, len(child.items)), (None, (), 1))
+
+    def test_failed_lookups_keep_the_items(self):
+        class Broken(FakeLibrus):
+            async def subjects(self):
+                raise RuntimeError("subjects down")
+
+            async def agenda_categories(self):
+                raise RuntimeError("categories down")
+
+        def opener(login, password, session):
+            return Broken(login, password, session, extra={"agenda": [event(1, "2026-11-11", content="Dział")]})
+
+        with mock.patch.object(lg, "open_account", opener):
+            [child] = self.check([lg.Account("Ania", "1u", "p")])
+        self.assertIsNone(child.error)
+        self.assertEqual([(i.group, i.subject, i.text) for i in child.items], [("other", "", "Dział")])
+
+    def test_accounts_whose_grades_failed_are_not_logged_into_again(self):
+        [child] = lu.check_upcoming([lg.Account("Ania", "1u", "p")], {}, TODAY, 7, failed={"1u": ("Ania", "bad password")})
+        self.assertEqual(child, lu.ChildUpcoming("Ania", [], "bad password"))
+        self.assertEqual(FakeLibrus.instances, [])
 
     def test_login_failure_is_an_error_for_that_child_only(self):
         def opener(login, password, session):

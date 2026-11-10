@@ -98,16 +98,12 @@ class FakeLibrus:
         self.calls.append("homework")
         return self._extra("homework")
 
-    @property
-    def client(self):  # the raw API: lessons, to tell a homework's subject
-        async def async_get_lessons():
-            self.calls.append("lessons")
-            got = self.extra.get("lessons", {})
-            if isinstance(got, Exception):
-                raise got
-            return got
-
-        return SimpleNamespace(async_get_lessons=async_get_lessons)
+    async def _lesson_subjects(self):  # lesson id -> subject id, to tell a homework's subject
+        self.calls.append("lessons")
+        got = self.extra.get("lessons", {})
+        if isinstance(got, Exception):
+            raise got
+        return got
 
     async def subjects(self):
         self.calls.append("subjects")

@@ -580,7 +580,9 @@ Inne:
 - A homework assignment names its lesson, not its subject; when the subject can't be found, the teacher is shown.
 - `LIBRUS_UPCOMING_DAYS` changes the number of days (`0` turns the section off). It uses the same accounts and
   saved sessions as the grades and stores nothing new. Like the grades, it is never posted to WhatsApp.
-- If the agenda or the homework can't be fetched, the section says so and the rest of the digest is sent as usual.
+- If the agenda or the homework can't be fetched, the section says so (and doesn't claim "nothing") and the rest
+  of the digest is sent as usual. A module the school doesn't have (Librus refuses it) just counts as empty. An
+  account whose grades couldn't be checked (e.g. a wrong password) isn't logged into a second time for this.
 
 ## Payments (eduSky)
 
