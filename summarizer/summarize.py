@@ -1224,6 +1224,10 @@ def parse_args(argv):
     p.add_argument("--substitutions-class", default=env("SUBSTITUTIONS_CLASS", ""),
                    help="class whose substitutions for the next school day are added to the digest, e.g. 1C")
     args = p.parse_args(argv)
+    retry = env("FETCH_RETRY_MINUTES", "10").strip()
+    if not (retry.isascii() and retry.isdigit() and int(retry) <= 120):
+        p.error(f"FETCH_RETRY_MINUTES must be a whole number of minutes between 0 and 120, got {retry!r}")
+    args.fetch_retry_minutes = int(retry)
     try:  # env only: passwords don't belong on the command line
         args.librus_accounts = librus_grades.parse_accounts(env("LIBRUS_ACCOUNTS", ""))
     except ValueError as e:
@@ -1264,6 +1268,123 @@ def parse_args(argv):
     return args
 
 
+# Failed school sections are fetched again (a site that is down for a moment must not cost a section):
+# after FIRST_RETRY_WAIT seconds, then twice as long each time up to MAX_FETCH_RETRY_WAIT, for at most
+# FETCH_RETRY_MINUTES (checked between rounds: the last round may start right at the limit). The clock and sleep are module attributes so that tests can fake them.
+FIRST_RETRY_WAIT = 30
+MAX_FETCH_RETRY_WAIT = 120
+_clock = time.monotonic
+_sleep = time.sleep
+
+
+def _retry_rank(result):
+    """0 = complete, 1 = partly fetched (`skipped`), 2 = failed; None = nothing yet."""
+    if result is None:
+        return 3
+    return 2 if result.error else 1 if getattr(result, "skipped", ()) else 0
+
+
+def _retryable(result):
+    return result is None or (_retry_rank(result) > 0 and not getattr(result, "final", False))
+
+
+def _keep_better(results, key, new):
+    """Store `new` unless what is already there is more complete; True if stored."""
+    if _retry_rank(new) <= _retry_rank(results.get(key)):
+        results[key] = new
+        return True
+    return False
+
+
+def fetch_school_sections(args, now, tz):
+    """(substitutions, grades, librus_state, librus_seen, upcoming, payments); what fails is fetched
+    again, only that, until it answers or the retry time is over. Problems left are logged as warnings."""
+    subs_on = bool(args.substitutions_url) and bool(args.substitutions_class)
+    if bool(args.substitutions_url) != bool(args.substitutions_class):
+        print("warning: substitutions need both SUBSTITUTIONS_URL and SUBSTITUTIONS_CLASS; skipped",
+              file=sys.stderr, flush=True)
+    edusky = args.edusky
+    missing = [f"EDUSKY_{k.upper()}" for k in ("url", "login", "password") if not edusky[k]]
+    if len(missing) < 3 and missing:
+        print(f"warning: edusky payments need {', '.join(missing)}; skipped", file=sys.stderr, flush=True)
+    edusky_on = not missing
+    accounts = args.librus_accounts
+    upcoming_on = bool(accounts) and bool(args.librus_upcoming_days)
+    librus_state = librus_grades.load_state(args.librus_state) if accounts else None
+    today = datetime.fromtimestamp(now, tz).date()
+    one = {}  # "substitutions" / "edusky" -> result
+    grades, seen, upcoming = {}, {}, {}  # by login
+    names = {a.login: a.name or a.login for a in accounts}
+
+    deadline = _clock() + args.fetch_retry_minutes * 60
+    wait = FIRST_RETRY_WAIT
+    while True:
+        if subs_on and _retryable(one.get("substitutions")):
+            _keep_better(one, "substitutions", fetch_substitutions(
+                args.substitutions_url, args.substitutions_class, next_school_day(now, tz)))
+        if edusky_on and _retryable(one.get("edusky")):
+            _keep_better(one, "edusky", edusky_payments.fetch_payments(
+                edusky["url"], edusky["login"], edusky["password"], edusky["name"]))
+        todo = [a for a in accounts if _retryable(grades.get(a.login))]
+        if todo:
+            children, ids = librus_grades.check_grades(todo, librus_state)
+            for account, child in zip(todo, children):
+                if _keep_better(grades, account.login, child):
+                    names[account.login] = child.name
+                    if account.login in ids:
+                        seen[account.login] = ids[account.login]
+                    else:
+                        seen.pop(account.login, None)
+        if upcoming_on:
+            # not for an account whose grades failed for good: its error is shown there too
+            todo = [a for a in accounts if _retryable(upcoming.get(a.login))
+                    and not (grades[a.login].error and grades[a.login].final)]
+            # accounts whose grades just failed are not logged into again (see check_upcoming)
+            failed = {a.login: (grades[a.login].name, grades[a.login].error) for a in todo
+                      if grades[a.login].error}
+            for account, child in zip(todo, librus_upcoming.check_upcoming(
+                    todo, librus_state, today, args.librus_upcoming_days, failed)):
+                _keep_better(upcoming, account.login, child)
+            for a in accounts:  # a final grades error is the agenda's too (also over an earlier passing one)
+                if grades[a.login].error and grades[a.login].final:
+                    upcoming[a.login] = librus_upcoming.ChildUpcoming(
+                        grades[a.login].name, [], grades[a.login].error, final=True)
+        # with the reason, so a site that recovers on a retry still leaves a trace in the log
+        pending = [f"{k} ({one[k].error or '; '.join(one[k].skipped)})" for k in ("substitutions", "edusky")
+                   if k in one and _retryable(one[k])]
+        for a in accounts:
+            parts = [r for r in (grades[a.login], upcoming.get(a.login)) if r is not None and _retryable(r)]
+            if parts:
+                reasons = [r.error or "; ".join(r.skipped) for r in parts]
+                pending.append(f"librus {names[a.login]} ({'; '.join(dict.fromkeys(reasons))})")
+        left = deadline - _clock()
+        if not pending or left <= 0:
+            break
+        wait = min(wait, left)
+        print(f"warning: retrying in {wait:.0f}s: {', '.join(pending)}", file=sys.stderr, flush=True)
+        _sleep(wait)
+        wait = min(wait * 2, MAX_FETCH_RETRY_WAIT)
+
+    substitutions, payments = one.get("substitutions"), one.get("edusky")
+    if substitutions and substitutions.error:
+        print(f"warning: substitutions: {substitutions.error}", file=sys.stderr, flush=True)
+    grades = [grades[a.login] for a in accounts]
+    for child in grades:
+        if child.error:
+            print(f"warning: librus: {child.name}: {child.error}", file=sys.stderr, flush=True)
+        for skipped in child.skipped:
+            print(f"warning: librus: {child.name}: {skipped}", file=sys.stderr, flush=True)
+    upcoming = [upcoming[a.login] for a in accounts] if upcoming_on else []
+    for g, child in zip(grades, upcoming):
+        if g.error:
+            continue  # already in the log as the grades' error
+        for problem in ([child.error] if child.error else []) + list(child.skipped):
+            print(f"warning: librus agenda: {child.name}: {problem}", file=sys.stderr, flush=True)
+    if payments and payments.error:
+        print(f"warning: edusky: {payments.error}", file=sys.stderr, flush=True)
+    return substitutions, grades, librus_state, seen, upcoming, payments
+
+
 def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=False):
     """Build one digest and deliver it (print, and optionally group and/or email)."""
     since = int(now - args.hours * 3600)
@@ -1302,45 +1423,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
             summary = dummy_summary(msgs, tz, lang)
         sections.append(Section(name, summary, len(msgs), omitted, ocr, voice, docs))
 
-    substitutions = None
-    if bool(args.substitutions_url) != bool(args.substitutions_class):
-        print("warning: substitutions need both SUBSTITUTIONS_URL and SUBSTITUTIONS_CLASS; skipped",
-              file=sys.stderr, flush=True)
-    elif args.substitutions_url:
-        substitutions = fetch_substitutions(args.substitutions_url, args.substitutions_class,
-                                            next_school_day(now, tz))
-        if substitutions.error:
-            print(f"warning: substitutions: {substitutions.error}", file=sys.stderr, flush=True)
-    grades, librus_state, librus_seen = [], None, {}
-    if args.librus_accounts:
-        librus_state = librus_grades.load_state(args.librus_state)
-        grades, librus_seen = librus_grades.check_grades(args.librus_accounts, librus_state)
-        for child in grades:
-            if child.error:
-                print(f"warning: librus: {child.name}: {child.error}", file=sys.stderr, flush=True)
-            for skipped in child.skipped:
-                print(f"warning: librus: {child.name}: {skipped}", file=sys.stderr, flush=True)
-    upcoming = []
-    if args.librus_accounts and args.librus_upcoming_days:
-        today = datetime.fromtimestamp(now, tz).date()
-        failed = {a.login: (child.name, child.error) for a, child in zip(args.librus_accounts, grades) if child.error}
-        upcoming = librus_upcoming.check_upcoming(args.librus_accounts, librus_state, today,
-                                                  args.librus_upcoming_days, failed)
-        for account, child in zip(args.librus_accounts, upcoming):
-            if account.login in failed:
-                continue  # already in the log as the grades' error
-            for problem in ([child.error] if child.error else []) + list(child.skipped):
-                print(f"warning: librus agenda: {child.name}: {problem}", file=sys.stderr, flush=True)
-    payments = None
-    edusky = args.edusky
-    missing = [f"EDUSKY_{k.upper()}" for k in ("url", "login", "password") if not edusky[k]]
-    if len(missing) < 3 and missing:
-        print(f"warning: edusky payments need {', '.join(missing)}; skipped", file=sys.stderr, flush=True)
-    elif not missing:
-        payments = edusky_payments.fetch_payments(edusky["url"], edusky["login"], edusky["password"],
-                                                  edusky["name"])
-        if payments.error:
-            print(f"warning: edusky: {payments.error}", file=sys.stderr, flush=True)
+    substitutions, grades, librus_state, librus_seen, upcoming, payments = fetch_school_sections(args, now, tz)
     common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions,
               "grades": grades, "payments": payments, "upcoming": upcoming,
               "upcoming_days": args.librus_upcoming_days}

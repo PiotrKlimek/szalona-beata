@@ -87,6 +87,14 @@ class FetchPaymentsTest(unittest.TestCase):
         self.assertIn("400", result.error)
         self.assertNotIn("tajne", result.error)
 
+    def test_refused_credentials_are_final_a_server_error_is_not(self):
+        for code in (400, 401):
+            srv = self.server({TOKEN: (code, {"error": "invalid_grant"})})
+            self.assertTrue(ep.fetch_payments(srv.url, "Rodzic", "tajne").final, code)
+        srv = self.server({TOKEN: (503, {"error": "busy"})})
+        self.assertFalse(ep.fetch_payments(srv.url, "Rodzic", "tajne").final)
+        self.assertFalse(ep.fetch_payments("http://127.0.0.1:9", "Rodzic", "tajne", timeout=2).final)
+
     def test_unexpected_answer_is_an_error_not_an_exception(self):
         srv = self.server({("GET", payments_path(11)): (200, {"unexpected": True})})
         result = ep.fetch_payments(srv.url, "Rodzic", "tajne:hasło")

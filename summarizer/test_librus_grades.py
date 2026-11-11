@@ -287,6 +287,17 @@ class CheckGradesTest(unittest.TestCase):
         self.assertEqual(len(children[1].grades), 1)
         self.assertNotIn("1111111u", seen)  # nothing new learned: keep what was seen
 
+    def test_rejected_login_is_final_a_network_error_is_not(self):
+        class LibrusInvalidCredentialsError(Exception):  # the library's name for a refused password
+            pass
+
+        self.failures = {"1111111u": LibrusInvalidCredentialsError("Login rejected"),
+                         "2222222u": ConnectionError("down")}
+        accounts = [lg.Account("Ania", "1111111u", "a"), lg.Account("Jaś", "2222222u", "b")]
+        children, _ = self.check(accounts, {})
+        self.assertTrue(children[0].final)  # retrying would only risk a lock-out
+        self.assertFalse(children[1].final)
+
     def test_failure_without_a_name_falls_back_to_the_login(self):
         self.failures = {"1234567u": TimeoutError()}
         children, _ = self.check([lg.Account("", "1234567u", "p")], {})

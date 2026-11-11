@@ -614,6 +614,20 @@ EDUSKY_NAME=Angielski        # section title; default "Edusky"
   sent as usual. With only some of `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` set, the section is skipped
   and the log says which are missing.
 
+## When a school site doesn't answer
+
+Edupage, Librus and eduSky are sometimes down or slow for a few minutes. Rather than send the digest without a
+section, the digest waits: whatever failed (and only that, e.g. one child's Librus account) is fetched again after
+30 seconds, then after twice as long each time (up to 2 minutes between tries), for about `FETCH_RETRY_MINUTES`
+(default 10; the last try may start right at the limit). The log says what is being retried and why
+(`warning: retrying in 30s: substitutions (timed out), librus Ania (Librus is down)`). If it
+still fails, the digest goes out with *Nie udało się pobrać…* in that section, as before. A part that came only
+partly (e.g. grades without the behaviour points) is retried too, but a complete earlier answer is never replaced
+by a worse one. A refused Librus login or eduSky password is **not** retried: that won't fix itself, and repeated
+failed logins can lock the account or bring a captcha. `FETCH_RETRY_MINUTES=0` turns retries off.
+An error that never goes away (e.g. a mistyped `SUBSTITUTIONS_URL`) delays the digest by the whole retry time
+until it is fixed.
+
 ## Local models (Ollama)
 
 `--model ollama` keeps everything on your server. Ollama starts only on demand (profile `llm`) and unloads the
@@ -718,6 +732,7 @@ docker volume rm szalona-beata_wa-data
 | `LIBRUS_UPCOMING_DAYS` | `7` | With `LIBRUS_ACCOUNTS`: tests and homework for that many days ahead ([section](#tests-and-homework-librus)); `0` turns it off |
 | `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` | (off) | eduSky site and the parent's login: adds what is due next (all children together) to the end of the digest ([section](#payments-edusky)) |
 | `EDUSKY_NAME` | `Edusky` | Title of the payments section, e.g. the activity's name |
+| `FETCH_RETRY_MINUTES` | `10` | When Edupage, Librus or eduSky fails, how long to keep trying again before sending the digest with the error ([section](#when-a-school-site-doesnt-answer)); `0` turns retries off |
 | `MAX_TRANSCRIPT_CHARS` | `12000` | Max chat length sent to the model per group; on busier days the oldest messages are left out and the email says so under the group |
 | `LLM_LOG_DB` | `llm_log.db` next to `--db` | Log of LLM prompts and responses; `off` disables it |
 | `OLLAMA_MODEL` | `qwen2.5:3b` | Local model for `--model ollama` (needs ~2.5 GB free RAM) |
