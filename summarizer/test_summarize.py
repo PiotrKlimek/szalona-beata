@@ -2331,7 +2331,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("- lekcja 1: wf", out)
         self.assertIn("Do zapłaty: 255,00 zł", out)
         self.assertNotIn("Nie udało się", out)
-        self.assertIn("retrying in 30s: substitutions, edusky", err.getvalue())
+        self.assertIn("retrying in 30s: substitutions (timed out), edusky (HTTP 502 Bad Gateway)", err.getvalue())
         self.assertNotIn("warning: substitutions", err.getvalue())
 
     def test_failed_librus_child_is_checked_again_on_its_own(self):
@@ -2359,7 +2359,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("*Nowe oceny – Ania*\nPierwsze sprawdzenie", out)
         self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\nNic w najbliższych 7 dniach.", out)
         self.assertNotIn("Nie udało się", out)
-        self.assertIn("retrying in 30s: librus Ania", err.getvalue())
+        self.assertIn("retrying in 30s: librus Ania (Librus is down)", err.getvalue())
         self.assertEqual(len(smtp.envelopes), 1)
         self.assertEqual(librus_grades.load_state(self.state_path)["1111111u"]["seen"], ["1"])
 
@@ -2406,6 +2406,32 @@ class MainTest(unittest.TestCase):
         self.assertEqual(self.slept, [])
         self.assertEqual(logins.count("1111111u"), 1)
         self.assertIn("Nie udało się pobrać ocen (Login rejected).", out)
+
+    def test_login_refused_on_a_retry_ends_the_retries_and_is_shown_in_the_agenda(self):
+        import os
+        from unittest import mock
+
+        class LibrusCaptchaRequiredError(Exception):
+            pass
+
+        env, _ = self.librus_env(FETCH_RETRY_MINUTES="10")
+        logins = []
+
+        def opener(login, password, session):
+            logins.append(login)
+            fail = None
+            if login == "1111111u":
+                first = logins.count(login) == 1
+                fail = ConnectionError("Librus is down") if first else LibrusCaptchaRequiredError("captcha")
+            return FakeLibrus(login, password, session, self.accounts[login], fail=fail)
+
+        with mock.patch.dict(os.environ, env), mock.patch.object(librus_grades, "open_account", opener), \
+                redirect_stderr(io.StringIO()):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slept, [30])  # nothing left worth waiting for
+        self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\nNie udało się pobrać terminarza (captcha).", out)
 
     def test_bad_fetch_retry_minutes_is_an_error(self):
         import os

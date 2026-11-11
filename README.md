@@ -618,12 +618,15 @@ EDUSKY_NAME=Angielski        # section title; default "Edusky"
 
 Edupage, Librus and eduSky are sometimes down or slow for a few minutes. Rather than send the digest without a
 section, the digest waits: whatever failed (and only that, e.g. one child's Librus account) is fetched again after
-30 seconds, then after twice as long each time (up to 2 minutes between tries), for at most `FETCH_RETRY_MINUTES`
-(default 10). The log says what is being retried (`warning: retrying in 30s: substitutions, librus Ania`). If it
+30 seconds, then after twice as long each time (up to 2 minutes between tries), for about `FETCH_RETRY_MINUTES`
+(default 10; the last try may start right at the limit). The log says what is being retried and why
+(`warning: retrying in 30s: substitutions (timed out), librus Ania (Librus is down)`). If it
 still fails, the digest goes out with *Nie udało się pobrać…* in that section, as before. A part that came only
 partly (e.g. grades without the behaviour points) is retried too, but a complete earlier answer is never replaced
 by a worse one. A refused Librus login or eduSky password is **not** retried: that won't fix itself, and repeated
 failed logins can lock the account or bring a captcha. `FETCH_RETRY_MINUTES=0` turns retries off.
+An error that never goes away (e.g. a mistyped `SUBSTITUTIONS_URL`) delays the digest by the whole retry time
+until it is fixed.
 
 ## Local models (Ollama)
 

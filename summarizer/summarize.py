@@ -1270,7 +1270,7 @@ def parse_args(argv):
 
 # Failed school sections are fetched again (a site that is down for a moment must not cost a section):
 # after FIRST_RETRY_WAIT seconds, then twice as long each time up to MAX_FETCH_RETRY_WAIT, for at most
-# FETCH_RETRY_MINUTES. The clock and sleep are module attributes so that tests can fake them.
+# FETCH_RETRY_MINUTES (checked between rounds: the last round may start right at the limit). The clock and sleep are module attributes so that tests can fake them.
 FIRST_RETRY_WAIT = 30
 MAX_FETCH_RETRY_WAIT = 120
 _clock = time.monotonic
@@ -1345,18 +1345,23 @@ def fetch_school_sections(args, now, tz):
             for account, child in zip(todo, librus_upcoming.check_upcoming(
                     todo, librus_state, today, args.librus_upcoming_days, failed)):
                 _keep_better(upcoming, account.login, child)
-            for a in accounts:  # a final grades error is the agenda's too
-                if a.login not in upcoming and grades[a.login].error:
+            for a in accounts:  # a final grades error is the agenda's too (also over an earlier passing one)
+                if grades[a.login].error and grades[a.login].final:
                     upcoming[a.login] = librus_upcoming.ChildUpcoming(
                         grades[a.login].name, [], grades[a.login].error, final=True)
-        pending = [k for k in ("substitutions", "edusky") if k in one and _retryable(one[k])]
-        pending += [f"librus {names[a.login]}" for a in accounts
-                    if _retryable(grades[a.login]) or (upcoming_on and _retryable(upcoming[a.login]))]
+        # with the reason, so a site that recovers on a retry still leaves a trace in the log
+        pending = [f"{k} ({one[k].error or '; '.join(one[k].skipped)})" for k in ("substitutions", "edusky")
+                   if k in one and _retryable(one[k])]
+        for a in accounts:
+            parts = [r for r in (grades[a.login], upcoming.get(a.login)) if r is not None and _retryable(r)]
+            if parts:
+                reasons = [r.error or "; ".join(r.skipped) for r in parts]
+                pending.append(f"librus {names[a.login]} ({'; '.join(dict.fromkeys(reasons))})")
         left = deadline - _clock()
         if not pending or left <= 0:
             break
         wait = min(wait, left)
-        print(f"warning: retrying in {wait:g}s: {', '.join(pending)}", file=sys.stderr, flush=True)
+        print(f"warning: retrying in {wait:.0f}s: {', '.join(pending)}", file=sys.stderr, flush=True)
         _sleep(wait)
         wait = min(wait * 2, MAX_FETCH_RETRY_WAIT)
 
