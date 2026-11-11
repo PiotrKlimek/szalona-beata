@@ -1441,6 +1441,13 @@ class ParseArgsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"FETCH_RETRY_MINUTES": ""}):
             self.assertEqual(summarize.parse_args([]).fetch_retry_minutes, 10)
 
+    def test_llm_is_retried_for_ten_minutes_by_default(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"LLM_RETRY_MINUTES": ""}):
+            self.assertEqual(summarize.parse_args([]).llm_retry_minutes, 10)
+
 
 class ReasoningEffortConfigTest(unittest.TestCase):
     def parse(self, value):
@@ -1548,7 +1555,7 @@ class MainTest(unittest.TestCase):
 
         # no retries of failed school sections unless a test asks for them; time is faked either way
         env = mock.patch.dict(os.environ, {"BRIDGE_URL": self.bridge.url, "SUMMARY_LANGUAGE": "English",
-                                           "FETCH_RETRY_MINUTES": "0"})
+                                           "FETCH_RETRY_MINUTES": "0", "LLM_RETRY_MINUTES": "0"})
         env.start()
         self.addCleanup(env.stop)
         self.slept, clock = [], [0.0]
@@ -1799,6 +1806,89 @@ class MainTest(unittest.TestCase):
         system, user = (m["content"] for m in srv.requests[0][2]["messages"])
         self.assertIn("'Anna Nowak'", system)
         self.assertIn("Anna Nowak : [document]", user)
+
+    def llm_env(self, srv_url, minutes="10", **extra):
+        return {"LLM_API_KEY": "k", "LLM_BASE_URL": srv_url, "LLM_RETRY_MINUTES": minutes, **extra}
+
+    def test_llm_that_does_not_answer_is_asked_again(self):
+        import os
+        from unittest import mock
+
+        ok = (200, {"choices": [{"message": {"content": '{"threads": [{"title": "Wyjazd", "points": ["Tak"]}]}'}}]})
+        down = (503, {"error": {"message": "Service Unavailable"}})
+        srv = FakeServer({("POST", "/chat/completions"): [down, down, ok]})
+        self.addCleanup(srv.close)
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, self.llm_env(srv.url, LLM_LOG_DB="")), redirect_stderr(err):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+
+        self.assertEqual(code, 0)
+        self.assertIn("▸ Wyjazd", out)
+        self.assertNotIn("model unavailable", out)
+        self.assertEqual(len(srv.requests), 3)
+        self.assertEqual(self.slept, [30, 60])
+        self.assertIn("warning: Rowery: POST", err.getvalue())
+        self.assertIn("retrying in 30s", err.getvalue())
+        errors = [e for e, in sqlite3.connect(self.log_path).execute("SELECT error FROM llm_calls ORDER BY id")]
+        self.assertEqual(len(errors), 3)  # every try is in the call log
+        self.assertIsNone(errors[2])
+
+    def test_llm_retry_time_is_shared_by_all_groups(self):
+        import os
+        from unittest import mock
+
+        db = sqlite3.connect(self.db_path)
+        add_msg(db, SCHOOL, "s", T0 + 60, "Ola", "Zebranie")
+        db.commit()
+        db.close()
+        srv = FakeServer({("POST", "/chat/completions"): (500, {"error": {"message": "Internal Server Error"}})})
+        self.addCleanup(srv.close)
+        with mock.patch.dict(os.environ, self.llm_env(srv.url, "1")), redirect_stderr(io.StringIO()):
+            code, out = self.run_main("--group", "rowery", "--group", "3b", "--hours", "2", "--model", "openai",
+                                      "--allow-real-data")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slept, [30, 30])  # the first group used up the minute
+        self.assertEqual(len(srv.requests), 4)  # 3 for the first group, 1 for the second
+        self.assertEqual(out.count("model unavailable"), 2)
+
+    def test_unreachable_llm_is_retried(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, self.llm_env("http://127.0.0.1:9", "1")), redirect_stderr(io.StringIO()):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slept, [30, 30])
+        self.assertIn("model unavailable", out)
+
+    def test_llm_errors_that_do_not_pass_are_not_retried(self):
+        import os
+        from unittest import mock
+
+        for resp in [(401, {"error": {"message": "Invalid API Key"}}),
+                     (413, {"error": {"message": "Request too large"}}),
+                     (429, {"error": {"message": "daily limit"}}, {"Retry-After": "3600"})]:
+            srv = FakeServer({("POST", "/chat/completions"): resp})
+            self.addCleanup(srv.close)
+            with mock.patch.dict(os.environ, self.llm_env(srv.url)), redirect_stderr(io.StringIO()):
+                code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "openai",
+                                          "--allow-real-data")
+            self.assertEqual(code, 0)
+            self.assertEqual(len(srv.requests), 1, resp[0])
+            self.assertEqual(self.slept, [], resp[0])
+            self.assertIn("model unavailable", out)
+
+    def test_bad_llm_retry_minutes_is_an_error(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"LLM_RETRY_MINUTES": "-1"}), redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            self.run_main("--group", "rowery")
+        self.assertIn("LLM_RETRY_MINUTES", err.getvalue())
 
     def test_failed_llm_call_is_logged_with_error(self):
         import os

@@ -18,6 +18,7 @@ x-summarizer-env: &summarizer-env
   LLM_BASE_URL: ${LLM_BASE_URL:-}
   LLM_MODEL: ${LLM_MODEL:-}
   LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
+  LLM_RETRY_MINUTES: ${LLM_RETRY_MINUTES:-}  # how long to keep asking an LLM API that fails; 0 = off
   LLM_LOG_DB: ${LLM_LOG_DB:-}
   IMPORTANT_SENDERS: ${IMPORTANT_SENDERS:-}  # names whose every message (even a bare attachment) is kept
   RETENTION_DAYS: ${RETENTION_DAYS:-}
