@@ -1880,6 +1880,44 @@ class MainTest(unittest.TestCase):
             self.assertEqual(self.slept, [], resp[0])
             self.assertIn("model unavailable", out)
 
+    def test_local_ollama_is_not_retried(self):
+        import os
+        from unittest import mock
+
+        srv = FakeServer({("GET", "/api/tags"): (200, {"models": [{"name": "qwen2.5:3b"}]}),
+                          ("POST", "/api/chat"): (500, {"error": "model requires more system memory"})})
+        self.addCleanup(srv.close)
+        with mock.patch.dict(os.environ, {"OLLAMA_URL": srv.url, "LLM_RETRY_MINUTES": "10"}), \
+                redirect_stderr(io.StringIO()):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--model", "ollama")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slept, [])
+        self.assertIn("model unavailable", out)
+
+    def test_llm_timeout_is_configurable(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"LLM_TIMEOUT": ""}):
+            self.assertEqual(summarize.parse_args([]).llm_timeout, 180)
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"LLM_TIMEOUT": "5"}), redirect_stderr(err), self.assertRaises(SystemExit):
+            summarize.parse_args([])
+        self.assertIn("LLM_TIMEOUT", err.getvalue())
+        seen = []
+        real = summarize._request
+
+        def spy(*a, **k):
+            seen.append(k.get("timeout"))
+            return real(*a, **k)
+
+        srv = FakeServer({("POST", "/chat/completions"): (200, {"choices": [{"message": {"content": "Ok."}}]})})
+        self.addCleanup(srv.close)
+        with mock.patch.dict(os.environ, self.llm_env(srv.url, LLM_TIMEOUT="900")), \
+                mock.patch.object(summarize, "_request", spy):
+            self.run_main("--group", "rowery", "--hours", "2", "--model", "openai", "--allow-real-data")
+        self.assertIn(900, seen)
+
     def test_bad_llm_retry_minutes_is_an_error(self):
         import os
         from unittest import mock
@@ -2724,6 +2762,19 @@ class ReplayTest(unittest.TestCase):
         self.assertIn("- Koszt 5 zł", out)
         self.assertIn("#2 2025-10-23 10:01 Rowery", out)
         self.assertIn("Replayed 2 calls: 1800 tokens before, 120 after.", out)
+
+    def test_failed_tries_of_one_call_are_replayed_once(self):
+        log = summarize.CallLog(self.log_path)
+        failed = {"provider": "openai", "model": "m", "language": "Polish", "system_prompt": "p",
+                  "transcript": "[11:00] Bartek: Jedziemy?", "response": None, "error": "503"}
+        log.record(failed, BIKES, "Rowery", T0 + 60, synthetic=True)  # #3: a failed try of #2's transcript
+        log.db.close()
+
+        code, out, _ = self.run_main("--model", "openai", "--allow-real-data", "--replay", "2-3")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.llm.requests), 1)
+        self.assertIn("#3: same transcript as #2, skipped", out)
 
     def test_sends_stored_transcript_with_current_prompt_in_stored_language(self):
         self.run_main("--model", "openai", "--allow-real-data", "--replay", "1")

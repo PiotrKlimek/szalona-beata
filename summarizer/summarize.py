@@ -913,8 +913,9 @@ def _raise_http_error(method, url, e, retry_after=None):
 
 
 def is_transient(e):
-    """True for an error that may pass by itself: network, timeout, a broken answer, 408, 5xx, a short 429.
-    Not for a wrong key (401), a too large request (413), an exhausted daily quota (429 with a long wait)..."""
+    """True for an error that may pass by itself: network (also DNS), timeout, a cut-off answer, 408, 5xx,
+    a short 429. Not for a wrong key (401), a too large request (413), an exhausted daily quota (429 with a
+    long wait), nor for a complete answer that makes no sense (ValueError, KeyError)."""
     if isinstance(e, HTTPStatusError):
         if e.code == 429:
             return e.retry_after is not None and e.retry_after <= MAX_RETRY_WAIT
@@ -923,6 +924,9 @@ def is_transient(e):
 
 
 class Ollama:
+    # a local model that fails is slow or out of memory, not briefly away: asking again only delays the digest
+    retry = False
+
     def __init__(self, base_url, model, important_senders=()):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -970,7 +974,10 @@ OPENAI_TIMEOUT = 180
 class OpenAICompat:
     """Any OpenAI-compatible chat completions API (Groq, Mistral, OpenRouter, Ollama's /v1...)."""
 
-    def __init__(self, base_url, api_key, model, reasoning_effort=None, important_senders=()):
+    retry = True  # a remote API that doesn't answer is asked again (LLM_RETRY_MINUTES)
+
+    def __init__(self, base_url, api_key, model, reasoning_effort=None, important_senders=(), timeout=OPENAI_TIMEOUT):
+        self.timeout = timeout
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -1005,8 +1012,8 @@ class OpenAICompat:
                 "POST",
                 f"{self.base_url}/chat/completions",
                 payload,
-                # a hung API must not eat the retry time (LLM_RETRY_MINUTES): replies take seconds
-                timeout=OPENAI_TIMEOUT,
+                # LLM_TIMEOUT: a hung API must not eat the retry time; Groq answers in seconds
+                timeout=self.timeout,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 retries=3,
             )
@@ -1113,10 +1120,15 @@ def replay(log_path, ids, llm, tz, allow_real_data, out=None):
         print("error: refusing to send real chats to an external API; pass --allow-real-data", file=sys.stderr)
         return 2
     before = done = 0
+    sent = {}  # transcript -> id: the failed tries of a retried call share it, one replay is enough
     for i in ids:
         if i not in rows:
             continue
         _, ts, group, language, transcript, response, tokens, _, error = rows[i]
+        if transcript in sent:
+            print(f"=== #{i}: same transcript as #{sent[transcript]}, skipped", file=out)
+            continue
+        sent[transcript] = i
         when = datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
         print(f"=== #{i} {when} {group}", file=out)
         if response is None:
@@ -1258,6 +1270,10 @@ def parse_args(argv):
     if not (retry.isascii() and retry.isdigit() and int(retry) <= 120):
         p.error(f"LLM_RETRY_MINUTES must be a whole number of minutes between 0 and 120, got {retry!r}")
     args.llm_retry_minutes = int(retry)
+    timeout = env("LLM_TIMEOUT", str(OPENAI_TIMEOUT)).strip()
+    if not (timeout.isascii() and timeout.isdigit() and 10 <= int(timeout) <= 3600):
+        p.error(f"LLM_TIMEOUT must be a whole number of seconds between 10 and 3600, got {timeout!r}")
+    args.llm_timeout = int(timeout)
     try:  # env only: passwords don't belong on the command line
         args.librus_accounts = librus_grades.parse_accounts(env("LIBRUS_ACCOUNTS", ""))
     except ValueError as e:
@@ -1476,7 +1492,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
                     docs = tagged_sent(msgs, omitted, DOC_TAG, keep)
                     break
                 text = str(error) or type(error).__name__
-                wait = llm_retry.next_wait() if is_transient(error) else None
+                wait = llm_retry.next_wait() if getattr(llm, "retry", False) and is_transient(error) else None
                 if wait is None:
                     print(f"warning: {name}: {text}", file=sys.stderr, flush=True)
                     omitted = 0  # the fallback statistics cover every message
@@ -1542,7 +1558,7 @@ def main(argv=None, now=None):
             print(f"error: no LLM call log at {args.llm_log} (LLM_LOG_DB)", file=sys.stderr)
             return 2
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort,
-                           args.important_senders)
+                           args.important_senders, args.llm_timeout)
         return replay(args.llm_log, args.replay, llm, tz, args.allow_real_data)
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
 
@@ -1592,7 +1608,7 @@ def main(argv=None, now=None):
         llm.ensure_model()
     elif args.model == "openai":
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort,
-                           args.important_senders)
+                           args.important_senders, args.llm_timeout)
     call_log = CallLog(args.llm_log, args.retention_days, now) if llm and args.llm_log else None
 
     def purge_unused_log(at):
