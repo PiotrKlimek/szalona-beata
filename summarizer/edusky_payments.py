@@ -35,6 +35,7 @@ class Payments(NamedTuple):
     name: str         # shown in the digest's section title
     items: list       # [Due], one per agreement
     error: object = None
+    final: bool = False  # the error won't go away by trying again (refused credentials)
 
 
 def _call(url, timeout, token=None, form=None):
@@ -98,7 +99,8 @@ def fetch_payments(base_url, login, password, name="", timeout=30):
                 items.append(due if due.child else due._replace(child=child.get("name") or ""))
         return Payments(name, items)
     except urllib.error.HTTPError as e:
-        return Payments(name, [], f"HTTP {e.code} {e.reason}")
+        # 400 invalid_grant / 401: a wrong login or password, not a passing outage
+        return Payments(name, [], f"HTTP {e.code} {e.reason}", final=e.code in (400, 401))
     except urllib.error.URLError as e:
         return Payments(name, [], str(e.reason))
     except Exception as e:  # anything else (e.g. IncompleteRead, an unexpected answer) must not cost the digest

@@ -1434,6 +1434,13 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual((args.smtp.host, args.smtp.port, args.smtp.security), ("smtp.resend.com", 465, "ssl"))
         self.assertEqual(args.model, "dummy")
 
+    def test_failed_school_sections_are_retried_for_ten_minutes_by_default(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"FETCH_RETRY_MINUTES": ""}):
+            self.assertEqual(summarize.parse_args([]).fetch_retry_minutes, 10)
+
 
 class ReasoningEffortConfigTest(unittest.TestCase):
     def parse(self, value):
@@ -1539,9 +1546,21 @@ class MainTest(unittest.TestCase):
         self.addCleanup(self.bridge.close)
         from unittest import mock
 
-        env = mock.patch.dict(os.environ, {"BRIDGE_URL": self.bridge.url, "SUMMARY_LANGUAGE": "English"})
+        # no retries of failed school sections unless a test asks for them; time is faked either way
+        env = mock.patch.dict(os.environ, {"BRIDGE_URL": self.bridge.url, "SUMMARY_LANGUAGE": "English",
+                                           "FETCH_RETRY_MINUTES": "0"})
         env.start()
         self.addCleanup(env.stop)
+        self.slept, clock = [], [0.0]
+
+        def sleep(seconds):
+            self.slept.append(seconds)
+            clock[0] += seconds
+
+        for name, fake in (("_sleep", sleep), ("_clock", lambda: clock[0])):
+            patcher = mock.patch.object(summarize, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_main(self, *args):
         out = io.StringIO()
@@ -2277,6 +2296,126 @@ class MainTest(unittest.TestCase):
         self.assertEqual(len(posted), 1)
         self.assertNotIn("Płatności", posted[0])
         self.assertIn("Płatności – Angielski", out)
+
+    def flaky_substitutions(self, failures, calls):
+        def fetch(url, cls, day):
+            calls.append(day)
+            if len(calls) <= failures:
+                return summarize.Substitutions(cls, day, [], "timed out", url)
+            return summarize.Substitutions(cls, day, [("1", "wf")], None, url)
+        return fetch
+
+    def test_failed_sections_are_fetched_again_until_they_answer(self):
+        import os
+        from unittest import mock
+
+        subs_calls, pay_calls = [], []
+
+        def pay(url, login, password, name=""):
+            pay_calls.append(1)
+            if len(pay_calls) == 1:
+                return edusky_payments.Payments(name, [], "HTTP 502 Bad Gateway")
+            return edusky_payments.Payments(name, [edusky_payments.Due("Ania", date(2026, 11, 10), 255.0, 0, 85)])
+
+        env = self.edusky_env(SUBSTITUTIONS_URL="https://x.edupage.org", SUBSTITUTIONS_CLASS="1C",
+                              FETCH_RETRY_MINUTES="10")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), redirect_stderr(err), \
+                mock.patch.object(summarize, "fetch_substitutions", self.flaky_substitutions(2, subs_calls)), \
+                mock.patch.object(edusky_payments, "fetch_payments", pay):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")
+
+        self.assertEqual(code, 0)
+        self.assertEqual((len(subs_calls), len(pay_calls)), (3, 2))  # only what failed is fetched again
+        self.assertEqual(self.slept, [30, 60])
+        self.assertIn("- lekcja 1: wf", out)
+        self.assertIn("Do zapłaty: 255,00 zł", out)
+        self.assertNotIn("Nie udało się", out)
+        self.assertIn("retrying in 30s: substitutions, edusky", err.getvalue())
+        self.assertNotIn("warning: substitutions", err.getvalue())
+
+    def test_failed_librus_child_is_checked_again_on_its_own(self):
+        import os
+        from unittest import mock
+
+        env, smtp = self.librus_env(FETCH_RETRY_MINUTES="10")
+        logins = []
+
+        def opener(login, password, session):
+            logins.append(login)
+            down = login == "1111111u" and logins.count(login) < 3
+            return FakeLibrus(login, password, session, self.accounts[login],
+                              fail=ConnectionError("Librus is down") if down else None)
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(librus_grades, "open_account", opener), \
+                redirect_stderr(err):
+            code, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+
+        self.assertEqual(code, 0)
+        # Ania: grades fail twice (her agenda is not tried then), then grades and agenda; Jaś: once each
+        self.assertEqual((logins.count("1111111u"), logins.count("2222222u")), (4, 2))
+        self.assertEqual(self.slept, [30, 60])
+        self.assertIn("*Nowe oceny – Ania*\nPierwsze sprawdzenie", out)
+        self.assertIn("*Sprawdziany i zadania na 7 dni – Ania*\nNic w najbliższych 7 dniach.", out)
+        self.assertNotIn("Nie udało się", out)
+        self.assertIn("retrying in 30s: librus Ania", err.getvalue())
+        self.assertEqual(len(smtp.envelopes), 1)
+        self.assertEqual(librus_grades.load_state(self.state_path)["1111111u"]["seen"], ["1"])
+
+    def test_gives_up_when_the_retry_time_is_over(self):
+        import os
+        from unittest import mock
+
+        calls = []
+        env = {"SUMMARY_LANGUAGE": "Polish", "SUBSTITUTIONS_URL": "https://x.edupage.org",
+               "SUBSTITUTIONS_CLASS": "1C", "FETCH_RETRY_MINUTES": "2"}
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), redirect_stderr(err), \
+                mock.patch.object(summarize, "fetch_substitutions", self.flaky_substitutions(99, calls)):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slept, [30, 60, 30])  # the last wait ends at the 2 minutes
+        self.assertEqual(len(calls), 4)
+        self.assertIn("Nie udało się pobrać zastępstw (timed out).", out)
+        self.assertEqual(err.getvalue().count("warning: substitutions: timed out"), 1)
+
+    def test_rejected_logins_are_not_retried(self):
+        import os
+        from unittest import mock
+
+        class LibrusInvalidCredentialsError(Exception):
+            pass
+
+        env, _ = self.librus_env(FETCH_RETRY_MINUTES="10", **self.edusky_env())
+        logins = []
+
+        def opener(login, password, session):
+            logins.append(login)
+            fail = LibrusInvalidCredentialsError("Login rejected") if login == "1111111u" else None
+            return FakeLibrus(login, password, session, self.accounts[login], fail=fail)
+
+        refused = edusky_payments.Payments("Angielski", [], "HTTP 401 Unauthorized", final=True)
+        with mock.patch.dict(os.environ, env), mock.patch.object(librus_grades, "open_account", opener), \
+                mock.patch.object(edusky_payments, "fetch_payments", lambda *a, **k: refused), \
+                redirect_stderr(io.StringIO()):
+            code, out = self.run_main("--group", "rowery", "--hours", "2")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slept, [])
+        self.assertEqual(logins.count("1111111u"), 1)
+        self.assertIn("Nie udało się pobrać ocen (Login rejected).", out)
+
+    def test_bad_fetch_retry_minutes_is_an_error(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"FETCH_RETRY_MINUTES": "pięć"}), redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            self.run_main("--group", "rowery")
+        self.assertIn("FETCH_RETRY_MINUTES", err.getvalue())
 
     def test_entrypoint_imports_with_isolated_mode(self):
         # the Dockerfile runs `python -I /app/summarize.py`: -I leaves the script's folder off sys.path

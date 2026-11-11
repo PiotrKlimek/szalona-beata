@@ -43,6 +43,15 @@ class ChildGrades(NamedTuple):
     seeded: int = 0     # > 0 on the first check: how many existing grades were only remembered
     first: bool = True  # False: `seeded` are only new kinds of grades of a child checked before
     skipped: tuple = ()  # "kind: error" for kinds that could not be fetched this time (retried next time)
+    final: bool = False  # the error won't go away by trying again (a refused login)
+
+
+# The library's errors for a refused login: trying again only brings a lock-out closer.
+PERMANENT_ERRORS = ("LibrusInvalidCredentialsError", "LibrusCaptchaRequiredError")
+
+
+def is_permanent(e):
+    return type(e).__name__ in PERMANENT_ERRORS
 
 
 def parse_accounts(value):
@@ -266,7 +275,7 @@ async def _check(account, entry):
             finally:
                 entry["session"] = librus.session_dict()
     except Exception as e:  # one child's failure must not cost the digest or the other children
-        return ChildGrades(name or account.login, [], str(e) or type(e).__name__), None
+        return ChildGrades(name or account.login, [], str(e) or type(e).__name__, final=is_permanent(e)), None
 
 
 def _id_order(key):

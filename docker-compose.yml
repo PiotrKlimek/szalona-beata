@@ -30,6 +30,7 @@ x-summarizer-env: &summarizer-env
   EDUSKY_LOGIN: ${EDUSKY_LOGIN:-}
   EDUSKY_PASSWORD: ${EDUSKY_PASSWORD:-}
   EDUSKY_NAME: ${EDUSKY_NAME:-}
+  FETCH_RETRY_MINUTES: ${FETCH_RETRY_MINUTES:-}  # how long to keep retrying a school site that fails; 0 = off
 
 services:
   bridge:

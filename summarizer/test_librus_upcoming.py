@@ -100,6 +100,17 @@ class CheckUpcomingTest(unittest.TestCase):
         self.assertEqual(child.error, "agenda: a; homework: TimeoutError")
         self.assertEqual(child.items, [])
 
+    def test_rejected_login_is_final(self):
+        class LibrusCaptchaRequiredError(Exception):
+            pass
+
+        # the library logs in on the first call: a refused login comes from the agenda
+        self.extra["1u"] = {"agenda": LibrusCaptchaRequiredError("captcha"), "homework": []}
+        [child] = self.check([lg.Account("Ania", "1u", "p")])
+        self.assertEqual(child.error, "captcha")
+        self.assertTrue(child.final)
+        self.assertNotIn("homework", FakeLibrus.instances[0].calls)  # no second refused login
+
     def test_a_module_the_school_refuses_is_just_empty(self):
         self.extra["1u"] = {"agenda": [event(1, "2026-11-11")], "agenda_categories": CATEGORIES,
                             "homework": Refused(403)}

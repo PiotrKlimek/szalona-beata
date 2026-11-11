@@ -25,6 +25,7 @@ class ChildUpcoming(NamedTuple):
     items: list           # [Item] by day
     error: object = None  # str if nothing could be fetched
     skipped: tuple = ()   # "part: error" for the part (agenda / homework) that could not be fetched
+    final: bool = False   # the error won't go away by trying again (a refused login)
 
 
 GROUPS = ("test", "quiz", "homework", "other")  # order in the digest
@@ -67,6 +68,8 @@ async def _fetch(load, part, skipped):
     try:
         return await load()
     except Exception as e:
+        if librus_grades.is_permanent(e):  # the login was refused: not again for the other part
+            raise
         if getattr(e, "status_code", None) not in REFUSED:
             skipped.append(f"{part}: {_error(e)}")
         return []
@@ -120,7 +123,7 @@ async def _check(account, entry, first, last):
             finally:
                 entry["session"] = librus.session_dict()
     except Exception as e:  # one child's failure must not cost the digest or the other children
-        return ChildUpcoming(name or account.login, [], _error(e))
+        return ChildUpcoming(name or account.login, [], _error(e), final=librus_grades.is_permanent(e))
 
 
 def check_upcoming(accounts, state, today, days, failed=None):
