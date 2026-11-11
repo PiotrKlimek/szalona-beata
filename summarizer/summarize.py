@@ -8,6 +8,7 @@ and prints the digest or sends it to a group through the bridge.
 
 import argparse
 import html as htmllib
+import http.client
 import json
 import os
 import re
@@ -879,29 +880,53 @@ def _request(method, url, payload=None, timeout=600, headers=None, retries=0):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.load(resp)
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < retries:
+            wait = None
+            if e.code == 429:
                 try:
                     wait = float(e.headers.get("Retry-After", 10))
                 except ValueError:
                     wait = 10
-                if wait <= MAX_RETRY_WAIT:
+                if attempt < retries and wait <= MAX_RETRY_WAIT:
                     print(f"Rate limited, retrying in {wait:g}s...", file=sys.stderr, flush=True)
                     time.sleep(wait)
                     continue
-            _raise_http_error(method, url, e)
+            _raise_http_error(method, url, e, wait)
 
 
-def _raise_http_error(method, url, e):
+class HTTPStatusError(RuntimeError):
+    """An HTTP error answer; `retry_after` = the server's Retry-After of a 429, in seconds."""
+
+    def __init__(self, message, code, retry_after=None):
+        super().__init__(message)
+        self.code = code
+        self.retry_after = retry_after
+
+
+def _raise_http_error(method, url, e, retry_after=None):
     try:
         detail = json.load(e).get("error", e.reason)
     except ValueError:
         detail = e.reason
     if isinstance(detail, dict):  # OpenAI-style {"error": {"message": ...}}
         detail = detail.get("message", detail)
-    raise RuntimeError(f"{method} {url} failed ({e.code}): {detail}") from None
+    raise HTTPStatusError(f"{method} {url} failed ({e.code}): {detail}", e.code, retry_after) from None
+
+
+def is_transient(e):
+    """True for an error that may pass by itself: network (also DNS), timeout, a cut-off answer, 408, 5xx,
+    a short 429. Not for a wrong key (401), a too large request (413), an exhausted daily quota (429 with a
+    long wait), nor for a complete answer that makes no sense (ValueError, KeyError)."""
+    if isinstance(e, HTTPStatusError):
+        if e.code == 429:
+            return e.retry_after is not None and e.retry_after <= MAX_RETRY_WAIT
+        return e.code == 408 or e.code >= 500
+    return isinstance(e, (OSError, http.client.HTTPException))
 
 
 class Ollama:
+    # a local model that fails is slow or out of memory, not briefly away: asking again only delays the digest
+    retry = False
+
     def __init__(self, base_url, model, important_senders=()):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -943,10 +968,16 @@ def parse_threads(content):
     return threads or NOTHING_NOTABLE
 
 
+OPENAI_TIMEOUT = 180
+
+
 class OpenAICompat:
     """Any OpenAI-compatible chat completions API (Groq, Mistral, OpenRouter, Ollama's /v1...)."""
 
-    def __init__(self, base_url, api_key, model, reasoning_effort=None, important_senders=()):
+    retry = True  # a remote API that doesn't answer is asked again (LLM_RETRY_MINUTES)
+
+    def __init__(self, base_url, api_key, model, reasoning_effort=None, important_senders=(), timeout=OPENAI_TIMEOUT):
+        self.timeout = timeout
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -981,11 +1012,13 @@ class OpenAICompat:
                 "POST",
                 f"{self.base_url}/chat/completions",
                 payload,
+                # LLM_TIMEOUT: a hung API must not eat the retry time; Groq answers in seconds
+                timeout=self.timeout,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 retries=3,
             )
-        except (RuntimeError, OSError) as e:
-            ex["error"] = str(e)
+        except Exception as e:
+            ex["error"] = str(e) or type(e).__name__
             raise
         finally:
             ex["duration_ms"] = int((time.monotonic() - started) * 1000)
@@ -1087,10 +1120,15 @@ def replay(log_path, ids, llm, tz, allow_real_data, out=None):
         print("error: refusing to send real chats to an external API; pass --allow-real-data", file=sys.stderr)
         return 2
     before = done = 0
+    sent = {}  # transcript -> id: the failed tries of a retried call share it, one replay is enough
     for i in ids:
         if i not in rows:
             continue
         _, ts, group, language, transcript, response, tokens, _, error = rows[i]
+        if transcript in sent:
+            print(f"=== #{i}: same transcript as #{sent[transcript]}, skipped", file=out)
+            continue
+        sent[transcript] = i
         when = datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
         print(f"=== #{i} {when} {group}", file=out)
         if response is None:
@@ -1228,6 +1266,14 @@ def parse_args(argv):
     if not (retry.isascii() and retry.isdigit() and int(retry) <= 120):
         p.error(f"FETCH_RETRY_MINUTES must be a whole number of minutes between 0 and 120, got {retry!r}")
     args.fetch_retry_minutes = int(retry)
+    retry = env("LLM_RETRY_MINUTES", "10").strip()
+    if not (retry.isascii() and retry.isdigit() and int(retry) <= 120):
+        p.error(f"LLM_RETRY_MINUTES must be a whole number of minutes between 0 and 120, got {retry!r}")
+    args.llm_retry_minutes = int(retry)
+    timeout = env("LLM_TIMEOUT", str(OPENAI_TIMEOUT)).strip()
+    if not (timeout.isascii() and timeout.isdigit() and 10 <= int(timeout) <= 3600):
+        p.error(f"LLM_TIMEOUT must be a whole number of seconds between 10 and 3600, got {timeout!r}")
+    args.llm_timeout = int(timeout)
     try:  # env only: passwords don't belong on the command line
         args.librus_accounts = librus_grades.parse_accounts(env("LIBRUS_ACCOUNTS", ""))
     except ValueError as e:
@@ -1385,6 +1431,28 @@ def fetch_school_sections(args, now, tz):
     return substitutions, grades, librus_state, seen, upcoming, payments
 
 
+class RetryWindow:
+    """Waits between tries of one kind of call, shared by the whole run: FIRST_RETRY_WAIT, then twice as
+    long up to MAX_FETCH_RETRY_WAIT, until `minutes` after the first failure."""
+
+    def __init__(self, minutes):
+        self.seconds = minutes * 60
+        self.deadline = None
+        self.wait = FIRST_RETRY_WAIT
+
+    def next_wait(self):
+        """Seconds to wait before trying again, or None when the time is over."""
+        now = _clock()
+        if self.deadline is None:
+            self.deadline = now + self.seconds
+        left = self.deadline - now
+        if left <= 0:
+            return None
+        wait = min(self.wait, left)
+        self.wait = min(self.wait * 2, MAX_FETCH_RETRY_WAIT)
+        return wait
+
+
 def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=False):
     """Build one digest and deliver it (print, and optionally group and/or email)."""
     since = int(now - args.hours * 3600)
@@ -1395,6 +1463,7 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
             warning = labels(lang)["bridge"][status]
             print(f"warning: bridge {status}", file=sys.stderr, flush=True)
     usage_before = dict(getattr(llm, "usage", None) or {})
+    llm_retry = RetryWindow(args.llm_retry_minutes)  # one for all groups: a dead API delays the digest once
     sections = []
     for jid, name in groups:
         msgs = fetch_messages(db, jid, since)
@@ -1404,21 +1473,34 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         elif llm:
             keep = args.important_senders
             transcript, omitted = build_transcript(msgs, args.max_chars, tz, keep)
-            try:
-                summary = llm.summarize(transcript, args.language)
-                ocr = tagged_sent(msgs, omitted, OCR_TAG, keep)
-                voice = tagged_sent(msgs, omitted, VOICE_TAG, keep)
-                docs = tagged_sent(msgs, omitted, DOC_TAG, keep)
-            except (RuntimeError, OSError) as e:  # API error, timeout, network
-                print(f"warning: {name}: {e}", file=sys.stderr, flush=True)
-                omitted = 0  # the fallback statistics cover every message
-                unavailable = labels(lang)["model_unavailable"].format(error=e)
-                summary = f"{dummy_summary(msgs, tz, lang)}\n({unavailable})"
-            if call_log and getattr(llm, "last_exchange", None):
+            while True:
+                if hasattr(llm, "last_exchange"):
+                    llm.last_exchange = None
                 try:
-                    call_log.record(llm.last_exchange, jid, name, now, synthetic)
-                except (sqlite3.Error, OSError) as e:  # logging must never block the digest
-                    print(f"warning: could not log the LLM call: {e}", file=sys.stderr, flush=True)
+                    summary = llm.summarize(transcript, args.language)
+                    error = None
+                except Exception as e:  # API error, timeout, network, a broken answer: never the whole digest
+                    error = e
+                if call_log and getattr(llm, "last_exchange", None):  # every try, the failed ones too
+                    try:
+                        call_log.record(llm.last_exchange, jid, name, now, synthetic)
+                    except (sqlite3.Error, OSError) as e:  # logging must never block the digest
+                        print(f"warning: could not log the LLM call: {e}", file=sys.stderr, flush=True)
+                if error is None:
+                    ocr = tagged_sent(msgs, omitted, OCR_TAG, keep)
+                    voice = tagged_sent(msgs, omitted, VOICE_TAG, keep)
+                    docs = tagged_sent(msgs, omitted, DOC_TAG, keep)
+                    break
+                text = str(error) or type(error).__name__
+                wait = llm_retry.next_wait() if getattr(llm, "retry", False) and is_transient(error) else None
+                if wait is None:
+                    print(f"warning: {name}: {text}", file=sys.stderr, flush=True)
+                    omitted = 0  # the fallback statistics cover every message
+                    unavailable = labels(lang)["model_unavailable"].format(error=text)
+                    summary = f"{dummy_summary(msgs, tz, lang)}\n({unavailable})"
+                    break
+                print(f"warning: {name}: {text}; retrying in {wait:.0f}s", file=sys.stderr, flush=True)
+                _sleep(wait)
         else:
             summary = dummy_summary(msgs, tz, lang)
         sections.append(Section(name, summary, len(msgs), omitted, ocr, voice, docs))
@@ -1476,7 +1558,7 @@ def main(argv=None, now=None):
             print(f"error: no LLM call log at {args.llm_log} (LLM_LOG_DB)", file=sys.stderr)
             return 2
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort,
-                           args.important_senders)
+                           args.important_senders, args.llm_timeout)
         return replay(args.llm_log, args.replay, llm, tz, args.allow_real_data)
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
 
@@ -1526,7 +1608,7 @@ def main(argv=None, now=None):
         llm.ensure_model()
     elif args.model == "openai":
         llm = OpenAICompat(args.llm_base_url, args.llm_api_key, args.llm_model, args.llm_reasoning_effort,
-                           args.important_senders)
+                           args.important_senders, args.llm_timeout)
     call_log = CallLog(args.llm_log, args.retention_days, now) if llm and args.llm_log else None
 
     def purge_unused_log(at):

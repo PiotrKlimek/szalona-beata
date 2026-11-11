@@ -272,8 +272,20 @@ Measured on a free Groq account in October 2026 (`openai/gpt-oss-120b`, from the
 | Tokens per minute | 8,000 | ~1.6k–3.4k |
 
 A daily digest fits easily. On a very busy day a burst over 8k tokens/minute gets HTTP 429. The summarizer
-waits for `Retry-After` and retries (3×, at most 120 s each). If the model still fails, that group falls back
-to statistics, so the email always goes out. Your current limits are at `console.groq.com/settings/limits`.
+waits for `Retry-After` and retries (3×, at most 120 s each). Your current limits are at
+`console.groq.com/settings/limits`.
+
+When the API doesn't answer (network or DNS error, no reply within `LLM_TIMEOUT` = 3 minutes, HTTP 5xx, a short
+429), the digest waits rather than show statistics: the group is asked again after 30 seconds, then twice as long
+each time (up to 2 minutes between tries), for `LLM_RETRY_MINUTES` (default 10) counted from the first failure.
+That time is shared by all groups, so a dead API delays the digest once, not once per group; once it is over,
+each remaining group gets one try. The last try may start right before the limit, so the digest can come up to
+~20 minutes late in the worst case. Errors that won't pass by waiting (a wrong key, a request too large, a daily
+quota with a long `Retry-After`) are not retried; a mistyped `LLM_BASE_URL` host, though, looks like a network
+error and costs the whole retry time. If the model still fails, that group falls back to statistics, so the
+email always goes out. Each try, failed ones too, is a row in the call log (`--replay` sends a transcript once).
+Only `--model openai` is retried: a local Ollama that fails is slow or out of memory, not briefly away. For a slow
+local model behind `--model openai` (e.g. Ollama's `/v1`), raise `LLM_TIMEOUT`.
 
 `gpt-oss` is a reasoning model, so hidden reasoning counts as output tokens. `LLM_REASONING_EFFORT` trades
 quality for tokens:
@@ -725,6 +737,8 @@ docker volume rm szalona-beata_wa-data
 | `LLM_API_KEY` | | Groq (or other OpenAI-compatible) API key; the bridge uses it only with `TRANSCRIBE_VOICE=on` |
 | `LLM_BASE_URL`, `LLM_MODEL` | Groq, `openai/gpt-oss-120b` | OpenAI-compatible endpoint and model |
 | `LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, or `off` |
+| `LLM_TIMEOUT` | `180` | Seconds to wait for one `--model openai` reply before it counts as failed (and is retried) |
+| `LLM_RETRY_MINUTES` | `10` | When the LLM API doesn't answer, how long to keep asking again before a group falls back to statistics ([section](#54-limits-and-token-usage)); `0` turns retries off |
 | `IMPORTANT_SENDERS` | (none) | Comma-separated sender names, e.g. a teacher, whose messages are never skipped: even a photo or a file sent without a caption goes to the model. Spell each name as the sender appears in the chat transcript (case doesn't matter, no commas inside a name); a sender shown under another name or as a phone number is not matched |
 | `SUBSTITUTIONS_URL`, `SUBSTITUTIONS_CLASS` | (off) | School's Edupage site and class: adds that class's substitutions for the next school day to the digest ([section](#school-substitutions-edupage)) |
 | `LIBRUS_ACCOUNTS` | (off) | `name:login:password;...`, one Librus account per child: adds each child's new grades to the digest ([section](#school-grades-librus)) |
