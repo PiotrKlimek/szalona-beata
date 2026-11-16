@@ -36,6 +36,7 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 | Summaries with `--model openai` | the chat text of the selected groups (including text read from photos and PDFs, and voice message transcripts) is sent to the LLM provider (Groq by default) |
 | LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
 | Librus grades, tests and homework (only with `LIBRUS_ACCOUNTS`) | read from Librus with each child's login; seen grade ids and the Librus sessions in `librus_state.json` on your server (no passwords) |
+| SMS to a child (only with `SMS_TO`) | the child's new grades and upcoming tests go to SMSAPI.pl and the mobile operator |
 | eduSky payments (only with `EDUSKY_URL`) | read from eduSky with the parent's login; nothing stored |
 | The email | the email provider (Resend) and your mailbox |
 
@@ -596,6 +597,34 @@ Inne:
   of the digest is sent as usual. A module the school doesn't have (Librus refuses it) just counts as empty. An
   account whose grades couldn't be checked (e.g. a wrong password) isn't logged into a second time for this.
 
+### SMS to a child (SMSAPI.pl)
+
+A child can get a short SMS about their own news, together with the scheduled email: new grades (the same ones
+the email lists) and tests and quizzes coming up in the next `LIBRUS_UPCOMING_DAYS` days. Homework, other agenda
+entries, behaviour, errors and the parents' sections stay in the email.
+
+```
+Ania, nowe oceny: Matematyka 5 (sprawdzian). Sprawdziany: czw 12.11 Matematyka: Dzial II; pt 13.11 kartkowka Chemia.
+```
+
+1. Create an account at [SMSAPI.pl](https://www.smsapi.pl), top it up, and create an API token
+   (**API → Tokeny OAuth**, with the SMS permission).
+2. Put the token in `.env` and name the children who get an SMS, by the name the digest shows (`LIBRUS_ACCOUNTS`):
+   ```
+   SMSAPI_TOKEN=...
+   SMS_TO=Ania:500100200;Jaś:600100200
+   SMSAPI_FROM=Oceny   # optional: a sender name registered at SMSAPI; empty = SMSAPI's default
+   ```
+   Tip: put `SMS_TO` under the `digest` service in `docker-compose.override.yml` instead, like a scheduled-only
+   `EMAIL_TO`, so manual test runs never text the child.
+
+- An SMS goes out only when the digest is **emailed** and the child has something new; a preview run sends none.
+- Polish letters are replaced (`ą` → `a`): with them one SMS holds 70 characters instead of 160. A busy day is cut
+  to three SMS parts (459 characters).
+- A test stays in the agenda until its day, so it is repeated in each evening's SMS until then.
+- If SMSAPI fails, the digest log says so (`warning: SMS to Ania failed`) and the email is not affected.
+- Data: the SMS text (the child's grades and tests) goes to SMSAPI and the mobile operator.
+
 ## Payments (eduSky)
 
 If an after-school activity (e.g. a language school) runs on eduSky and gives parents a panel at
@@ -744,6 +773,8 @@ docker volume rm szalona-beata_wa-data
 | `LIBRUS_ACCOUNTS` | (off) | `name:login:password;...`, one Librus account per child: adds each child's new grades to the digest ([section](#school-grades-librus)) |
 | `LIBRUS_STATE` | `librus_state.json` next to `--db` | Grades already shown and the Librus sessions |
 | `LIBRUS_UPCOMING_DAYS` | `7` | With `LIBRUS_ACCOUNTS`: tests and homework for that many days ahead ([section](#tests-and-homework-librus)); `0` turns it off |
+| `SMS_TO`, `SMSAPI_TOKEN` | (off) | `name:phone;...`: each child gets an SMS about own new grades and upcoming tests with the emailed digest ([section](#sms-to-a-child-smsapipl)) |
+| `SMSAPI_FROM` | (SMSAPI default) | Sender name registered at SMSAPI |
 | `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` | (off) | eduSky site and the parent's login: adds what is due next (all children together) to the end of the digest ([section](#payments-edusky)) |
 | `EDUSKY_NAME` | `Edusky` | Title of the payments section, e.g. the activity's name |
 | `FETCH_RETRY_MINUTES` | `10` | When Edupage, Librus or eduSky fails, how long to keep trying again before sending the digest with the error ([section](#when-a-school-site-doesnt-answer)); `0` turns retries off |
