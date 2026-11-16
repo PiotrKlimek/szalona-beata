@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import edusky_payments  # noqa: E402
 import librus_grades  # noqa: E402
 import librus_upcoming  # noqa: E402
+import sms_notices  # noqa: E402
 
 # The bridge appends text read from a photo (OCR) after this tag; see bridge/ocr.go.
 OCR_TAG = "[text in image]"
@@ -1285,6 +1286,14 @@ def parse_args(argv):
     if not valid and args.librus_accounts:  # Librus off: not in the way of the digest
         p.error(f"LIBRUS_UPCOMING_DAYS must be a whole number of days between 0 and 60, got {days!r}")
     args.librus_upcoming_days = int(days) if valid else 0
+    try:  # env only, like LIBRUS_ACCOUNTS: phone numbers and the token stay off the command line
+        recipients = sms_notices.parse_recipients(env("SMS_TO", ""))
+    except ValueError as e:
+        p.error(str(e))
+    if recipients and not env("SMSAPI_TOKEN"):
+        p.error("SMS_TO needs SMSAPI_TOKEN (see .env.example)")
+    args.sms = sms_notices.Config(env("SMSAPI_TOKEN", ""), recipients, env("SMSAPI_FROM", ""),
+                                  env("SMSAPI_URL", sms_notices.DEFAULT_URL)) if recipients else None
     args.librus_state = env("LIBRUS_STATE", "") or os.path.join(os.path.dirname(args.db) or ".", "librus_state.json")
     if args.max_chars < 1:
         p.error(f"--max-chars / MAX_TRANSCRIPT_CHARS must be at least 1, got {args.max_chars}")
@@ -1535,6 +1544,8 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
         subject = args.email_subject.format(date=day, hours=args.hours, groups=groups_list)
         send_email(args.smtp, args.email_from, args.email_to, subject, digest, html=html)
         print(f"\nEmailed to {', '.join(args.email_to)}.", file=sys.stderr)
+        if args.sms:  # with the emailed digest only: the same grades are then no longer new
+            sms_notices.notify(args.sms, grades, upcoming)
     if librus_state is not None:
         if args.email_to:  # emailed: these grades are no longer new
             librus_grades.commit(librus_state, librus_seen)

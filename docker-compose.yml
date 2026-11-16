@@ -33,6 +33,9 @@ x-summarizer-env: &summarizer-env
   EDUSKY_PASSWORD: ${EDUSKY_PASSWORD:-}
   EDUSKY_NAME: ${EDUSKY_NAME:-}
   FETCH_RETRY_MINUTES: ${FETCH_RETRY_MINUTES:-}  # how long to keep retrying a school site that fails; 0 = off
+  SMS_TO: ${SMS_TO:-}  # name:phone;... (a child gets an SMS about own new grades and tests)
+  SMSAPI_TOKEN: ${SMSAPI_TOKEN:-}
+  SMSAPI_FROM: ${SMSAPI_FROM:-}  # registered sender name; empty = SMSAPI default
 
 services:
   bridge:

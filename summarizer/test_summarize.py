@@ -2254,6 +2254,46 @@ class MainTest(unittest.TestCase):
             _, out = self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
             self.assertIn("- Matematyka: 5", out)  # still new for the emailed digest
 
+    def test_sms_with_own_news_only_when_the_digest_is_emailed(self):
+        import os
+        import urllib.parse
+        from unittest import mock
+
+        smsapi = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": []})})
+        self.addCleanup(smsapi.close)
+        env, _ = self.librus_env(SMS_TO="Ania:500100200", SMSAPI_TOKEN="tok", SMSAPI_URL=smsapi.url)
+        with mock.patch.dict(os.environ, env), redirect_stderr(io.StringIO()):
+            self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")  # seeds
+            self.assertEqual(smsapi.requests, [])  # a first check has nothing new
+            self.accounts["1111111u"].append(grade(2, "3", subject_id=2))
+            self.run_main("--group", "rowery", "--hours", "2")  # a preview: no email, no SMS
+            self.assertEqual(smsapi.requests, [])
+            self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
+
+        (_, _, body), = smsapi.requests
+        self.assertEqual(urllib.parse.parse_qs(body)["to"], ["48500100200"])
+        self.assertEqual(urllib.parse.parse_qs(body)["message"], ["Ania, nowe oceny: Jezyk polski 3 (sprawdzian)."])
+
+    def test_sms_to_needs_a_token(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"SMS_TO": "Ania:500100200"}), redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            self.run_main("--group", "rowery")
+        self.assertIn("SMSAPI_TOKEN", err.getvalue())
+
+    def test_bad_sms_to_exits(self):
+        import os
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"SMS_TO": "Ania", "SMSAPI_TOKEN": "tok"}), redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            self.run_main("--group", "rowery")
+        self.assertIn("SMS_TO", err.getvalue())
+
     def test_librus_failure_does_not_block_the_digest(self):
         import os
         from unittest import mock
