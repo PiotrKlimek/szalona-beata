@@ -53,11 +53,17 @@ def parse_recipients(value):
     return recipients
 
 
+# Polish letters and typography make an SMS hold 70 characters instead of 160; [ ] { } | ~ ^ \\ count twice
+# and ` isn't in the SMS alphabet at all
+REPLACE = str.maketrans({"ł": "l", "Ł": "L", "–": "-", "—": "-", "„": '"', "”": '"', "“": '"', "«": '"', "»": '"',
+                         "’": "'", "‘": "'", "`": "'", "×": "x", "…": "...", "[": "(", "]": ")", "{": "(",
+                         "}": ")", "|": "/", "~": "-", "^": "", "\\": "/"})
+
+
 def plain(text):
-    """Without Polish letters and other characters that make an SMS hold 70 characters."""
-    text = str(text).replace("ł", "l").replace("Ł", "L").replace("–", "-").replace("—", "-")
-    text = text.replace("„", '"').replace("”", '"').replace("…", "...")
-    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    """Only characters that take one place in a 160-character SMS."""
+    text = unicodedata.normalize("NFKD", str(text).translate(REPLACE))
+    return text.encode("ascii", "ignore").decode().translate(REPLACE)
 
 
 def _short(text):
@@ -65,9 +71,14 @@ def _short(text):
     return text if len(text) <= MAX_ITEM else text[:MAX_ITEM - 1].rstrip() + "..."
 
 
+KINDS = {"semester": "semestralna", "semester_proposition": "propozycja semestralnej", "final": "roczna",
+         "final_proposition": "propozycja rocznej"}
+
+
 def _grade(g):
     line = f"{g.subject} {_short(g.value)}".strip()
-    return f"{line} ({g.category})" if g.category else line
+    details = [x for x in (KINDS.get(g.kind), g.category, "poprawa" if g.improvement else "") if x]
+    return f"{line} ({', '.join(details)})" if details else line
 
 
 def _test(i):
@@ -94,7 +105,8 @@ def compose(grades, upcoming):
 
 
 def send(config, phone, text):
-    data = {"to": phone, "message": text, "format": "json", "encoding": "utf-8"}
+    # max_parts: the panel's default limit may be lower than compose() allows
+    data = {"to": phone, "message": text, "format": "json", "encoding": "utf-8", "max_parts": "3"}
     if config.sender:
         data["from"] = config.sender
     req = urllib.request.Request(
@@ -112,6 +124,9 @@ def send(config, phone, text):
             raise RuntimeError(f"SMSAPI answered {e.code}") from None
     if "error" in answer:  # SMSAPI reports some errors with HTTP 200
         raise RuntimeError(f"SMSAPI error {answer['error']}: {answer.get('message', '')}")
+    for entry in answer.get("list") or ():  # a number refused on its own
+        if isinstance(entry, dict) and entry.get("error"):
+            raise RuntimeError(f"SMSAPI error {entry['error']}")
     return answer
 
 
@@ -130,11 +145,11 @@ def notify(config, grades, upcoming):
         if found is None:
             print(f"warning: SMS_TO: no Librus child named {name}", file=sys.stderr, flush=True)
             continue
-        text = compose(*found)
-        if not text:
-            continue
         shown = next(c for c in found if c).name
         try:
+            text = compose(*found)
+            if not text:
+                continue
             send(config, phone, text)
             print(f"SMS sent to {shown}.", file=sys.stderr, flush=True)
         except Exception as e:  # never the digest, never the other children

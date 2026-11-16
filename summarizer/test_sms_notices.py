@@ -76,6 +76,31 @@ class ComposeTest(unittest.TestCase):
         self.assertEqual(text, f"Ania, sprawdziany: pt 13.11 Historia: {'x' * 39}....")
 
 
+class PlainTest(unittest.TestCase):
+    def test_only_single_gsm_characters_remain(self):
+        self.assertEqual(sms.plain("[str. 12] {a|b} ~^\\ `x` Kowalski’s «x» 2×3 – „ok”…"),
+                         '(str. 12) (a/b) -/ \'x\' Kowalski\'s "x" 2x3 - "ok"...')
+
+
+class GradeKindTest(unittest.TestCase):
+    def test_kind_and_improvement_are_shown(self):
+        grades = lg.ChildGrades("Ania", [g("Matematyka", "3", kind="final_proposition"),
+                                         g("Fizyka", "4", kind="semester"),
+                                         g("Chemia", "5", "sprawdzian")._replace(improvement=True)])
+        self.assertEqual(sms.compose(grades, None),
+                         "Ania, nowe oceny: Matematyka 3 (propozycja rocznej); Fizyka 4 (semestralna); "
+                         "Chemia 5 (sprawdzian, poprawa).")
+
+
+class BrokenDataTest(unittest.TestCase):
+    def test_a_child_that_cannot_be_composed_is_a_warning(self):
+        broken = lu.ChildUpcoming("Ania", [item(None, "test", "Historia")])
+        err = io.StringIO()
+        with redirect_stderr(err):
+            sms.notify(sms.Config("tok", {"Ania": "48500100200"}, "", "http://127.0.0.1:9"), [], [broken])
+        self.assertIn("warning: SMS to Ania failed", err.getvalue())
+
+
 class SendTest(unittest.TestCase):
     def test_posts_to_smsapi_with_token(self):
         srv = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": [{"id": "1", "status": "QUEUE"}]})})
@@ -87,7 +112,7 @@ class SendTest(unittest.TestCase):
         self.assertEqual(srv.headers[0]["Authorization"], "Bearer tok")
         self.assertEqual(urllib.parse.parse_qs(body), {
             "to": ["48500100200"], "message": ["Ania, sprawdziany: pt 13.11 Historia."],
-            "format": ["json"], "encoding": ["utf-8"]})
+            "format": ["json"], "encoding": ["utf-8"], "max_parts": ["3"]})
 
     def test_sender_name_when_set(self):
         srv = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": []})})
@@ -101,6 +126,13 @@ class SendTest(unittest.TestCase):
             self.addCleanup(srv.close)
             with self.assertRaisesRegex(RuntimeError, "101.*Authorization failed"):
                 sms.send(sms.Config("tok", {}, "", srv.url), "48500100200", "x")
+
+
+    def test_refused_number_raises(self):
+        srv = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": [{"id": "1", "error": 13}]})})
+        self.addCleanup(srv.close)
+        with self.assertRaisesRegex(RuntimeError, "13"):
+            sms.send(sms.Config("tok", {}, "", srv.url), "48500100200", "x")
 
 
 class NotifyTest(unittest.TestCase):
