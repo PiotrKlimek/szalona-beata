@@ -46,12 +46,13 @@ class ComposeTest(unittest.TestCase):
         ])
         self.assertEqual(
             sms.compose(grades, upcoming),
-            "Ania, nowe oceny: Matematyka 5 (sprawdzian); Jezyk polski 3. "
-            "Sprawdziany: czw 12.11 Matematyka: Dzial II - ulamki; pt 13.11 kartkowka Przyroda.")
+            "Oceny: Matematyka 5 (sprawdzian); Jezyk polski 3. "
+            "Sprawdziany: czw 12.11 Matematyka: Dzial II - ulamki; pt 13.11 kartkowka Przyroda. "
+            "Zadania domowe: czw 12.11 Fizyka: zad. 3.")
 
     def test_nothing_new_means_no_sms(self):
         self.assertIsNone(sms.compose(lg.ChildGrades("Ania", []), lu.ChildUpcoming("Ania", [
-            item(THU, "homework", "Fizyka")])))
+            item(THU, "other", "", "wycieczka")])))
         self.assertIsNone(sms.compose(None, None))
 
     def test_errors_and_behaviour_are_left_out(self):
@@ -63,7 +64,11 @@ class ComposeTest(unittest.TestCase):
     def test_only_tests(self):
         self.assertEqual(sms.compose(lg.ChildGrades("Ania", []),
                                      lu.ChildUpcoming("Ania", [item(FRI, "test", "Historia")])),
-                         "Ania, sprawdziany: pt 13.11 Historia.")
+                         "Sprawdziany: pt 13.11 Historia.")
+
+    def test_only_homework(self):
+        self.assertEqual(sms.compose(None, lu.ChildUpcoming("Ania", [item(FRI, "homework", "Historia")])),
+                         "Zadania domowe: pt 13.11 Historia.")
 
     def test_long_message_is_cut_to_three_sms(self):
         grades = lg.ChildGrades("Ania", [g(f"Przedmiot {i}", "5", "sprawdzian") for i in range(40)])
@@ -73,7 +78,7 @@ class ComposeTest(unittest.TestCase):
 
     def test_long_test_description_is_shortened(self):
         text = sms.compose(None, lu.ChildUpcoming("Ania", [item(FRI, "test", "Historia", "x" * 100)]))
-        self.assertEqual(text, f"Ania, sprawdziany: pt 13.11 Historia: {'x' * 39}....")
+        self.assertEqual(text, f"Sprawdziany: pt 13.11 Historia: {'x' * 39}....")
 
 
 class PlainTest(unittest.TestCase):
@@ -88,7 +93,7 @@ class GradeKindTest(unittest.TestCase):
                                          g("Fizyka", "4", kind="semester"),
                                          g("Chemia", "5", "sprawdzian")._replace(improvement=True)])
         self.assertEqual(sms.compose(grades, None),
-                         "Ania, nowe oceny: Matematyka 3 (propozycja rocznej); Fizyka 4 (semestralna); "
+                         "Oceny: Matematyka 3 (propozycja rocznej); Fizyka 4 (semestralna); "
                          "Chemia 5 (sprawdzian, poprawa).")
 
 
@@ -106,12 +111,12 @@ class SendTest(unittest.TestCase):
         srv = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": [{"id": "1", "status": "QUEUE"}]})})
         self.addCleanup(srv.close)
 
-        sms.send(sms.Config("tok", {}, "", srv.url), "48500100200", "Ania, sprawdziany: pt 13.11 Historia.")
+        sms.send(sms.Config("tok", {}, "", srv.url), "48500100200", "Sprawdziany: pt 13.11 Historia.")
 
         (method, path, body), = srv.requests
         self.assertEqual(srv.headers[0]["Authorization"], "Bearer tok")
         self.assertEqual(urllib.parse.parse_qs(body), {
-            "to": ["48500100200"], "message": ["Ania, sprawdziany: pt 13.11 Historia."],
+            "to": ["48500100200"], "message": ["Sprawdziany: pt 13.11 Historia."],
             "format": ["json"], "encoding": ["utf-8"], "max_parts": ["3"]})
 
     def test_sender_name_when_set(self):
@@ -135,6 +140,22 @@ class SendTest(unittest.TestCase):
             sms.send(sms.Config("tok", {}, "", srv.url), "48500100200", "x")
 
 
+class BalanceTest(unittest.TestCase):
+    def test_points_from_the_profile(self):
+        srv = FakeServer({("GET", "/profile"): (200, {"points": 67.28, "payment_type": "prepaid"})})
+        self.addCleanup(srv.close)
+        self.assertEqual(sms.balance(sms.Config("tok", {}, "", srv.url)), 67.28)
+        self.assertEqual(srv.headers[0]["Authorization"], "Bearer tok")
+
+    def test_failure_is_a_warning_and_none(self):
+        srv = FakeServer({("GET", "/profile"): (401, {"error": 101, "message": "Authorization failed"})})
+        self.addCleanup(srv.close)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertIsNone(sms.balance(sms.Config("tok", {}, "", srv.url)))
+        self.assertIn("warning: SMSAPI balance", err.getvalue())
+
+
 class NotifyTest(unittest.TestCase):
     def test_each_child_with_a_number_gets_its_own_news(self):
         srv = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": []})})
@@ -148,7 +169,7 @@ class NotifyTest(unittest.TestCase):
             sms.notify(config, grades, upcoming)
 
         self.assertEqual([urllib.parse.parse_qs(b)["message"] for _, _, b in srv.requests],
-                         [["Ania, nowe oceny: Matematyka 5."]])
+                         [["Oceny: Matematyka 5."]])
         self.assertIn("SMS sent to Ania", err.getvalue())
 
     def test_grades_without_agenda(self):
