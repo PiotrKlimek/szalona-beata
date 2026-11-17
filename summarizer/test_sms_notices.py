@@ -140,6 +140,22 @@ class SendTest(unittest.TestCase):
             sms.send(sms.Config("tok", {}, "", srv.url), "48500100200", "x")
 
 
+class BalanceTest(unittest.TestCase):
+    def test_points_from_the_profile(self):
+        srv = FakeServer({("GET", "/profile"): (200, {"points": 67.28, "payment_type": "prepaid"})})
+        self.addCleanup(srv.close)
+        self.assertEqual(sms.balance(sms.Config("tok", {}, "", srv.url)), 67.28)
+        self.assertEqual(srv.headers[0]["Authorization"], "Bearer tok")
+
+    def test_failure_is_a_warning_and_none(self):
+        srv = FakeServer({("GET", "/profile"): (401, {"error": 101, "message": "Authorization failed"})})
+        self.addCleanup(srv.close)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertIsNone(sms.balance(sms.Config("tok", {}, "", srv.url)))
+        self.assertIn("warning: SMSAPI balance", err.getvalue())
+
+
 class NotifyTest(unittest.TestCase):
     def test_each_child_with_a_number_gets_its_own_news(self):
         srv = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": []})})

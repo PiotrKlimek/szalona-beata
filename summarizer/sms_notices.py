@@ -130,6 +130,18 @@ def send(config, phone, text):
     return answer
 
 
+def balance(config):
+    """What is left on the SMSAPI account (prepaid: zł), or None with a warning when it can't be read."""
+    req = urllib.request.Request(f"{config.url.rstrip('/')}/profile", method="GET",
+                                 headers={"Authorization": f"Bearer {config.token}", "User-Agent": "szalona-beata/0.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return float(json.load(resp)["points"])
+    except Exception as e:  # only a line in the email: never in the way of the digest
+        print(f"warning: SMSAPI balance: {e}", file=sys.stderr, flush=True)
+        return None
+
+
 def notify(config, grades, upcoming):
     """One SMS per child in config.recipients that has news; `grades` and `upcoming` are lists by child.
     A failure is only a warning: the email has already gone out."""

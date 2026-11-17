@@ -979,6 +979,20 @@ class LibrusUpcomingRenderTest(unittest.TestCase):
         self.assertNotIn("data-upcoming", summarize.build_html_digest([], 24, "10.11.2026"))
 
 
+class SmsBalanceRenderTest(unittest.TestCase):
+    def test_balance_ends_both_versions(self):
+        payments = edusky_payments.Payments("Angielski", [], None)
+        text = summarize.build_digest([("Klasa 1C", "x", 1)], 24, lang="Polish", payments=payments, sms_balance=67.28)
+        self.assertTrue(text.endswith("\n\nSaldo SMSAPI: 67,28 zł"), text)
+        html = summarize.build_html_digest([("Klasa 1C", "x", 1)], 24, "17.11.2026", lang="Polish",
+                                           payments=payments, sms_balance=67.28)
+        self.assertGreater(html.index("Saldo SMSAPI: 67,28 zł"), html.index("Płatności – Angielski"))
+
+    def test_no_balance_no_line(self):
+        self.assertNotIn("SMSAPI", summarize.build_digest([("Klasa 1C", "x", 1)], 24, lang="Polish"))
+        self.assertNotIn("SMSAPI", summarize.build_html_digest([("Klasa 1C", "x", 1)], 24, "17.11.2026"))
+
+
 class EduskyPaymentsRenderTest(unittest.TestCase):
     def payments(self, items=(), error=None, name="Angielski"):
         return edusky_payments.Payments(name, list(items), error)
@@ -2255,22 +2269,29 @@ class MainTest(unittest.TestCase):
             self.assertIn("- Matematyka: 5", out)  # still new for the emailed digest
 
     def test_sms_with_own_news_only_when_the_digest_is_emailed(self):
+        import email
         import os
         import urllib.parse
         from unittest import mock
 
-        smsapi = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": []})})
+        smsapi = FakeServer({("POST", "/sms.do"): (200, {"count": 1, "list": []}),
+                             ("GET", "/profile"): (200, {"points": 12.5})})
         self.addCleanup(smsapi.close)
-        env, _ = self.librus_env(SMS_TO="Ania:500100200", SMSAPI_TOKEN="tok", SMSAPI_URL=smsapi.url)
+        env, smtp = self.librus_env(SMS_TO="Ania:500100200", SMSAPI_TOKEN="tok", SMSAPI_URL=smsapi.url)
+        sent = lambda: [r for r in smsapi.requests if r[1] == "/sms.do"]
         with mock.patch.dict(os.environ, env), redirect_stderr(io.StringIO()):
             self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")  # seeds
-            self.assertEqual(smsapi.requests, [])  # a first check has nothing new
+            self.assertEqual(sent(), [])  # a first check has nothing new
+            msg = email.message_from_bytes(smtp.envelopes[0][2].encode(), policy=email.policy.default)
+            self.assertTrue(msg.get_body(("plain",)).get_content().rstrip().endswith("Saldo SMSAPI: 12,50 zł"))
+            self.assertIn("Saldo SMSAPI: 12,50 zł", msg.get_body(("html",)).get_content())
             self.accounts["1111111u"].append(grade(2, "3", subject_id=2))
-            self.run_main("--group", "rowery", "--hours", "2")  # a preview: no email, no SMS
-            self.assertEqual(smsapi.requests, [])
+            _, out = self.run_main("--group", "rowery", "--hours", "2")  # a preview: no email, no SMS
+            self.assertEqual(sent(), [])
+            self.assertNotIn("SMSAPI", out)  # nor a balance check
             self.run_main("--group", "rowery", "--hours", "2", "--email-to", "piko@example.com")
 
-        (_, _, body), = smsapi.requests
+        (_, _, body), = [r for r in smsapi.requests if r[1] == "/sms.do"]
         self.assertEqual(urllib.parse.parse_qs(body)["to"], ["48500100200"])
         self.assertEqual(urllib.parse.parse_qs(body)["message"], ["Oceny: Jezyk polski 3 (sprawdzian)."])
 

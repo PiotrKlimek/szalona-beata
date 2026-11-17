@@ -36,7 +36,7 @@ down, the email starts with a red warning instead of quietly reporting "no messa
 | Summaries with `--model openai` | the chat text of the selected groups (including text read from photos and PDFs, and voice message transcripts) is sent to the LLM provider (Groq by default) |
 | LLM call log (prompts, transcripts, responses) | only your server (`llm_log.db` next to the messages database); entries deleted after `RETENTION_DAYS` |
 | Librus grades, tests and homework (only with `LIBRUS_ACCOUNTS`) | read from Librus with each child's login; seen grade ids and the Librus sessions in `librus_state.json` on your server (no passwords) |
-| SMS to a child (only with `SMS_TO`) | the child's new grades and upcoming tests go to SMSAPI.pl and the mobile operator |
+| SMS to a child (only with `SMS_TO`) | the child's new grades, upcoming tests and homework go to SMSAPI.pl and the mobile operator |
 | eduSky payments (only with `EDUSKY_URL`) | read from eduSky with the parent's login; nothing stored |
 | The email | the email provider (Resend) and your mailbox |
 
@@ -622,8 +622,9 @@ Oceny: Matematyka 5 (sprawdzian). Sprawdziany: czw 12.11 Matematyka: Dzial II; p
 - Polish letters are replaced (`ą` → `a`): with them one SMS holds 70 characters instead of 160. A busy day is cut
   to three SMS parts (459 characters).
 - A test or homework stays in the agenda until its day, so it is repeated in each evening's SMS until then.
+- The email ends with what is left on the SMSAPI account (`Saldo SMSAPI: 67,28 zł`), so you know when to top it up.
 - If SMSAPI fails, the digest log says so (`warning: SMS to Ania failed`) and the email is not affected.
-- Data: the SMS text (the child's grades and tests) goes to SMSAPI and the mobile operator.
+- Data: the SMS text (the child's grades, tests and homework) goes to SMSAPI and the mobile operator.
 
 ## Payments (eduSky)
 

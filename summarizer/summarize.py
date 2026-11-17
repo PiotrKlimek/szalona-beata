@@ -171,6 +171,7 @@ LABELS = {
         "upcoming_skipped": "Could not fetch part of the data ({error}).",
         "upcoming_groups": {"test": "Tests", "quiz": "Quizzes", "homework": "Homework", "other": "Other"},
         "payments_title": "Payments – {name}",
+        "sms_balance": "SMSAPI balance: {amount}",
         "payments_none": "Nothing to pay.",
         "payments_error": "Could not fetch the payments ({error}).",
         "payments_due": "To pay: {amount} by {day}",
@@ -223,6 +224,7 @@ LABELS = {
         "upcoming_groups": {"test": "Sprawdziany i prace klasowe", "quiz": "Kartkówki",
                             "homework": "Zadania domowe", "other": "Inne"},
         "payments_title": "Płatności – {name}",
+        "sms_balance": "Saldo SMSAPI: {amount}",
         "payments_none": "Nic do zapłaty.",
         "payments_error": "Nie udało się pobrać płatności ({error}).",
         "payments_due": "Do zapłaty: {amount} do {day}",
@@ -619,8 +621,12 @@ def _payments_text(payments, lang):
     return f"*{_payments_title(payments, lang)}*\n{_payments_line(payments, lang)[0]}"
 
 
+def _balance_line(amount, lang):
+    return labels(lang)["sms_balance"].format(amount=_money(amount, lang))
+
+
 def build_digest(sections, hours, title=None, lang="English", warning=None, substitutions=None, grades=(),
-                 payments=None, upcoming=(), upcoming_days=7):
+                 payments=None, upcoming=(), upcoming_days=7, sms_balance=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     header = f"📋 {title or L['digest']} ({L['last'].format(hours=hours)})"
@@ -637,6 +643,8 @@ def build_digest(sections, hours, title=None, lang="English", warning=None, subs
         parts.append(_subst_text(substitutions, lang))
     if payments:
         parts.append(_payments_text(payments, lang))
+    if sms_balance is not None:
+        parts.append(_balance_line(sms_balance, lang))
     return "\n\n".join(parts)
 
 
@@ -827,7 +835,7 @@ WARNING_BANNER = ('<div data-warning="1" style="background:#fdecea;color:#8a1c12
 
 
 def build_html_digest(sections, hours, day, title=None, lang="English", warning=None, substitutions=None,
-                      grades=(), payments=None, upcoming=(), upcoming_days=7):
+                      grades=(), payments=None, upcoming=(), upcoming_days=7, sms_balance=None):
     L = labels(lang)
     sections = [Section(*s) for s in sections]
     cards = "\n".join(
@@ -846,6 +854,9 @@ def build_html_digest(sections, hours, day, title=None, lang="English", warning=
         cards += "\n" + render_substitutions_html(substitutions, lang)
     if payments:
         cards += "\n" + render_payments_html(payments, lang)
+    if sms_balance is not None:
+        cards += (f'\n<p data-sms-balance="1" style="margin:20px 0 0;font-size:13px;color:#7a8783">'
+                  f'{htmllib.escape(_balance_line(sms_balance, lang))}</p>')
     total = _total_line(sections, lang)
     return HTML_PAGE.format(
         title=htmllib.escape(title or L["html_title"]),
@@ -1517,7 +1528,9 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
     substitutions, grades, librus_state, librus_seen, upcoming, payments = fetch_school_sections(args, now, tz)
     common = {"title": args.email_title, "lang": lang, "warning": warning, "substitutions": substitutions,
               "grades": grades, "payments": payments, "upcoming": upcoming,
-              "upcoming_days": args.librus_upcoming_days}
+              "upcoming_days": args.librus_upcoming_days,
+              # for the email only: how much is left for the SMS (none on a preview, nobody pays then)
+              "sms_balance": sms_notices.balance(args.sms) if args.sms and args.email_to else None}
     digest = build_digest(sections, args.hours, **common)
     print(digest, flush=True)
     if usage := getattr(llm, "usage", None):
@@ -1528,9 +1541,9 @@ def run_digest(args, db, groups, target, llm, now, tz, call_log=None, synthetic=
             file=sys.stderr,
         )
     if target:  # a group chat: children's grades, agenda and payments are only for the email
-        private = grades or payments or upcoming
+        private = grades or payments or upcoming or common["sms_balance"] is not None
         group_text = build_digest(sections, args.hours,
-                                  **{**common, "grades": (), "payments": None, "upcoming": ()}) \
+                                  **{**common, "grades": (), "payments": None, "upcoming": (), "sms_balance": None}) \
             if private else digest
         send_to_bridge(args.bridge_url, target[0], group_text)
         print(f"\nSent to {target[1]}.", file=sys.stderr)
