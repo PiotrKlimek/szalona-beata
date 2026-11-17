@@ -600,11 +600,11 @@ Inne:
 ### SMS to a child (SMSAPI.pl)
 
 A child can get a short SMS about their own news, together with the scheduled email: new grades (the same ones
-the email lists) and tests and quizzes coming up in the next `LIBRUS_UPCOMING_DAYS` days. Homework, other agenda
+the email lists), tests and quizzes, and homework due in the next `LIBRUS_UPCOMING_DAYS` days. Other agenda
 entries, behaviour, errors and the parents' sections stay in the email.
 
 ```
-Ania, nowe oceny: Matematyka 5 (sprawdzian). Sprawdziany: czw 12.11 Matematyka: Dzial II; pt 13.11 kartkowka Chemia.
+Oceny: Matematyka 5 (sprawdzian). Sprawdziany: czw 12.11 Matematyka: Dzial II; pt 13.11 kartkowka Chemia. Zadania domowe: sr 11.11 Fizyka: zad. 3.
 ```
 
 1. Create an account at [SMSAPI.pl](https://www.smsapi.pl), top it up, and create an API token
@@ -621,7 +621,7 @@ Ania, nowe oceny: Matematyka 5 (sprawdzian). Sprawdziany: czw 12.11 Matematyka: 
 - An SMS goes out only when the digest is **emailed** and the child has something new; a preview run sends none.
 - Polish letters are replaced (`ą` → `a`): with them one SMS holds 70 characters instead of 160. A busy day is cut
   to three SMS parts (459 characters).
-- A test stays in the agenda until its day, so it is repeated in each evening's SMS until then.
+- A test or homework stays in the agenda until its day, so it is repeated in each evening's SMS until then.
 - If SMSAPI fails, the digest log says so (`warning: SMS to Ania failed`) and the email is not affected.
 - Data: the SMS text (the child's grades and tests) goes to SMSAPI and the mobile operator.
 
@@ -773,7 +773,7 @@ docker volume rm szalona-beata_wa-data
 | `LIBRUS_ACCOUNTS` | (off) | `name:login:password;...`, one Librus account per child: adds each child's new grades to the digest ([section](#school-grades-librus)) |
 | `LIBRUS_STATE` | `librus_state.json` next to `--db` | Grades already shown and the Librus sessions |
 | `LIBRUS_UPCOMING_DAYS` | `7` | With `LIBRUS_ACCOUNTS`: tests and homework for that many days ahead ([section](#tests-and-homework-librus)); `0` turns it off |
-| `SMS_TO`, `SMSAPI_TOKEN` | (off) | `name:phone;...`: each child gets an SMS about own new grades and upcoming tests with the emailed digest ([section](#sms-to-a-child-smsapipl)) |
+| `SMS_TO`, `SMSAPI_TOKEN` | (off) | `name:phone;...`: each child gets an SMS about own new grades, upcoming tests and homework with the emailed digest ([section](#sms-to-a-child-smsapipl)) |
 | `SMSAPI_FROM` | (SMSAPI default) | Sender name registered at SMSAPI |
 | `EDUSKY_URL`, `EDUSKY_LOGIN`, `EDUSKY_PASSWORD` | (off) | eduSky site and the parent's login: adds what is due next (all children together) to the end of the digest ([section](#payments-edusky)) |
 | `EDUSKY_NAME` | `Edusky` | Title of the payments section, e.g. the activity's name |

@@ -1,9 +1,9 @@
-"""Short SMS to a child about their own new grades and upcoming tests, through SMSAPI.pl.
+"""Short SMS to a child about their own new grades, upcoming tests and homework, through SMSAPI.pl.
 
 SMS_TO="Ania:500100200;Jaś:600100200" - a child's name as the digest shows it (LIBRUS_ACCOUNTS) and their
 phone number; SMSAPI_TOKEN is the API token, SMSAPI_FROM an optional registered sender name. A child gets
-an SMS only when there is something to say: new grades (the same as in the email) or tests and quizzes
-coming up in the next LIBRUS_UPCOMING_DAYS days. Homework, other agenda entries, behaviour, errors and
+an SMS only when there is something to say: new grades (the same as in the email) or tests, quizzes and
+homework due in the next LIBRUS_UPCOMING_DAYS days. Other agenda entries, behaviour, errors and
 the parents' sections stay in the email. Polish letters are replaced (ą -> a): with them one SMS holds
 70 characters instead of 160.
 """
@@ -92,15 +92,15 @@ def compose(grades, upcoming):
     parts = []
     if grades and not grades.error:
         if lines := [_grade(g) for g in grades.grades if g.kind != "behaviour"]:
-            parts.append("nowe oceny: " + "; ".join(lines))
+            parts.append("Oceny: " + "; ".join(lines))
     if upcoming and not upcoming.error:
         if lines := [_test(i) for i in upcoming.items if i.group in ("test", "quiz")]:
-            parts.append("sprawdziany: " + "; ".join(lines))
+            parts.append("Sprawdziany: " + "; ".join(lines))
+        if lines := [_test(i) for i in upcoming.items if i.group == "homework"]:
+            parts.append("Zadania domowe: " + "; ".join(lines))
     if not parts:
         return None
-    name = (grades or upcoming).name
-    parts[1:] = [p[0].upper() + p[1:] for p in parts[1:]]
-    text = plain(f"{name}, {'. '.join(parts)}.")
+    text = plain(". ".join(parts) + ".")
     return text if len(text) <= MAX_CHARS else text[:MAX_CHARS - 3] + "..."
 
 

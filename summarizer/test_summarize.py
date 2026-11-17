@@ -2272,7 +2272,7 @@ class MainTest(unittest.TestCase):
 
         (_, _, body), = smsapi.requests
         self.assertEqual(urllib.parse.parse_qs(body)["to"], ["48500100200"])
-        self.assertEqual(urllib.parse.parse_qs(body)["message"], ["Ania, nowe oceny: Jezyk polski 3 (sprawdzian)."])
+        self.assertEqual(urllib.parse.parse_qs(body)["message"], ["Oceny: Jezyk polski 3 (sprawdzian)."])
 
     def test_sms_to_needs_a_token(self):
         import os
